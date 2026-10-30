@@ -5575,7 +5575,7 @@ mod tests {
     // Before the fix, `translate_64bit_impl`'s kseg3/ksseg compat arm passed
     // `XTLB=0`, which had two effects, one per use of that const param:
     //   1. wrong vector — a KX=1 kernel's cksseg miss went to 0x000
-    //   2. wrong compare width — `vcmp32` drops EntryHi's Region field, so a
+    //   2. historical compare-width bug — the old `vcmp32` dropped Region, so a
     //      cksseg VA could alias an xuseg entry with a colliding VPN2[31:13]
     // Both are asserted below.
 
@@ -5681,7 +5681,7 @@ mod tests {
                    "setup: xuseg VA must hit its own entry");
 
         // The cksseg address must MISS: same VPN2[31:13], different Region.
-        // Before the fix this arm compared with `vcmp32`, which drops Region,
+        // Before the fix this arm used the old `vcmp32`, which dropped Region,
         // so it spuriously hit the xuseg entry and returned that page's data.
         let err = exec.read_data::<4>(cksseg).expect_err(
             "a kseg3-compat VA must NOT alias an xuseg entry that merely \

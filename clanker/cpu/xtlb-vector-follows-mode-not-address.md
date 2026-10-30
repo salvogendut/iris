@@ -1,6 +1,8 @@
 # The XTLB refill vector follows the MODE, not the address shape
 
-*cpucritique.md T1. Fixed 2026-09-12.*
+*cpucritique.md T1. Fixed 2026-09-12. Historical compare-width explanation
+superseded on 2026-10-30 by [full TLB tag comparisons](tlb-tags-survive-address-mode-changes.md).
+The refill-vector rule remains current. NetBSD LP64 now exercises KX=1.*
 
 ## The rule
 

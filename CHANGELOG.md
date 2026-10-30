@@ -1,5 +1,13 @@
 # Changelog
 
+## Native 64-bit NetBSD bring-up
+
+- Retain Region and upper VPN bits when translating 32-bit addresses or
+  probing the TLB. This prevents an o32 user process from matching a global
+  xkseg mapping left by a 64-bit kernel. Snapshot restore rebuilds the same
+  comparison masks.
+
+
 All notable user-facing and developer-facing changes to iris.
 
 Binary builds are published as a daily `nightly` pre-release

@@ -212,6 +212,50 @@ mod tests {
     }
 
     #[test]
+    fn test_o32_cannot_alias_extended_tlb_entries() {
+        // NetBSD's LP64 kernel maps xkseg while running o32 user processes.
+        // Neither Region nor VPN[39:32] may disappear when UX becomes zero.
+        for upper in [0xC000_0000_0000_0000, 0x4000_0000_0000_0000,
+                      0x0000_0001_0000_0000] {
+            for global in [false, true] {
+                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                let va = 0x2a000;
+                let mut extended = TlbEntry::new();
+                extended.entry_hi = upper | va | 4 | if global { 0x1000 } else { 0 };
+                extended.entry_lo = [(0x17f7a << 6) | 0x1e, (0x17f7b << 6) | 0x1e];
+                tlb.write(5, extended);
+                for access in [AccessType::Fetch, AccessType::Read, AccessType::Write] {
+                    assert!(matches!(tlb.translate::<0>(va + 0x13b8, 4, access),
+                        TlbResult::Miss { .. }), "o32 must not hit an extended mapping");
+                }
+                assert_eq!(tlb.probe(va, 4, false), 0x80000000);
+                assert_eq!(tlb.probe(upper | va, 4, false), 5,
+                    "TLBP compares the full EntryHi register even with KX clear");
+
+                // A real user mapping must win even if an extended mapping is
+                // the most recent candidate for the same vmap slot.
+                let mut user = TlbEntry::new();
+                user.entry_hi = va | 4;
+                user.entry_lo = [(0x17ac0 << 6) | 0x1e, (0x17ac1 << 6) | 0x1e];
+                tlb.write(6, user);
+                tlb.write(5, extended);
+                let saved = tlb.save_state();
+                let mut restored = MipsTlb::new(TLB_NUM_ENTRIES);
+                restored.load_state(&saved).unwrap();
+                for t in [&mut tlb, &mut restored] {
+                    for access in [AccessType::Fetch, AccessType::Read, AccessType::Write] {
+                        assert!(matches!(t.translate::<0>(va + 0x13b8, 4, access),
+                            TlbResult::Hit { phys_addr: 0x17ac13b8, .. }));
+                    }
+                    assert_eq!(t.probe(va, 4, false), 6);
+                    assert!(matches!(t.translate::<0>(va, 9, AccessType::Read),
+                        TlbResult::Miss { .. }));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_tlb_32bit_vs_64bit_mode() {
         let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
         let asid = 10;
@@ -226,14 +270,10 @@ mod tests {
 
         tlb.write(5, entry);
 
-        // Test 32-bit mode translation - should match on bits 31:13 only
+        // A 32-bit VA must not match another Region with the same low VPN.
         let va_32bit = 0x00200000; // VPN2=0x100 in bits 31:13
-        match tlb.translate::<0>(va_32bit, asid, AccessType::Read) {
-            TlbResult::Hit { phys_addr, .. } => {
-                assert_eq!(phys_addr, 0x50000);
-            }
-            res => panic!("Expected Hit in 32-bit mode, got {:?}", res),
-        }
+        assert!(matches!(tlb.translate::<0>(va_32bit, asid, AccessType::Read),
+            TlbResult::Miss { .. }));
 
         // Test 64-bit mode translation - should match R field and extended VPN2
         let va_64bit = (2u64 << 62) | 0x00200000; // R=2, VPN2=0x100
@@ -268,10 +308,10 @@ mod tests {
 
         tlb.write(5, entry);
 
-        // Test 32-bit mode probe - should match on bits 31:13 only
+        // TLBP also retains Region when KX is clear.
         let va_32bit = 0x00200000; // VPN2=0x100 in bits 31:13
         let result = tlb.probe(va_32bit, asid, false);
-        assert_eq!(result, 5, "Expected probe to find entry at index 5 in 32-bit mode");
+        assert_eq!(result, 0x80000000, "32-bit probe must not alias another Region");
 
         // Test 64-bit mode probe - should match R field and extended VPN2
         let va_64bit = (2u64 << 62) | 0x00200000; // R=2, VPN2=0x100
