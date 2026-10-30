@@ -410,6 +410,17 @@ The export is a single root, so mount it as `/`:
 Use the gateway address shown in the GUI (it tracks your NAT subnet). The server
 fakes uid/gid/mode so the export behaves the same regardless of the host OS.
 
+For NetBSD, explicitly select UDP for both MOUNT and NFS; its default NFS
+transport is TCP, which this server does not implement:
+
+```sh
+mount_nfs -3 -u -U 192.168.0.1:/ /shared
+```
+
+The MOUNT v3 reply advertises both AUTH_SYS (UNIX credentials) and AUTH_NULL.
+Credentials are accepted without enforcing their uid/gid against the synthetic
+attributes; this does not provide an authentication or authorization boundary.
+
 In PCAP mode there is no gateway, so set `[network] nfs_pcap_ip` to a free
 address on your LAN; the server answers there instead and the guest mounts
 `<nfs_pcap_ip>:/`.

@@ -1326,7 +1326,11 @@ pub fn mount_call(call: &RpcCall, args: &mut Cur) -> Vec<u8> {
             } else {
                 x.u32(0); // mountstat3 = MNT3_OK
                 put_fh(&mut x, ROOT_ID); // v3 fhandle3 (opaque)
-                x.u32(1); // one auth flavor follows
+                // NetBSD's mount client requires its requested AUTH_SYS flavor
+                // in a non-empty list. We accept those credentials as well as
+                // anonymous calls; retain AUTH_NULL for existing clients.
+                x.u32(2);
+                x.u32(1); // AUTH_SYS (also called AUTH_UNIX)
                 x.u32(AUTH_NULL);
             }
             x.into_bytes()
@@ -1979,7 +1983,8 @@ mod tests {
         assert_eq!(c.u32(), Some(0)); // MNT3_OK
         let fh = c.opaque().unwrap();
         assert_eq!(u64::from_be_bytes(fh.try_into().unwrap()), ROOT_ID);
-        assert_eq!(c.u32(), Some(1)); // one auth flavor
+        assert_eq!(c.u32(), Some(2)); // accepted auth flavors
+        assert_eq!(c.u32(), Some(1)); // AUTH_SYS, required by NetBSD mount_nfs
         assert_eq!(c.u32(), Some(0)); // AUTH_NULL
 
         // MOUNT v1 MNT -> fhstatus OK + 32-byte fhandle.

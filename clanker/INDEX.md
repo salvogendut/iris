@@ -148,6 +148,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
 | [nfs-fileid-1-panics-irix53-imon.md](net/nfs-fileid-1-panics-irix53-imon.md) | rule | NFS fileid 1 panics IRIX 5.3 through imon (fam) |
+| [nfs-mount-advertise-auth-sys.md](net/nfs-mount-advertise-auth-sys.md) | rule | MOUNT v3 must advertise AUTH_SYS for NetBSD clients |
 | [nfs-readdir-must-respect-count-and-fit-one-datagram.md](net/nfs-readdir-must-respect-count-and-fit-one-datagram.md) | rule | NFS READDIR replies must respect the client's `count` and fit one UDP datagram |
 | [prom-bootp-tftp-boot.md](net/prom-bootp-tftp-boot.md) | rule | PROM `boot -f bootp()file`: what the ARCS PROM demands of BOOTP and TFTP |
 | [rsh-forward-needs-reserved-source-port.md](net/rsh-forward-needs-reserved-source-port.md) | rule | Inbound port-forwards to rsh/rlogin need a reserved source port |
