@@ -299,6 +299,18 @@ than the silicon's. The differences below are deliberate. They are also pinned
 by tests, so a change to any of them fails the suite rather than silently
 altering what a guest sees.
 
+### NetBSD Xorg acceleration
+
+NetBSD 11.0's Newport Xorg driver can display a software-rendered desktop with
+`Option "NoAccel" "true"` in its Device section. Its accelerated XAA solid
+fills currently produce incorrect colors in IRIS, while image uploads render
+correctly. Screen-to-screen copies preserve the incorrect fill colors.
+The driver's fast-clear path writes a different COLORVRAM packing from the
+BGR pixel representation used by IRIS. Hardware comparison is still needed
+to resolve the register/plane mapping; acceleration is not qualified for this
+guest. Disabling acceleration avoids that path and does not establish graphics
+performance or compatibility with IRIX desktop clients.
+
 ### RGB mode is a separate field from plane selection
 
 `DRAWMODE1` has two independent fields that are easy to confuse:

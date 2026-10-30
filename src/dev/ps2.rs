@@ -501,7 +501,13 @@ impl Ps2Controller {
     /// SGI O2's MACE). Same device behaviour as the data port, without
     /// controller commands in between.
     pub fn write_to(&self, val: u8, mouse: bool) {
-        self.state.lock().next_write_is_mouse = mouse;
+        {
+            let mut state = self.state.lock();
+            state.next_write_is_mouse = mouse;
+            // MACE/IOC3 ports connect directly to the devices, without an
+            // 8042 translating the keyboard's scan-code stream.
+            state.config &= !0x40;
+        }
         self.write_data(val);
     }
 
@@ -539,7 +545,15 @@ impl Ps2Controller {
             return;
         }
 
-        match state.scancode_set {
+        // NetBSD enables the 8042's Set 2 -> Set 1 translation bit and
+        // expects XT make/break bytes. Keep the keyboard's selected set
+        // intact (including query replies); translate only host key events.
+        let output_set = if state.scancode_set == 2 && state.config & 0x40 != 0 {
+            1
+        } else {
+            state.scancode_set
+        };
+        match output_set {
             1 => {
                 if let Some(scancode) = self.map_keycode_set1(key) {
                     let val = scancode as u16;
@@ -1401,6 +1415,44 @@ mod tests {
         assert!(probe.level(), "the ACK is waiting");
         assert_eq!(ps2.read_data(), 0xFA);
         assert!(!probe.level(), "and once read, the line drops");
+    }
+
+    #[test]
+    fn controller_translation_emits_xt_make_break_and_extended_codes() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_data(0xF4);
+        assert_eq!(ps2.read_data(), 0xFA);
+        ps2.write_command(0x60);
+        ps2.write_data(0x47); // keyboard and mouse IRQs, SYS, translation
+        for key in [KeyCode::KeyA, KeyCode::ShiftLeft, KeyCode::ArrowUp] {
+            ps2.push_kb(key, true);
+            ps2.push_kb(key, false);
+        }
+        let got: Vec<_> = (0..8).map(|_| ps2.read_data()).collect();
+        assert_eq!(got, [0x1e, 0x9e, 0x2a, 0xaa, 0xe0, 0x48, 0xe0, 0xc8]);
+        assert_eq!(ps2.read_status() & 1, 0);
+        assert_eq!(ps2.state.lock().scancode_set, 2);
+
+        ps2.write_command(0x60);
+        ps2.write_data(0x07); // translation off: raw Set 2
+        ps2.push_kb(KeyCode::KeyA, true);
+        ps2.push_kb(KeyCode::KeyA, false);
+        assert_eq!([ps2.read_data(), ps2.read_data(), ps2.read_data()], [0x1c, 0xf0, 0x1c]);
+        assert_eq!(ps2.read_status() & 1, 0);
+    }
+
+    #[test]
+    fn direct_device_ports_do_not_translate_set2() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        ps2.write_to(0xF4, false);
+        assert_eq!(ps2.pop_from(false), Some(0xFA));
+        ps2.push_kb(KeyCode::KeyA, true);
+        ps2.push_kb(KeyCode::KeyA, false);
+        assert_eq!([ps2.pop_from(false), ps2.pop_from(false), ps2.pop_from(false)],
+                   [Some(0x1c), Some(0xf0), Some(0x1c)]);
+        assert_eq!(ps2.pop_from(false), None);
     }
 
     #[test]

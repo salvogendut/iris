@@ -121,6 +121,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | design | O2 cache: the full model through POST, the shadow model after; switched by PC range and a tag-store trigger, and why the log flips during a reboot |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
+| [ps2-controller-translation-for-netbsd.md](devices/ps2-controller-translation-for-netbsd.md) | rule | Honor 8042 Set 2 to Set 1 translation for NetBSD keyboard input |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
 | [vdma-transfers-are-always-translated.md](devices/vdma-transfers-are-always-translated.md) | rule | VDMA image transfers are always address-translated |
@@ -187,6 +188,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [hostrw-tests-must-use-partial-word-rows.md](rex3/hostrw-tests-must-use-partial-word-rows.md) | rule | HOSTRW tests must use rows that do not fill a whole 64-bit word |
 | [jit-reads-take-the-plane-bits.md](rex3/jit-reads-take-the-plane-bits.md) | rule | Compiled READ and SCR2SCR reads take the plane's bits, as the interpreter does |
 | [line-plus-host-not-jittable.md](rex3/line-plus-host-not-jittable.md) | rule | Lines with COLORHOST/ALPHAHOST: legal, but Cranelift refuses them |
+| [netbsd-xaa-fastclear-colors.md](rex3/netbsd-xaa-fastclear-colors.md) | open | NetBSD XAA fast-clear colors differ from image uploads; NoAccel avoids the path |
 | [prefetch-primes-the-pio-read-pipeline.md](rex3/prefetch-primes-the-pio-read-pipeline.md) | rule | PREFETCH primes the PIO read pipeline — the `0xdeadbeef` GO is the primer |
 | [rex-jit-queue-retry.md](rex3/rex-jit-queue-retry.md) | rule | Retry rejected REX JIT compile requests |
 | [rex3-fline-fractional-bresenham.md](rex3/rex3-fline-fractional-bresenham.md) | open | REX3 F_LINE fractional Bresenham — fixes and open A_LINE follow-up |

@@ -485,6 +485,10 @@ Right Ctrl releases mouse grab. iris-gui has its own bindings; see
 | **Right Ctrl + F11** | Toggle borderless fullscreen |
 | **Right Ctrl + F12** | Pick an ISO/CHD and load it into the CD-ROM (hot-swap) |
 
+The Indy/Indigo2 keyboard controller honors its Set 2 to Set 1 translation
+bit, including key releases and extended keys. MACE and IOC3 direct device
+ports deliver the keyboard's selected scan-code set without this translation.
+
 ### Non-US keyboards
 
 iris sends the guest the *position* of each key; the guest applies the
