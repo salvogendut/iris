@@ -55,10 +55,12 @@ See [TODO.md](clanker/TODO.md) for remaining device and restore work.
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
 SCSI controller, and the Seeq Ethernet chip all round-trip. Current schema
-version is 3: postcard-encoded binary device state plus content-addressable
+version is 4: postcard-encoded binary device state plus content-addressable
 chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
 adds **zero bytes** to disk for any RAM region that didn't change — same
-storage model as Docker layers. A snapshot records which CPU it was taken on
+storage model as Docker layers. Restore republishes the saved memory-controller bank map before execution,
+so a fresh emulator process can load the guest without first running its PROM
+or operating-system boot sequence. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
 From the interactive monitor (`telnet 127.0.0.1 8888`):

@@ -1351,6 +1351,17 @@ impl Saveable for MemoryController {
             state.eeprom.lock().load_state_mut(e)?;
         }
 
+        // Restoring the register bytes must also restore the board's decode
+        // map. A fresh process still has its power-on bank mapping; an
+        // in-process load can hide this because the PROM already mapped RAM.
+        let banks = self.parse_memcfg(state.regs[(REG_MEMCFG0 / 4) as usize],
+                                      state.regs[(REG_MEMCFG1 / 4) as usize]);
+        drop(dma);
+        drop(state);
+        if let Some(callback) = self.memcfg_callback.get() {
+            callback(banks);
+        }
+
         Ok(())
     }
 }
@@ -1430,6 +1441,31 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "MemoryController save_state mismatch after load_state round-trip");
+    }
+
+    /// Register round-trips alone miss the physical bank map: a new machine
+    /// has not run the PROM that installs the saved MEMCFG decode.
+    #[test]
+    fn load_state_republishes_memory_bank_map() {
+        let src = MemoryController::new(Arc::new(Mutex::new(Eeprom93c56::new())), true, [128, 128, 0, 0]);
+        assert_eq!(src.write32((MC_BASE + REG_MEMCFG0) as u64, 0x7f20_7f40), BUS_OK);
+        assert_eq!(src.write32((MC_BASE + REG_MEMCFG1) as u64, 0), BUS_OK);
+        let saved = src.save_state();
+        let expected = src.parse_memcfg(0x7f20_7f40, 0);
+        assert!(expected[0].is_some() && expected[1].is_some());
+
+        let dst = Arc::new(MemoryController::new(Arc::new(Mutex::new(Eeprom93c56::new())), true, [128, 128, 0, 0]));
+        let observed = Arc::new(Mutex::new(None));
+        let sink = observed.clone();
+        let weak = Arc::downgrade(&dst);
+        dst.set_memcfg_callback(Box::new(move |banks| {
+            // A callback can inspect MC state; loading must release its locks.
+            assert!(weak.upgrade().unwrap().state.try_lock().is_some());
+            *sink.lock() = Some(banks);
+        }));
+        *observed.lock() = None;
+        dst.load_state(&saved).unwrap();
+        assert_eq!(*observed.lock(), Some(expected));
     }
 
     /// Fails at 1.5e9 counts without the re-anchor in `start()`.

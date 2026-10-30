@@ -148,6 +148,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
 | [nfs-fileid-1-panics-irix53-imon.md](net/nfs-fileid-1-panics-irix53-imon.md) | rule | NFS fileid 1 panics IRIX 5.3 through imon (fam) |
+| [netbsd-fragmented-nfs-upload-corruption.md](net/netbsd-fragmented-nfs-upload-corruption.md) | open | Intermittent NetBSD NFS upload corruption with 8192-byte requests after restore |
 | [nfs-mount-advertise-auth-sys.md](net/nfs-mount-advertise-auth-sys.md) | rule | MOUNT v3 must advertise AUTH_SYS for NetBSD clients |
 | [nfs-readdir-must-respect-count-and-fit-one-datagram.md](net/nfs-readdir-must-respect-count-and-fit-one-datagram.md) | rule | NFS READDIR replies must respect the client's `count` and fit one UDP datagram |
 | [prom-bootp-tftp-boot.md](net/prom-bootp-tftp-boot.md) | rule | PROM `boot -f bootp()file`: what the ARCS PROM demands of BOOTP and TFTP |
@@ -306,6 +307,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
+| [mc-restore-must-republish-bank-map.md](snapshot/mc-restore-must-republish-bank-map.md) | rule | MC snapshot restore must publish the saved physical bank map |
 | [per-device-saveloadsave-round-trip-is-the-regression-net.md](snapshot/per-device-saveloadsave-round-trip-is-the-regression-net.md) | rule | Per-device save→load→save round-trip is the regression net |
 | [scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md](snapshot/scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md) | howto | Scratch SCSI volume - SGI VH layout and IRIX raw-device gotchas |
 | [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | design | Snapshot manifest format (snapshot.toml schema_version=1) |
