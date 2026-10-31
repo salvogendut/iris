@@ -70,6 +70,13 @@ reach the machine through one shared `MachineSlot` per machine, which the
 machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
 after iris-gui's Stop) gets "machine is not running" instead of freed memory.
 
+Library frontends can call `workstation::set_exit_on_guest_poweroff(false)`
+before starting a workstation. Guest power-off then stops the machine while
+leaving the host process alive to flush storage, display its stopped state or
+start another machine. This process-wide policy avoids mutating environment
+variables after threads start. The standalone default and the existing
+`IRIS_NO_EXIT_ON_POWEROFF` environment override remain unchanged.
+
 SCSI storage follows the same pattern one level down. `src/scsi.rs` is the
 target (disk, CD-ROM, DaynaPort) any controller can hold, and
 `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow` subcommands and

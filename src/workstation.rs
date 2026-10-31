@@ -33,6 +33,17 @@ use crate::monitor::Monitor;
 use crate::net::NatControl;
 use crate::traits::{Device, MachineEvent};
 
+// Embedders must be able to keep their host alive without changing the
+// process environment after threads have started.
+static EXIT_ON_GUEST_POWEROFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set the process-wide guest power-off policy before starting a workstation.
+/// False stops the guest but leaves the embedding application's event loop alive.
+/// The standalone default is true; IRIS_NO_EXIT_ON_POWEROFF still disables exit.
+pub fn set_exit_on_guest_poweroff(enabled: bool) {
+    EXIT_ON_GUEST_POWEROFF.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Build the machine `cfg` describes, or say why it cannot be built.
 ///
 /// Construction can put more than a megabyte on the stack, so call this from
@@ -408,7 +419,8 @@ pub(crate) fn register_system_controller(
                             // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
                             // does not kill the host process.
                             #[cfg(not(feature = "developer"))]
-                            if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+                            if EXIT_ON_GUEST_POWEROFF.load(std::sync::atomic::Ordering::Relaxed)
+                                && std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
                                 std::process::exit(0);
                             }
                         }
