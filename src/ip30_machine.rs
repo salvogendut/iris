@@ -545,9 +545,7 @@ impl OctaneMachine {
         // The guest clock points into this machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
-        if self.lifecycle != crate::machine_state::GuestState::Idle {
-            self.lifecycle = crate::machine_state::GuestState::Halted;
-        }
+        self.lifecycle = self.lifecycle.after_stop();
     }
 
     /// The hardware as at power-on, with the CPU stopped: memory and the
@@ -555,6 +553,9 @@ impl OctaneMachine {
     /// PCI function's header returns to power-up (RST#).
     pub fn reset(&mut self) {
         self.stop();
+        if self.lifecycle == crate::machine_state::GuestState::PoweredOff {
+            self.lifecycle = crate::machine_state::GuestState::Halted;
+        }
         for c in &self.cpus {
             Resettable::power_on(&**c);
         }

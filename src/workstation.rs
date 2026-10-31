@@ -92,7 +92,7 @@ pub trait Workstation: Send {
     /// Never `Running`: [`Workstation::status`] derives that from the CPU's
     /// own running flag, so an execution-control command cannot leave it
     /// stale. `start` moves it to `Starting` before the monitor binds and
-    /// `stop` to `Halted` (unless it was never started). See
+    /// `stop` to `Halted` (preserving `Idle` and `PoweredOff`). See
     /// [`crate::machine_state`].
     fn lifecycle(&self) -> GuestState;
     fn set_lifecycle(&mut self, state: GuestState);
@@ -119,14 +119,18 @@ pub trait Workstation: Send {
     ///
     /// Idempotent: a running machine is left alone and the acknowledgement says
     /// so. A machine that is `Starting` only needs the CPU released; an `Idle`
-    /// or `Halted` one also restarts its peripherals. The returned
-    /// [`TransitionAck`] is what the monitor prints.
+    /// or `Halted` one also restarts its peripherals. `PoweredOff` first resets
+    /// the hardware. The returned [`TransitionAck`] is what the monitor prints.
     fn start_guest(&mut self) -> Result<TransitionAck, String> {
         let from = self.status().state;
         if from == GuestState::Running {
             return Ok(TransitionAck { from, via: None, to: from });
         }
 
+        if from == GuestState::PoweredOff {
+            // Restart at the reset vector, including the panel power latch.
+            self.reset();
+        }
         let via = if from == GuestState::Starting {
             None
         } else {
@@ -420,6 +424,7 @@ pub(crate) fn register_system_controller(
                         MachineEvent::PowerOff => {
                             println!("Machine: soft power-off");
                             machine.stop();
+                            machine.set_lifecycle(GuestState::PoweredOff);
                             // Hosts that embed iris as a library (e.g. iris-gui)
                             // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
                             // does not kill the host process.

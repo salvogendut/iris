@@ -538,9 +538,7 @@ impl O2Machine {
         }
         self.bus.save_flash();
         // A machine that was never started has nothing to halt.
-        if self.lifecycle != crate::machine_state::GuestState::Idle {
-            self.lifecycle = crate::machine_state::GuestState::Halted;
-        }
+        self.lifecycle = self.lifecycle.after_stop();
     }
 
     /// Let the service thread look after the devices again.
@@ -561,6 +559,9 @@ impl O2Machine {
     /// reset does, less the restart.
     pub fn reset(&mut self) {
         self.stop();
+        if self.lifecycle == crate::machine_state::GuestState::PoweredOff {
+            self.lifecycle = crate::machine_state::GuestState::Halted;
+        }
         crate::traits::Resettable::power_on(&*self.cpu);
         self.bus.power_on();
         self.restart_peripherals();

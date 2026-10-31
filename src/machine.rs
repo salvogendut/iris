@@ -1028,9 +1028,7 @@ impl Machine {
         if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         // Idle -> Halted is not a lifecycle transition: a machine that was
         // never started has nothing to halt, and the monitor is not up to ask.
-        if self.lifecycle != GuestState::Idle {
-            self.lifecycle = GuestState::Halted;
-        }
+        self.lifecycle = self.lifecycle.after_stop();
         // A graceful stop must not lose the final partial line.
         if let Some(log) = &self.serial_log { log.flush(); }
     }
@@ -1604,6 +1602,9 @@ impl Machine {
     /// The CPU is left stopped — the monitor `run` command (or debugger) should start it.
     pub fn reset(&mut self) {
         self.stop();
+        if self.lifecycle == GuestState::PoweredOff {
+            self.lifecycle = GuestState::Halted;
+        }
 
         self.power_on_devices();
 
@@ -2162,6 +2163,14 @@ mod controller_lifetime_tests {
 
         let ack = machine.start_guest().expect("start after halt");
         assert_eq!(ack.text(), "halted -> starting -> running");
+        machine.stop();
+
+        // Embedded hosts may stop an already powered-off machine during cleanup.
+        machine.set_lifecycle(GuestState::PoweredOff);
+        machine.stop();
+        assert_eq!(machine.status().state, GuestState::PoweredOff);
+        let ack = machine.start_guest().expect("start after power-off");
+        assert_eq!(ack.text(), "powered_off -> starting -> running");
         machine.stop();
     }
 

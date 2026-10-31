@@ -271,6 +271,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 
 | Note | Kind | Title |
 |---|---|---|
+| [embedded-guest-poweroff-state.md](gui/embedded-guest-poweroff-state.md) | design | Distinguish completed guest power-off from stopped CPUs in embedded hosts |
 | [01-overview.md](gui/01-overview.md) | design | iris-gui — overview |
 | [cdrom-hot-insert-remount.md](gui/cdrom-hot-insert-remount.md) | rule | GUI CD-ROM insert must hot-load + remount /CDROM |
 | [cmd-q-bypasses-close-intercept-fold-on-poweroff.md](gui/cmd-q-bypasses-close-intercept-fold-on-poweroff.md) | rule | macOS Cmd+Q bypasses the close-intercept — fold CHD overlays on power-off, not just quit |

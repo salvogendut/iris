@@ -84,15 +84,18 @@ accepted in every build but do nothing without the feature.
 |---|---|
 | `machine-start` | Start the CPU and all peripherals. Idempotent: prints the transition it performed, e.g. `machine-start: halted -> starting -> running`, or `machine-start: running (no change)` |
 | `machine-stop` | Stop the CPU and all peripherals. Idempotent: prints `machine-stop: running -> halted` |
-| `machine-status [json]` | Guest state (`idle`, `starting`, `running`, `halted`) and whether the monitor is accepting commands; `json` emits one object |
+| `machine-status [json]` | Guest state (`idle`, `starting`, `running`, `halted`, `powered_off`) and whether the monitor is accepting commands; `json` emits one object |
 | `reset` | Reset all hardware to power-on state |
 | `save <name>` / `load <name>` | Save / load a snapshot under `saves/<name>/` (see [STORAGE.md](STORAGE.md#snapshots-and-rollback)) |
 | `testdev` | Bare-metal test device status (`cpu-tests/`, `bench/`) |
 
 The machine lifecycle is one value, and every surface reports it the same way:
 `idle` (not started; the monitor is not listening), `starting` (the monitor
-accepts commands but the CPU is parked), `running` (the CPU is executing), and
-`halted` (stopped by `machine-stop`, `reset` or a guest power-off). `running` is
+accepts commands but the CPU is parked), `running` (the CPU is executing),
+`halted` (stopped by `machine-stop` or `reset`), and `powered_off` (guest power-off
+completed). Embedded hosts that disable process exit can distinguish power-off
+from a pause. Repeated stops preserve `powered_off`; `machine-start` resets the
+hardware before restarting it. `running` is
 read from the CPU's own running flag, so the `start`/`stop` execution commands
 and breakpoints are reflected without a separate bookkeeping step.
 

@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Guest power-off state for embedded hosts
+
+- `Workstation::status` and the monitor report `powered_off` after guest power-off
+  finishes, separately from a halted CPU. Host cleanup preserves that state;
+  `machine-start` resets powered-off hardware before restarting. The default
+  standalone exit behavior is unchanged.
+
 ### CHD copy-on-write for embedded frontends
 
 - `block_node::open_chd_cow` supports uncompressed hard-disk CHDs with no

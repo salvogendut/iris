@@ -26,9 +26,12 @@ pub enum GuestState {
     Starting,
     /// The CPU is executing.
     Running,
-    /// The CPU was stopped by `machine-stop`, `reset`, or a guest power-off.
+    /// The CPU was stopped by `machine-stop` or `reset`.
     /// The monitor still accepts commands.
     Halted,
+    /// The guest requested power-off and all peripherals have stopped.
+    /// Embedded hosts may keep their window open after this transition.
+    PoweredOff,
 }
 
 impl GuestState {
@@ -38,13 +41,22 @@ impl GuestState {
             GuestState::Starting => "starting",
             GuestState::Running => "running",
             GuestState::Halted => "halted",
+            GuestState::PoweredOff => "powered_off",
+        }
+    }
+
+    /// A host stop must preserve an already completed guest power-off.
+    pub fn after_stop(self) -> Self {
+        match self {
+            Self::Idle | Self::PoweredOff => self,
+            _ => Self::Halted,
         }
     }
 
     /// Move to `to`, refusing transitions the lifecycle does not have.
     ///
     /// Identical states are allowed so callers can apply an operation
-    /// idempotently. The machine-level path is `Idle`/`Halted` -> `Starting`
+    /// idempotently. The machine-level path is `Idle`/`Halted`/`PoweredOff` -> `Starting`
     /// -> `Running`; reaching `Running` directly from `Idle` or `Halted` is a
     /// bug (it would claim the guest ran without a start), and a running guest
     /// cannot move back to `Starting` without being halted first.
@@ -58,6 +70,9 @@ impl GuestState {
                     | (Starting, Running)
                     | (Starting, Halted)
                     | (Running, Halted)
+                    | (Halted, PoweredOff)
+                    | (PoweredOff, Starting)
+                    | (PoweredOff, Halted)
             );
         if allowed {
             Ok(to)
@@ -243,6 +258,20 @@ mod tests {
             to: GuestState::Running,
         };
         assert_eq!(ack.text(), "starting -> running");
+    }
+
+    #[test]
+    fn power_off_survives_host_cleanup_and_can_restart() {
+        use GuestState::*;
+        let off = Running.after_stop().transition(PoweredOff).unwrap();
+        assert_eq!(off.after_stop(), PoweredOff);
+        assert_eq!(Idle.after_stop(), Idle);
+        assert_eq!(Starting.after_stop(), Halted);
+        assert_eq!(off.transition(Starting).unwrap().transition(Running).unwrap(), Running);
+        assert_eq!(off.transition(Halted).unwrap(), Halted); // hardware reset
+        let status = MachineStatus { state: off, cpu_running: false, monitor_addr: Some(addr()) };
+        assert_eq!(status.to_json()["state"], "powered_off");
+        assert!(status.text().contains("state:   powered_off"));
     }
 
     /// Reaching `Running` without passing through `Starting`, or rewinding a

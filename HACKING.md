@@ -65,6 +65,13 @@ around a different chipset implements the same trait and gets the window,
 iris-ci, iris-gui and the monitor's `reset`/`save`/`load`/`machine-status`
 with it.
 
+Guest `MachineEvent::PowerOff` stops the machine before publishing
+`GuestState::PoweredOff` under the shared slot lock. Embedded hosts can disable
+process exit with `set_exit_on_guest_poweroff(false)`, observe that state, then
+release their media and renderer. A stopped CPU alone does not imply power-off:
+monitor pauses and breakpoints must remain distinct. Repeated stops preserve the
+power-off state; `machine-start` resets powered-off hardware before starting.
+
 The monitor's system controller, the machine-events thread and the CI server
 reach the machine through one shared `MachineSlot` per machine, which the
 machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
