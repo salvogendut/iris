@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use crate::config::MachineConfig;
 use crate::gdb_stub::CpuDebug;
 use crate::dev::ps2::Ps2Controller;
-use crate::dev::z85c30::CiSerialBackend;
+use crate::dev::serial_host::CiSerialBackend;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::machine::Machine;
@@ -237,6 +237,11 @@ pub trait Workstation: Send {
         Ok(0)
     }
 
+    /// The count of guest frames every network backend feeds, for the GUI's
+    /// network indicator.
+    fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        None
+    }
     /// The NAT engine's controls, when the machine's Ethernet runs on it.
     fn nat_control(&self) -> Option<Arc<NatControl>> {
         None
@@ -269,9 +274,9 @@ impl dyn Workstation + '_ {
     // The NAT controls by name, for embedders. Each is a no-op (or reports
     // nothing) on a machine without a NAT.
 
-    /// Guest-originated Ethernet frames the NAT has processed so far.
+    /// Guest-originated Ethernet frames the network backend has processed so far.
     pub fn net_guest_frames(&self) -> u64 {
-        self.nat_control().map_or(0, |n| n.guest_frames())
+        self.net_frames().map_or(0, |f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
     /// The guest's own source IP as last seen on the wire.
     pub fn net_observed_guest_ip(&self) -> Option<Ipv4Addr> {

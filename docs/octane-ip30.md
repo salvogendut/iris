@@ -146,7 +146,8 @@ gateway, with the usual settings: `nat_subnet`, `[nfs]`, `[[port_forward]]`,
 route of 192.0.2.3 works with `nat_subnet = "192.0.2.0/24"` unchanged. When
 `[network] mac` is unset the station address is 08:00:69:12:34:56; set your
 own if more than one Octane shares a network. `[network] mode = "off"`
-unplugs the Ethernet; `pcap` is not available.
+unplugs the Ethernet; `pcap` bridges it onto a host interface instead (see
+[NETWORKING.md](../NETWORKING.md)), with no NAT services.
 
 ## Inspecting the machine
 
@@ -172,7 +173,7 @@ interrupt, the NVRAM flush) as `hptimer` one-shots, so they fire without the
 guest touching the chip. RAD audio is paced by `hptimer` too and
 has no thread of its own. Each ISP1040 runs a request-ring thread, started
 with the machine and joined when it stops. The Ethernet has a receive pump
-and the NAT engine (`ip30-eth-rx`, `ip30-eth-nat`). A power-off from the
+and the network backend (`ip30-eth-rx`, `ip30-eth-net`). A power-off from the
 guest (the DS1685 clock powering the machine down) reaches the machine
 through its event channel. `HACKING.md` lists the thread names.
 

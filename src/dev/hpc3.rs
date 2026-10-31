@@ -10,7 +10,7 @@ use crate::config::{AudioConfig, NetworkConfig, RtcOffset};
 use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::dev::ioc::Ioc;
 use crate::dev::ds1x86::Ds1x86;
-use crate::net::GatewayConfig;
+use crate::net::{GatewayConfig, Link};
 use crate::dev::seeq8003::Seeq8003;
 use crate::dev::wd33c93a::Wd33c93a;
 use crate::irq::{InterruptController, IrqLine};
@@ -1106,8 +1106,20 @@ pub struct Hpc3 {
 }
 
 impl Hpc3 {
-    pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, AudioConfig::default(), "nvram.bin".to_string(), RtcOffset::default(), true)
+    /// The empty SCSI buses of a board: one controller on an Indy (guinness),
+    /// two on an Indigo2. A machine fills them from `[scsi.N]` and gives them
+    /// to [`Self::with_net`].
+    pub fn new_scsi_buses(guinness: bool) -> Vec<crate::scsi::ScsiBus> {
+        (0..if guinness { 1 } else { 2 }).map(|_| Wd33c93a::new_bus()).collect()
+    }
+
+    /// The bus `controller` names among a board's `buses`, or why there is none.
+    pub fn route_scsi(buses: &[crate::scsi::ScsiBus], controller: u8) -> Result<&crate::scsi::ScsiBus, String> {
+        match controller {
+            c if (c as usize) < buses.len() => Ok(&buses[c as usize]),
+            1 => Err("controller 1 (this machine has only controller 0)".to_string()),
+            c => Err(format!("controller {c} (valid: 0, 1)")),
+        }
     }
 
     /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
@@ -1115,15 +1127,9 @@ impl Hpc3 {
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
     /// target for `iris-ci rtc-save`); `rtc_offset` shifts the RTC's
     /// host-time seed (`[rtc_offset]`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool) -> Self {
-        let nfs = net.nfs;
-        let port_forwards = net.port_forward;
-        let subnet = net.nat_subnet.unwrap_or_default();
-        let net_mode = net.mode;
-        let pcap_interface = net.pcap_interface;
-        let nfs_pcap_ip = net.nfs_pcap_ip;
-        let tftp_dir = net.tftp_dir.clone();
-        let rsh_dir = net.rsh_dir.clone();
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool, scsi_buses: Vec<crate::scsi::ScsiBus>) -> Self {
+        let mut scsi_buses = scsi_buses.into_iter();
+        let gateway_cfg = GatewayConfig::from_network(&net);
         let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1190,21 +1196,14 @@ impl Hpc3 {
         pdma_channels[HPC3_PDMA_CHAN_SCSI0 as usize].lock().irq = Some(irqs.line(HPC3_INTSTAT_SCSI0_DMA));
         pdma_channels[HPC3_PDMA_CHAN_SCSI1 as usize].lock().irq = Some(irqs.line(HPC3_INTSTAT_SCSI1_DMA));
         let seeq_irq = irqs.line(HPC3_INTSTAT_ENET_DEV);
-        let gateway_cfg = GatewayConfig {
-            nfs,
-            port_forwards,
-            gateway_ip: subnet.gateway_ip,
-            client_ip:  subnet.client_ip,
-            netmask:    subnet.netmask,
-            mode:       net_mode,
-            pcap_interface,
-            nfs_pcap_ip,
-            tftp_dir,
-            rsh_dir,
-            ..GatewayConfig::default()
-        };
         let net_base = gateway_cfg.clone();
+        let link = Link::with_gateway(gateway_cfg.clone());
         let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
+        match link {
+            Ok(Some(link)) => seeq.attach(link),
+            Ok(None) => {}
+            Err(e) => eprintln!("iris: network: {e}; Ethernet left unplugged"),
+        }
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());
         
@@ -1213,14 +1212,16 @@ impl Hpc3 {
         // lingering PDMA INT on the same line; see Hpc3Interrupts.
         let scsi0_irq = irqs.line(HPC3_INTSTAT_SCSI0_DEV);
 
-        let scsi_dev = Arc::new(Wd33c93a::new_with_id(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), scsi_deferred_int, 0));
+        let scsi_dev = Arc::new(Wd33c93a::new_with_id(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), scsi_deferred_int, 0,
+            scsi_buses.next().expect("a board has a SCSI bus")));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
 
         // Fullhouse's second WD33C93A — see scsi1_wd_lock's doc comment above.
         let scsi_dev1 = if !guinness {
             let scsi1_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[9].clone() });
             let scsi1_irq = irqs.line(HPC3_INTSTAT_SCSI1_DEV);
-            let dev = Arc::new(Wd33c93a::new_with_id(Some(scsi1_dma), Some(scsi1_irq), heartbeat.clone(), scsi_deferred_int, 1));
+            let dev = Arc::new(Wd33c93a::new_with_id(Some(scsi1_dma), Some(scsi1_irq), heartbeat.clone(), scsi_deferred_int, 1,
+                scsi_buses.next().expect("a fullhouse board has a second SCSI bus")));
             let _ = scsi1_wd_lock.set(dev.clone());
             Some(dev)
         } else {
@@ -1270,10 +1271,6 @@ impl Hpc3 {
         }
     }
 
-    pub fn add_scsi_device(&self, controller: u8, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
-        self.scsi_controller(controller).add_device(id, path, is_cdrom, discs, overlay, None)
-    }
-
     /// Attach a DaynaPort SCSI/Link (SCSI-attached Ethernet) at `id`.
     ///
     /// Each DaynaPort gets its **own** `NatEngine` on its own subnet, separate
@@ -1294,14 +1291,6 @@ impl Hpc3 {
             ..self.net_base.clone()
         };
         self.scsi_controller(controller).add_daynaport(id, params.mac, gateway)
-    }
-
-    /// Same as `add_scsi_device` but lets the caller specify where the COW
-    /// overlay file lives. Used by `--ci` mode to keep per-process overlays
-    /// in `/tmp` so parallel `--ci` instances (and an interactive session)
-    /// don't race on the same file.
-    pub fn add_scsi_device_with_overlay(&self, controller: u8, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool, overlay_path: &str) -> std::io::Result<()> {
-        self.scsi_controller(controller).add_device(id, path, is_cdrom, discs, overlay, Some(overlay_path))
     }
 
     pub fn ioc(&self) -> &Ioc {
@@ -2368,7 +2357,7 @@ mod tests {
         let hpc = Hpc3::with_net(
             ee.clone(), Ioc::new_ci(true), false, Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(), true, AudioConfig::default(), nvram.clone(),
-            RtcOffset::default(), true,
+            RtcOffset::default(), true, Hpc3::new_scsi_buses(false),
         );
         hpc.rtc.write8(500, 0x5a);
         ee.lock().set_word(0x74, 0x3530);
@@ -2400,6 +2389,7 @@ mod tests {
             String::new(),
             RtcOffset::default(),
             true,
+            Hpc3::new_scsi_buses(true),
         )
     }
 
@@ -2573,6 +2563,7 @@ mod enet_rx_chain_tests {
             String::new(),
             RtcOffset::default(),
             true,
+            Hpc3::new_scsi_buses(true),
         )
     }
 
@@ -2597,5 +2588,18 @@ mod enet_rx_chain_tests {
             "the channel refused the frame but still reports ACTIVE, so \
              sq_rxintr's restart path never runs and receive never resumes",
         );
+    }
+
+    /// A target for controller 1 on an Indy, which has one, is an error that
+    /// names the machine; an Indigo2 has the second bus.
+    #[test]
+    fn the_second_scsi_controller_exists_on_an_indigo2_only() {
+        let indy = Hpc3::new_scsi_buses(true);
+        assert!(Hpc3::route_scsi(&indy, 0).is_ok());
+        let e = Hpc3::route_scsi(&indy, 1).err().unwrap();
+        assert!(e.contains("only controller 0"), "{e}");
+        let indigo2 = Hpc3::new_scsi_buses(false);
+        assert!(Hpc3::route_scsi(&indigo2, 1).is_ok());
+        assert!(Hpc3::route_scsi(&indigo2, 2).err().unwrap().contains("valid: 0, 1"));
     }
 }

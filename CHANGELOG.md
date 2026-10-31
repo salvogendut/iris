@@ -29,6 +29,20 @@ hashes are given where a change is easiest to understand by reading the commit.
   Selecting embedded Indy firmware with an empty PROM path reports an
   informational message instead of a missing-file warning.
 
+### Two processors on the Octane
+
+- **`[machine] cpus = 2`** runs an Octane with two R10000s on two host threads.
+  The real PROM and IRIX bring the second up through HEART, which now answers per
+  processor; IRIX 6.5 schedules across both. Both share one body of jitv2 compiled
+  code. See [docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md).
+- **Monitor.** CPU commands moved out of `mips_exec.rs` behind one `CpuMonitor`.
+  With one CPU nothing changes. With two there are `cpus`, `cpu <n>`,
+  `cpu <n> <command>`, `r<n>` and `s<n>`, and the status bar shows MIPS and Hz per
+  CPU. See [debug.md](debug.md#several-cpus).
+- **HEART's software reset** (`MODE` bit 22) now resets the machine.
+- **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
+  DMA engine or another CPU storing beside them is not lost.
+
 ### VNC, and screen and pointer commands
 
 - **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the
@@ -67,6 +81,23 @@ hashes are given where a change is easiest to understand by reading the commit.
   cursor position fields are 12-bit signed; they were read as unsigned, so a
   cursor partly off the edge was drawn 4000 pixels away. (`src/dev/o2gfx.rs`)
 
+### SCSI
+
+- Every SCSI controller attaches its targets through one shared bus, and
+  disks report one emulated identity on every machine. The O2 and Octane now
+  say `IRIS EMUL DISK` and `IRIS EMUL CDROM` in INQUIRY; the Indy and Indigo2
+  keep their Sony CD-ROM.
+- A disc change loads a CHD CD as well as an ISO, and the O2, the Octane and
+  the Indigo2's second controller fold pending CHD diffs on a clean exit as the
+  first controller always did.
+
+### Serial ports
+
+- The O2 and Octane serial ports share one 16550A core ported from QEMU. On the
+  O2 this adds the receive FIFO with trigger levels and the character timeout;
+  O2 snapshots from before are refused (snapshot schema 5).
+- Serial host backends moved out of the Z85C30 into `src/dev/serial_host.rs`.
+
 ### Host efficiency on small machines
 
 - **Threads that have nothing to do now sleep in milliseconds, not
@@ -92,6 +123,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   the same lock the CPU thread needed to arm it. It now sleeps 100 µs between
   attempts, which is still far below the timescales a disk command runs at.
   (`src/dev/wd33c93a.rs`)
+- **Newport's REX3 thread sleeps while the screen is idle.** `REX3-Processor`
+  yield-spun at ~100 % of a host core on an idle desktop in every build but
+  `idle-pause`; it now parks when its queue is empty, and the producer wakes
+  it on the next write. (`src/dev/ng1/rex3.rs`)
+- **The timer thread sleeps between deadlines instead of spinning.** On the
+  Indigo2 the `hptimer` thread kept a host core at ~100 %: it spun for every
+  wait under 200 µs, and the machine's tick timers keep the waits that short.
+  It now sleeps to 50 µs short of a deadline and spins the rest, and an Indigo2
+  at the login screen uses a few percent of a core.
+  (`src/hptimer.rs`)
 
 ### Idle parking
 
@@ -111,6 +152,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   counters.
 - The `ci_clock` unit tests that materialise Count now advance it by retired
   cycles, so `--features ci_clock,idle-pause` passes.
+- **A masked pending interrupt no longer freezes a guest that polls with
+  interrupts off.** With interrupts disabled and a masked line pending, the
+  CPU thread slept until a new unmasked interrupt or a monitor command, so a
+  guest polling a device (the console's transmit-ready bit, say) stopped
+  mid-line for minutes. It keeps running now.
 
 ### JIT v2
 
@@ -166,6 +212,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
 ### SGI Octane (IP30)
 
+- **Octane compile workers start after the memory windows are published.** A
+  worker that started first could compile every load and store without the
+  inline path for the whole run. Two test boots of the old order did not hit
+  it.
+- **Octane audio plays at the rate the guest asks for.** RAD audio ran at
+  44.1 kHz whatever IRIX programmed, so games and other non-44.1 kHz sounds
+  played at the wrong speed. `test/audiotest` sweeps rates and formats.
+  ([#354](https://github.com/techomancer/iris/issues/354))
 - **IMPACT on the Octane passes the GL pixel and state suites.** On IRIX
   6.5.22 pixtest went from 52 to 366 passing cases (the two left fail on the
   Indigo2 too) and glstate from 393 to 394. The Octane's microcode keeps the
@@ -260,6 +314,23 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2 runs on the shadow cache from reset.** The full cache model, and
+  the switch to and from it during POST and reboots, are gone
+  (`src/ip32_handover.rs`), and with them a branch on every cached load, store
+  and fetch. POST keeps its stack in cache tags for physical page 0 while it
+  tests that page uncached; the bus now answers for that page from a page of
+  its own for as long as those tags stand (`O2Memory::stack_tag_store`).
+  O2 snapshots from before are refused unless `IRIS_SNAPSHOT_SKIP_CHECK=1` is
+  set, which is safe for one taken while an OS ran and not for one taken
+  during POST.
+- **O2 audio at 8 and 11 kHz no longer plays sharp.** A read of MACE's
+  audio registers now brings the rings up to date, so IRIX, which keeps
+  only about 2 ms of sound queued, no longer lets them run dry between
+  service passes.
+- **The O2's Ethernet-address chip is on the shared 1-wire bus** (`dev::mace_id`,
+  ported from the QEMU model); the MAC reads correctly at any emulator speed.
+- The O2's front LEDs show in the status bar.
+- The O2's SCSI and Ethernet lights show in the status bar.
 - **The O2 is on `Physical`.** Its bus is the same decode table and memory
   window as the Indy's: CRIME's banks are RAM banks a bank-control write
   remaps, CRIME, GBE, VICE, MACE and the flash are table entries, and
@@ -573,9 +644,17 @@ hashes are given where a change is easiest to understand by reading the commit.
   the root, as `tftpd -s` does, and serves netascii. `test/tftp/` has a
   portable client (`tftpget.c`) and a guest test script. The monitor's
   `ps2 esc` presses Esc, which stops the PROM's autoboot.
+- The SEEQ, DaynaPort, MEC and IOC3 now get their NAT or PCAP backend from one
+  shared link, so a new backend is one implementation. The backend threads are
+  named `seeq-net`, `daynaN-net`, `ip32-mec-net` and `ip30-eth-net`.
+- `mode = "pcap"` is allowed on the O2 and the Octane, untested on a real
+  interface.
 
 ### UI / input
 
+- **The status bar and debug overlays use SGI's Screen 16 font** instead of
+  the PC VGA font. `tools/gen-screen-font.py` generates the table from the
+  font's PCF file.
 - **`--2x` and `scale = 2` survive boot.** The window opened at 2× but
   snapped back to 1× as soon as the PROM or IRIX set a video mode. Every
   guest mode change now sizes the window to the new resolution times the
