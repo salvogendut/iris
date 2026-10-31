@@ -2170,14 +2170,14 @@ impl Rex3 {
         let mut triples: Vec<(u32, u32, u32)> = all.into_iter().collect();
         triples.sort_unstable();
 
-        eprintln!(
+        crate::diagnostics::stderr(format_args!(
             "REX3 corpus: {} drawn this session ({} new), {} on disk, {} precompiled -> saving {}",
             drawn.len(),
             new_this_run,
             on_disk.len(),
             crate::dev::ng1::rex3_shaders::SHADERS.len(),
             triples.len(),
-        );
+        ));
         if let Err(e) = crate::dev::ng1::rex3_profile::save_profile(&triples) {
             eprintln!("REX3: failed to save shape corpus: {e}");
         }
@@ -3467,7 +3467,7 @@ impl Rex3 {
             REX3_CONFIG | REX3_STATUS | REX3_USER_STATUS |
             REX3_DCBMODE | REX3_DCBDATA0 | REX3_DCBDATA1 | REX3_DCBRESET => {}
             _ => {
-                eprintln!("REX3 Write: unhandled reg {:04x} ({}), val {:08x}", reg_offset, rex3_reg_name(reg_offset), val);
+                crate::diagnostics::stderr(format_args!("REX3 Write: unhandled reg {:04x} ({}), val {:08x}", reg_offset, rex3_reg_name(reg_offset), val));
             }
         }
         exit
@@ -4310,7 +4310,7 @@ impl Rex3 {
                     REX3_XYWIN        => busy_or_val!(ctx.xywin),
                     REX3_CLIPMODE     => busy_or_val!(ctx.clipmode & 0x1FFF),
                     _ => {
-                        eprintln!("REX3 Read32: unhandled reg {:04x} ({})", reg_offset, rex3_reg_name(reg_offset));
+                        crate::diagnostics::stderr(format_args!("REX3 Read32: unhandled reg {:04x} ({})", reg_offset, rex3_reg_name(reg_offset)));
                         BusRead32::ok(0)
                     }
                 }

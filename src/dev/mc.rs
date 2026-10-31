@@ -483,10 +483,10 @@ impl MemoryController {
                 new_memcfg1,
                 self.ram_sizes
             );
-            eprintln!(
+            crate::diagnostics::stderr(format_args!(
                 "MC: synthesized MEMCFG1 for extended RAM (banks {:?})",
                 self.ram_sizes
-            );
+            ));
         }
         changed
     }
@@ -505,7 +505,7 @@ impl MemoryController {
         state.regs[(REG_CPU_ERROR_ADDR / 4) as usize] = addr as u32;
         state.regs[(REG_CPU_ERROR_STAT / 4) as usize] = 1u32 << 10; // cpu address error
         dlog_dev!(LogModule::Mc, "MC: CPU Error at {:08x}", addr);
-        eprintln!("MC: CPU Error at {:08x}", addr);
+        crate::diagnostics::stderr(format_args!("MC: CPU Error at {:08x}", addr));
     }
 
     /// A GIO access nobody answered. Returns whether the MC aborts it with a
@@ -519,7 +519,7 @@ impl MemoryController {
             state.regs[(REG_GIO_ERROR_STAT / 4) as usize] = 1u32 << 10; // TIME: GIO bus timeout
         }
         dlog_dev!(LogModule::Mc, "MC: GIO Timeout at {:08x} (abort_en={})", addr, abort_en);
-        eprintln!("MC: GIO Timeout at {:08x}", addr);
+        crate::diagnostics::stderr(format_args!("MC: GIO Timeout at {:08x}", addr));
         abort_en
     }
 

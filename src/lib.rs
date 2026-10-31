@@ -165,6 +165,7 @@ pub mod config;
 pub mod traits;
 #[macro_use]
 pub mod devlog;
+pub mod diagnostics;
 pub mod prombin;
 pub mod prombini2;
 pub mod prombinip28;

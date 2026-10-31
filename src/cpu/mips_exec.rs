@@ -5233,7 +5233,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             } else {
                 // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
                 if r.status != BUS_BUSY {
-                    eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}", virt_addr, phys_addr, r.status);
+                    crate::diagnostics::stderr(format_args!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}", virt_addr, phys_addr, r.status));
                 }
                 FetchInstrResult::exception(r.status)
             }
@@ -5361,7 +5361,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                                     };
                                     #[cfg(not(feature = "developer"))]
                                     let jitcheck_pass = "";
-                                    eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, r.status, jitcheck_pass);
+                                    crate::diagnostics::stderr(format_args!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, r.status, jitcheck_pass));
                                     self.core.cp0_badvaddr = virt_addr;
                                 }
                             }
@@ -5518,7 +5518,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws);
+                crate::diagnostics::stderr(format_args!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws));
             }
             ws
         };
@@ -5574,7 +5574,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}", self.core.pc, virt_addr, phys_addr, val, mask, ws);
+                crate::diagnostics::stderr(format_args!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}", self.core.pc, virt_addr, phys_addr, val, mask, ws));
             }
             ws
         }

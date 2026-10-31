@@ -316,8 +316,8 @@ impl Bt445 {
                         let prev_sog = prev & CMD1_SOG_ENABLE != 0;
                         let new_sog  = val  & CMD1_SOG_ENABLE != 0;
                         if prev_sog != new_sog {
-                            eprintln!("BT445: Sync-on-Green (IOG) {}",
-                                if new_sog { "ENABLED" } else { "DISABLED" });
+                            crate::diagnostics::stderr(format_args!("BT445: Sync-on-Green (IOG) {}",
+                                if new_sog { "ENABLED" } else { "DISABLED" }));
                         }
                     }
                 }

@@ -50,7 +50,11 @@ impl Prom {
                 Self::from_bytes(&bytes)
             }
             Err(e) => {
-                eprintln!("Warning: Could not read PROM file '{}': {} — using embedded PROM", path, e);
+                if path.is_empty() {
+                    crate::diagnostics::stderr(format_args!("PROM: using embedded firmware"));
+                } else {
+                    eprintln!("Warning: Could not read PROM file '{}': {} — using embedded PROM", path, e);
+                }
                 Self::from_bytes(&crate::prombin::PROM0709101011)
             }
         }

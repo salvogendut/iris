@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Embedding diagnostics
+
+- Library frontends can route routine startup, CPU/MC bus-exception, Newport
+  register/display and draw-cache diagnostics through a process-wide
+  `diagnostics::DiagnosticSink`. The default keeps console output; host failures
+  and explicit serial/monitor/file tracing retain their own reporting paths.
+  Selecting embedded Indy firmware with an empty PROM path reports an
+  informational message instead of a missing-file warning.
+
 ### VNC, and screen and pointer commands
 
 - **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the

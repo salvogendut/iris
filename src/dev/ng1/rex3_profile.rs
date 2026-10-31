@@ -74,7 +74,7 @@ fn load_profile_inner(verbose: bool) -> Vec<(u32, u32, u32)> {
     }
 
     if verbose {
-        eprintln!("REX3 corpus: loaded {} draw shapes from {:?}", entries.len(), path);
+        crate::diagnostics::stderr(format_args!("REX3 corpus: loaded {} draw shapes from {:?}", entries.len(), path));
     }
     entries
 }
@@ -101,7 +101,7 @@ pub fn save_profile(entries: &[(u32, u32, u32)]) -> io::Result<()> {
     }
 
     writer.flush()?;
-    eprintln!("REX3 corpus: saved {} draw shapes to {:?}", entries.len(), path);
+    crate::diagnostics::stderr(format_args!("REX3 corpus: saved {} draw shapes to {:?}", entries.len(), path));
     Ok(())
 }
 

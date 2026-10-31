@@ -76,7 +76,7 @@ impl Monitor {
             return;
         }
         thread::spawn(move || {
-            println!("Monitor listening on {}", addr);
+            crate::diagnostics::stdout(format_args!("Monitor listening on {}", addr));
             for stream in listener.incoming() {
                 if self.shutdown.load(Ordering::SeqCst) {
                     break; // drops the listener: the port is free again

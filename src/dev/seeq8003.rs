@@ -588,7 +588,7 @@ impl Device for Seeq8003 {
                     engine.run();
                     return;
                 }
-                eprintln!("iris: networking backend = NAT (software gateway)");
+                crate::diagnostics::stderr(format_args!("iris: networking backend = NAT (software gateway)"));
                 let mut engine = NatEngine::new(config, tx_cons, rx_prod,
                                                 rx_wake_nat, tx_wake_nat,
                                                 running_nat, nat_ctl);
@@ -602,7 +602,7 @@ impl Device for Seeq8003 {
                                lacks --features pcap; falling back to NAT gateway. \
                                Rebuild with `--features pcap`.");
                 } else {
-                    eprintln!("iris: networking backend = NAT (software gateway)");
+                    crate::diagnostics::stderr(format_args!("iris: networking backend = NAT (software gateway)"));
                 }
                 NatEngine::new(config, tx_cons, rx_prod,
                                rx_wake_nat, tx_wake_nat,

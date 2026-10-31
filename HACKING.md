@@ -77,6 +77,17 @@ start another machine. This process-wide policy avoids mutating environment
 variables after threads start. The standalone default and the existing
 `IRIS_NO_EXIT_ON_POWEROFF` environment override remain unchanged.
 
+Embedded frontends can also install a process-wide
+`diagnostics::DiagnosticSink` with `diagnostics::set_sink`. Routine startup,
+CPU/MC bus-exception, Newport register/display and draw-cache messages use this
+channel. Without a sink they retain their stdout/stderr destinations. Host
+failures, guest serial output and explicit monitor/file tracing remain separate.
+The sink runs on the emitting thread, possibly with device locks held: keep it
+short, use bounded buffering for UI output, and never call SDL or devices from
+it. The router releases its own lock before invoking or dropping a sink.
+Changing routing affects reporting only; bus exceptions and cache writes still
+occur normally. `set_sink(None)` restores the standalone console behavior.
+
 SCSI storage follows the same pattern one level down. `src/scsi.rs` is the
 target (disk, CD-ROM, DaynaPort) any controller can hold, and
 `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow` subcommands and
