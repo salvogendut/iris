@@ -49,6 +49,9 @@ use std::path::{Path, PathBuf};
 
 use crate::chd_disk::{ChdCd, ChdHd};
 
+mod chd_cow;
+pub use chd_cow::open_chd_cow;
+
 /// Sector granularity shared by the raw and overlay layers. Matches the SCSI
 /// disk sector size and [`crate::cow_disk`]'s private constant.
 pub const SECTOR_BYTES: usize = 512;

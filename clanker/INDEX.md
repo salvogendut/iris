@@ -133,6 +133,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | Note | Kind | Title |
 |---|---|---|
 | [a-write-cdb-must-outlive-its-data-request.md](scsi/a-write-cdb-must-outlive-its-data-request.md) | rule | A write CDB must outlive the chip's request for its data |
+| [hashless-chd-cow.md](scsi/hashless-chd-cow.md) | rule | Hashless CHDs need a sparse overlay instead of a MAME child |
 | [daynaport-target-gotchas.md](scsi/daynaport-target-gotchas.md) | rule | DaynaPort target: the three things that bite |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |

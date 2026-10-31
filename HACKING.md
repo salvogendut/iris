@@ -99,6 +99,12 @@ lend theirs and keep only chip-specific subcommands (`regs`; the WD's `wdt`,
 their devices from the `[scsi.N]` tables, where the key is a slot
 (controller × 16 + id, see `config::scsi_slot`).
 
+Library frontends requiring copy-on-write can use `block_node::open_chd_cow`.
+It returns a `BlockNode` using a MAME diff when the base has a hash, or a sparse
+sector overlay over a read-only CHD when an uncompressed base has no SHA-1.
+The latter refuses commit to prevent raw offsets from corrupting the CHD;
+see [STORAGE.md](STORAGE.md#chd-image-support) for sidecar handling.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit

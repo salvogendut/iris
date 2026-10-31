@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### CHD copy-on-write for embedded frontends
+
+- `block_node::open_chd_cow` supports uncompressed hard-disk CHDs with no
+  stored SHA-1 using a persistent sparse overlay. The base stays read-only;
+  an empty diff left by the previous `InvalidFile` failure is preserved and
+  bypassed after validation. Diffs with data or damage are reported for recovery.
+
 ### Embedding diagnostics
 
 - Library frontends can route routine startup, CPU/MC bus-exception, Newport

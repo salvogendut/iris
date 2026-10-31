@@ -11,6 +11,15 @@ IRIS mounts `.chd` hard-disk and CD-ROM images directly without first
 extracting to raw. Compressed parent CHDs stay untouched — writes go to a
 MAME-style `.diff.chd` sidecar.
 
+Library frontends that always protect disks can use `block_node::open_chd_cow`.
+For uncompressed CHDs without a stored SHA-1, it uses a read-only CHD backing
+and sparse `.diff.chd.overlay` / `.diff.chd.overlay.dirty` files instead of a
+MAME child. These paths honor `IRIS_CHD_DIFF_DIR`. Keep both sidecars with the
+base: they hold persistent guest writes. Rollback is supported; commit is
+rejected because raw sector offsets cannot be written into a CHD container.
+An empty child left by an older failed open is checked and preserved. A damaged
+or allocated child blocks opening so its contents are not silently lost.
+
 The CHD backend (`libchdman-rs` >= 0.288.8) and the MAME CHD core it vendors
 are BSD-3-Clause licensed, so IRIS stays fully BSD-3-Clause (see
 `LICENSE-libchdman-rs.txt`).
