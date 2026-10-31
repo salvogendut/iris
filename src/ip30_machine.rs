@@ -77,6 +77,8 @@ fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64
 }
 
 pub struct OctaneMachine {
+    /// Where this machine has memory.
+    pub memory: Arc<crate::memory_map::MemoryMap>,
     pub phys: Arc<Ip30Bus>,
     pub heart: Arc<Heart>,
     pub ram: Arc<HeartRam>,
@@ -279,8 +281,9 @@ impl OctaneMachine {
         // CPU 0 keeps the counter the graphics board already reads.
         let mut ticks = vec![fasttick];
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
+        let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -312,6 +315,7 @@ impl OctaneMachine {
             unsafe {
                 sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
                 cpu.set_tcache_window(sp.window_base());
+                cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
                 let bitmap = cpu.tcache_bitmap_ptr();
                 if !bitmap.is_null() {
                     sp.set_bitmap_sink2(bitmap);
@@ -321,6 +325,7 @@ impl OctaneMachine {
                 for c in cpus.iter().skip(1) {
                     sp.add_bitmap_sink(c.ppmem_bitmap_ptr());
                     c.set_tcache_window(sp.window_base());
+                    c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
                     let bitmap = c.tcache_bitmap_ptr();
                     if !bitmap.is_null() {
                         sp.add_bitmap_sink(bitmap);
@@ -410,6 +415,7 @@ impl OctaneMachine {
             eth.attach(link);
         }
         Ok(Self {
+            memory,
             phys,
             heart,
             ram,
@@ -474,13 +480,14 @@ impl OctaneMachine {
     fn build_cpu(
         id: u8,
         cpu_count: u8,
+        memory: Arc<crate::memory_map::MemoryMap>,
         sysad: Arc<dyn BusDevice>,
         cached: Arc<CachedFlashLines>,
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
     ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>();
+        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
@@ -521,6 +528,18 @@ impl OctaneMachine {
         d
     }
 
+    /// Reverse of start order, but graphics last: its stop joins a display
+    /// thread, which can fail to end, and the disks must be stopped by then.
+    fn stop_devices(&self) {
+        // `devices` ends with the graphics board, if there is one.
+        for d in self.devices().iter().rev().skip(self.gfx.iter().count()) {
+            d.stop();
+        }
+        if let Some(g) = &self.gfx {
+            g.stop();
+        }
+    }
+
     pub fn start(&mut self) {
         if let Ok(starting) = self.lifecycle.transition(crate::machine_state::GuestState::Starting) {
             self.lifecycle = starting;
@@ -539,9 +558,7 @@ impl OctaneMachine {
     /// and IOC3 writes its NVRAM out.
     pub fn stop(&mut self) {
         self.stop_cpus();
-        for d in self.devices().iter().rev() {
-            d.stop();
-        }
+        self.stop_devices();
         // The guest clock points into this machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
@@ -616,9 +633,8 @@ impl Drop for OctaneMachine {
             slot.lock().0 = MachineRef::null();
         }
         self.stop_cpus();
-        for d in self.devices().iter().rev() {
-            d.stop();
-        }
+        self.stop_devices();
+        crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
 }
@@ -705,6 +721,9 @@ impl Workstation for OctaneMachine {
     }
     fn pending_chd_sync_count(&self) -> usize {
         self.scsi.iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+    }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.scsi.iter().try_for_each(|c| c.bus().flush())
     }
     fn sync_chd_disks(
         &self,

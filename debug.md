@@ -160,7 +160,13 @@ Without a number, `start`, `stop` and the breakpoint commands (`bp`, `b`, `bd`,
 `be`, `bb`) apply to every CPU, `status` answers for each, and everything else
 goes to the selected CPU. A number always means that CPU alone, even for `stop`.
 
-To step one CPU while the other holds still:
+**Debugging a running guest on two CPUs is not supported.** The commands run,
+but there is no way to step one CPU that keeps the guest healthy. If the other
+CPU stays stopped, the stepped one will eventually wait on a lock or a reply
+from it for good. If the other CPU runs, it finds that the stepped one has
+stopped responding, and IRIX panics. Reading registers and memory while every
+CPU is stopped is fine, and so is a short step to look at something, as long as
+you expect to reboot afterwards:
 
 ```
 stop
@@ -170,8 +176,9 @@ start
 ```
 
 HEART's counter keeps running through a monitor stop, and the guest's
-timeouts count on it, so a long stop can make IRIX report that a CPU missed its
-clock. A breakpoint stops the CPU that hit it; the other keeps running until
+timeouts count on it, so even a long stop with no stepping can make IRIX report
+that a CPU missed its clock. To debug code rather than the two-CPU behaviour,
+boot with `cpus = 1`. A breakpoint stops the CPU that hit it; the other keeps running until
 `stop`. `heart status` shows each CPU's mask, interrupt outputs and why it is
 held. `j2 inline` and `j2 clear` are refused with several CPUs. The GDB stub
 sees CPU 0.
@@ -255,7 +262,7 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 | Command | Description |
 |---|---|
 | `dt [n]` / `dt file <path> [n]` | Disassemble the traceback: the last `n` instructions executed (the history holds 1,048,576) |
-| `undo on` / `undo off` | Enable / disable the undo buffer **[DEV]** |
+| `undo on` / `undo off` | Enable / disable the undo buffer, which records stores to the machine's RAM **[DEV]** |
 | `undo [n]` / `u` | Step back `n` instructions, reversing register and memory changes **[DEV]** |
 | `undo clear` / `undo resize <n>` | Clear / resize the undo history **[DEV]** |
 | `debug <on\|off\|file <path>>` | Print every executed instruction, or write them to a file **[DEV]** |
@@ -276,7 +283,7 @@ accesses with suspicion.
 | `tlb trans <vaddr> [asid]` | Translate through the TLB, optionally with another ASID |
 | `tlb debug <on\|off>` | Log TLB operations **[DEV]** |
 | `l1i <check\|dump> <addr\|index>` | L1 instruction cache |
-| `l1d <check\|dump> <addr\|index>` | L1 data cache |
+| `l1d <check\|dump> <addr\|index>` | L1 data cache. For `check`, an address from `0x80000000` up is virtual, except one above 4 GB in the machine's memory, which is physical. `l1i` and `l2` read addresses the same way |
 | `l1d wb <vaddr> <size>` / `l1d pwb <paddr> <size>` | Write cached L1D data back to RAM (virtual / physical range) |
 | `l2 <check\|dump> <addr\|index>` | Unified L2 (R4400) |
 | `ll` / `ll stats` / `ll clear` | LL/SC state (LLbit, LLAddr); the histogram needs `--features llstats` |
@@ -309,12 +316,12 @@ take effect after `j2 flush`.
 | `j2 <alu\|fpu\|branch\|loadstore\|cop0> [on\|off]` | Enable or disable compiling one instruction category | `on` |
 | `j2 instrs [category]` | List instructions and whether each has an emitter and is enabled | — |
 | `j2 flush` | Drop all compiled code and reset the arena (stop the CPU first) | — |
-| `j2 clear <paddr>` / `j2 deny <paddr>` | Reset one physical code page / deny one entry point | — |
-| `j2 analyze <addr>` | Run the analyzer's walk on live memory and print each word with its classification | — |
-| `j2 pcp [addr]` | Physical code page state: entries, generation, compiled code | — |
-| `j2 dumppcp [addr] [path]` | Capture a page and its memory for the offline `jitv2-pcp-dump` | — |
+| `j2 clear <paddr>` / `j2 deny <paddr>` | Reset one physical code page / deny one entry point. The address has to be in the machine's memory; the error lists its ranges | — |
+| `j2 analyze <paddr>` | Run the analyzer's walk on live memory and print each word with its classification | — |
+| `j2 pcp [vaddr]` | Physical code page state: entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
+| `j2 dumppcp [vaddr] [path]` | Capture a page and its memory for the offline `jitv2-pcp-dump` | — |
 | `j2 corpus [dir]` | Dump every cached page as `.pcp` files for offline codegen measurement | `jitv2_corpus/` |
-| `j2 html [path]` | Render the physical code page visualiser | — |
+| `j2 html [path]` | Render the physical code page visualiser, with one section per memory range of the machine | — |
 | `j2 seal-queue` | Peek at the shared arena's seal queue | — |
 | `j2 lockstep` / `j2 lstate [full] [N]` | Lockstep status / recent lockstep history (`jitv2_lockstep` builds) | — |
 

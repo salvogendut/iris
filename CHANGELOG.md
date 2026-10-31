@@ -17,8 +17,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `Workstation::status` and the monitor report `powered_off` after guest power-off
   finishes, separately from a halted CPU. Host cleanup preserves that state;
-  `machine-start` resets powered-off hardware before restarting. The default
-  standalone exit behavior is unchanged.
+  `machine-start` resets powered-off hardware before restarting. Disks are
+  flushed before and after stopping, including when an embedded host disables
+  process exit. The default standalone exit behavior is unchanged.
 
 ### CHD copy-on-write for embedded frontends
 
@@ -49,6 +50,38 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **HEART's software reset** (`MODE` bit 22) now resets the machine.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
+
+### Debugging on two CPUs is unsupported
+
+- Stepping one CPU of two cannot keep the guest healthy, whichever way the other
+  CPU is treated, so `debug.md` now calls it unsupported. The commands still run.
+
+### Memory ranges come from the machine
+
+- Each machine now describes its RAM, RAM aliases and ROM in a `MemoryMap`,
+  built when the machine is constructed and passed to the CPU. Generic code no
+  longer uses the Indy's `lomem` and `himem` addresses.
+- `j2 clear` and `j2 deny` accept any address in the machine's memory, including
+  an Octane's above 4 GB, and list the ranges when given one outside it.
+  `j2 analyze` no longer cuts its address to 32 bits.
+- `j2 html` has one section per memory range of the machine.
+- `undo` records stores to all of a machine's RAM. It used to miss the O2's and
+  most of an Octane's, and could take a high Octane address for a low one. It now
+  also covers the low-memory aliases, such as the exception vectors on an Indy.
+- `l1d`, `l1i` and `l2` `check` read an address in an Octane's RAM above 4 GB
+  as physical.
+- The JIT's page table is sized to the machine's memory instead of 16 MiB on
+  every machine. It takes under 1 MiB on an Indy. Code above the end of a
+  machine's memory now runs in the interpreter.
+
+### Octane memory up to 8 GB
+
+- An Octane bank now takes 1024 and 2048 MB as well, so `banks` reaches
+  `[2048, 2048, 2048, 2048]`. Each entry is a pair of DIMMs in one of the four
+  banks, not one of the eight DIMM slots.
+- Memory past 4 GB is as fast as the rest: such a machine gets a 16 GB direct
+  window, and the JIT compiles code anywhere in it.
+- A store-conditional on memory outside the window is now atomic with two CPUs.
 
 ### VNC, and screen and pointer commands
 
@@ -167,6 +200,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **Compiles skip Cranelift's IR verifier.** Cranelift runs it unless told
+  not to, and it was 38% of the compile thread's samples in a Fuel boot on an
+  M2 Max, where the guest interprets every page still waiting in the compile
+  queue. It only checks the IR, so the emitted code is unchanged; tests and
+  `developer` builds keep it. On x86, a VPro Fuel went from "The system is
+  coming up" to the login prompt in 50 s instead of 58-59 s (thin-LTO build)
+  and 55-63 s instead of 69-74 s (no LTO). (`src/cpu/jitv2/codegen.rs`)
 - **Pages above 4 GB keep their nutlb entries.** The inline memory path's
   window test now bounds the region number itself, so translations of
   physical addresses past the 4 GB window are cached for the interpreter

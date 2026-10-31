@@ -103,6 +103,8 @@ pub fn emulator_name() -> String {
 
 pub struct Machine {
     cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice>,
+    /// Where this machine has memory.
+    memory: Arc<crate::memory_map::MemoryMap>,
     /// The physical bus and the Indy's or Indigo2's devices on it.
     board: Arc<Ip22Bus>,
     mc: MemoryController,
@@ -676,8 +678,9 @@ impl Machine {
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
+        let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::for_model::<$cache>();
+        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone());
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
@@ -903,7 +906,7 @@ impl Machine {
         crate::thread_affinity::init(perf);
 
         Self {
-            cpu,
+            memory,            cpu,
             board,
             mc,
             hpc3,
@@ -1019,13 +1022,15 @@ impl Machine {
 
     pub fn stop(&mut self) {
         self.cpu.stop();
+        // Graphics last: a board's stop joins its display thread, which can
+        // fail to end, and the disks must be stopped by then.
+        self.hpc3.stop();
+        self.mc.stop();
+        if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
         if let Some(mgras) = &self.board.mgras { mgras.stop_display(); }
         if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
         if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
-        self.hpc3.stop();
-        self.mc.stop();
-        if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         // Idle -> Halted is not a lifecycle transition: a machine that was
         // never started has nothing to halt, and the monitor is not up to ask.
         self.lifecycle = self.lifecycle.after_stop();
@@ -1035,16 +1040,21 @@ impl Machine {
 
     /// The address this Machine's own monitor is serving on, or None when it
     /// couldn't bind its port (another iris holding it) or has not started.
+    pub fn memory_map(&self) -> &Arc<crate::memory_map::MemoryMap> {
+        &self.memory
+    }
+
     pub fn monitor_addr(&self) -> Option<std::net::SocketAddr> {
         self.monitor.bound_addr()
     }
 
     /// The terminal console: relays stdin to the monitor at `addr` and the
     /// monitor's output to stdout. When the monitor closes the connection
-    /// (`quit`) the process exits, so `addr` must be this process's own
-    /// monitor (`monitor_addr`): another iris's would take this one down
-    /// with it when it quits.
-    pub fn run_console_client(addr: std::net::SocketAddr) {
+    /// (`quit`) `on_eof` ends the process (through
+    /// `workstation::exit_process`, which flushes the disks first), so `addr`
+    /// must be this process's own monitor (`monitor_addr`): another iris's
+    /// would take this one down with it when it quits.
+    pub fn run_console_client(addr: std::net::SocketAddr, on_eof: impl FnOnce() + Send + 'static) {
         println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
 
@@ -1058,21 +1068,7 @@ impl Machine {
             }
         };
 
-        let mut socket_reader = stream.try_clone().unwrap();
-        thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                match socket_reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        print!("{}", String::from_utf8_lossy(&buf[0..n]));
-                        io::stdout().flush().unwrap();
-                    }
-                    Err(_) => break,
-                }
-            }
-            std::process::exit(0);
-        });
+        Self::relay_monitor_output(stream.try_clone().unwrap(), on_eof);
 
         let stdin = io::stdin();
         let mut line = String::new();
@@ -1087,6 +1083,25 @@ impl Machine {
                 break;
             }
         }
+    }
+
+    /// Print what the monitor sends until it closes the connection (`quit`, or
+    /// iris going away), then run `on_eof`.
+    pub(crate) fn relay_monitor_output(mut monitor: TcpStream, on_eof: impl FnOnce() + Send + 'static) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match monitor.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        print!("{}", String::from_utf8_lossy(&buf[0..n]));
+                        io::stdout().flush().unwrap();
+                    }
+                    Err(_) => break,
+                }
+            }
+            on_eof();
+        })
     }
 
     pub fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
@@ -1224,7 +1239,7 @@ impl Machine {
 
     /// Every SCSI bus on the board: the first controller's, and the second's
     /// on a Fullhouse Indigo2.
-    fn scsi_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
+    pub(crate) fn scsi_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
         use crate::scsi_monitor::ScsiTargets;
         let mut v = vec![self.hpc3.scsi().scsi_bus()];
         v.extend(self.hpc3.scsi1().map(|c| c.scsi_bus()));
@@ -2013,6 +2028,7 @@ impl Drop for Machine {
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
+        crate::workstation::flush_on_drop(self);
         // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();
@@ -2062,6 +2078,9 @@ impl Workstation for Machine {
     }
     fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
     fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.scsi_buses().iter().try_for_each(|b| b.flush())
+    }
     fn sync_chd_disks(
         &self,
         only: Option<usize>,
@@ -2174,6 +2193,55 @@ mod controller_lifetime_tests {
         machine.stop();
     }
 
+    /// A guest power-off ends the process without dropping the machine (and so
+    /// without the disks' Drop), so the power-off path has to flush the disks
+    /// itself. Drives the event the IOC sends and looks for the overlay's
+    /// sector record on disk.
+    #[test]
+    fn guest_power_off_flushes_overlay_disks() {
+        use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+        let path = std::env::temp_dir().join(format!("iris-poweroff-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
+        let sidecar = format!("{}.overlay.dirty", path.display());
+        let _ = std::fs::remove_file(&sidecar);
+
+        let path_str = path.to_str().unwrap().to_string();
+        let mut machine = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], crate::config::CpuModel::default());
+                cfg.scsi.insert(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
+                Box::new(Machine::new(cfg))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let write = ScsiRequest {
+            cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 3, 0, 0, 1, 0],
+            data_len: ScsiDataLength::Unlimited,
+            data_in: Some(vec![0xA5; 512]),
+        };
+        machine.scsi_buses()[0].request(1, &write).unwrap().unwrap();
+        assert!(!std::path::Path::new(&sidecar).exists(), "nothing has flushed yet");
+
+        // The handler would otherwise exit this test process.
+        std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
+        machine.register_system_controller();
+        machine.event_tx.send(crate::traits::MachineEvent::PowerOff).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !std::path::Path::new(&sidecar).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let held = crate::cow_disk::load_dirty_sidecar(std::path::Path::new(&sidecar)).unwrap_or_default();
+        assert!(held.contains(&3), "power-off left no record of the written sector");
+
+        // Leak the machine as the process exit would.
+        std::mem::forget(machine);
+        let _ = std::fs::remove_file(format!("{}.overlay", path.display()));
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// iris-gui drops a Machine on Stop while the monitor keeps its
     /// SystemController. Every command through that controller afterwards used
     /// to dereference freed memory (SIGSEGV in `save_snapshot`).
@@ -2187,5 +2255,34 @@ mod controller_lifetime_tests {
             let err = ctrl.execute_command(cmd, args, Box::new(std::io::sink())).unwrap_err();
             assert_eq!(err, "machine is not running", "{cmd}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_order_tests {
+    use super::*;
+    use crate::display_stop_tests::{big_stack, Probe};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    /// The graphics board can hang in its stop, so HPC3 must already be
+    /// stopped when its renderer is torn down.
+    #[test]
+    fn stopping_the_disks_comes_before_stopping_the_graphics() {
+        // A REX3 saves its shape corpus when it stops; keep it out of $HOME.
+        let dir = crate::display_stop_tests::scratch("indy-order");
+        let mut machine = big_stack(|| {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], crate::config::CpuModel::default());
+            cfg.headless = false;
+            Box::new(Machine::new(cfg))
+        });
+        let hpc3 = machine.hpc3.clone();
+        let (probe, overlap) = Probe::watching(move || hpc3.is_running());
+        *machine.board.rex3.clone().expect("a Newport").renderer.lock() = Some(Box::new(probe.clone()));
+        machine.restart_peripherals();
+        assert!(machine.hpc3.is_running(), "HPC3 is running");
+        machine.stop();
+        assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
+        assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

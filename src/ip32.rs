@@ -134,6 +134,17 @@ pub const NO_ECC_BASE: u64 = 0x8000_0000;
 /// How much of memory also answers from address 0: the first 256 MB.
 pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
 
+/// Where an O2 can answer with memory. The no-ECC alias is left out: the CPU
+/// folds it onto [`RAM_BASE`], so no other code sees an address in it.
+pub fn memory_map() -> crate::memory_map::MemoryMap {
+    use crate::memory_map::{MemKind, MemRange, MemoryMap};
+    MemoryMap::new(vec![
+        MemRange::new("low alias", MemKind::Alias, 0, LOW_ALIAS_SIZE as u64),
+        MemRange::new("prom", MemKind::Rom, PROM_BASE as u64, (PROM_BASE + PROM_SIZE) as u64),
+        MemRange::new("ram", MemKind::Ram, RAM_BASE as u64, RAM_BASE as u64 + RAM_WINDOW_SIZE as u64),
+    ])
+}
+
 /// Boot PROM. Same address as the Indy's, which is the one thing that carries
 /// over: the MIPS reset vector is 0xbfc00000 on both.
 pub const PROM_BASE: u32 = 0x1fc0_0000;
@@ -422,6 +433,12 @@ pub struct Ip32Bus {
 }
 
 impl Ip32Bus {
+    /// Flush the disks on every SCSI controller.
+    pub fn flush_disks(&self) -> std::io::Result<()> {
+        let controllers = self.scsi.lock().unwrap().clone();
+        controllers.iter().try_for_each(|c| c.bus().flush())
+    }
+
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
     /// size no O2 can have, one bank of it (power-of-two sizes only). `prom`
     /// must be the raw 512 KiB IP32 PROM image.

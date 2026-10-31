@@ -170,6 +170,7 @@ pub mod prombin;
 pub mod prombini2;
 pub mod prombinip28;
 pub mod ppmem;
+pub mod memory_map;
 pub mod machine;
 pub mod workstation;
 /// The SGI O2 (IP32): its bus and devices -- see `docs/o2-ip32.md` (and, for how it was built, `clanker/devices/ip32-o2-bringup-log.md`).
@@ -238,6 +239,10 @@ pub use perfetto_macros::{PfBits, PfLevel, PfValue};
 pub mod perfetto;
 
 #[cfg(test)]
+mod display_stop_tests;
+#[cfg(test)]
 mod platform_profile_tests;
+#[cfg(test)]
+mod exit_persistence_tests;
 #[cfg(test)]
 pub(crate) mod test_board;

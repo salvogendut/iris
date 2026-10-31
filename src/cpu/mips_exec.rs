@@ -7,7 +7,6 @@ use crate::cpu::mips_tlb::*;
 use crate::cpu::mips_cache_v2::*;
 use crate::devlog::{LogModule, devlog_mask, devlog_is_active};
 use crate::cpu::mips_dis;
-use crate::ip22_bus::{HIMEM_BASE, HIMEM_END, LOMEM_BASE, LOMEM_END};
 use std::fmt::Write as FmtWrite;
 use crate::cpu::mips_dis::SymbolTable;
 use std::sync::Arc;
@@ -694,16 +693,18 @@ impl TranslateResult {
 }
 
 /// Configuration for the MIPS CPU: TLB and cache hierarchy sizes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MipsCpuConfig {
     pub tlb_entries: usize,
+    /// Where the machine has memory.
+    pub memory: Arc<crate::memory_map::MemoryMap>,
 }
 
 impl MipsCpuConfig {
     /// Default configuration matching SGI Indy (R4400): 48-entry TLB.
     /// Cache geometry is fixed at compile time via constants in mips_cache_v2.
-    pub const fn indy() -> Self {
-        Self { tlb_entries: 48 }
+    pub fn indy() -> Self {
+        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)) }
     }
 
     /// The JTLB size the CPU model declares.
@@ -714,8 +715,8 @@ impl MipsCpuConfig {
     /// end is silently dropped. The R10000 has 64 entries where the R4400 has
     /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
     /// test — every one of its reported failures was that write going nowhere.
-    pub fn for_model<C: crate::cpu::mips_cache_v2::CpuModel>() -> Self {
-        Self { tlb_entries: C::TLB_ENTRIES }
+    pub fn for_model<C: crate::cpu::mips_cache_v2::CpuModel>(memory: Arc<crate::memory_map::MemoryMap>) -> Self {
+        Self { tlb_entries: C::TLB_ENTRIES, memory }
     }
 }
 
@@ -1034,6 +1035,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// reach EntryLo and come out as physical address bits 32 and up. All
     /// ones (no fold) by default; each machine sets its own.
     pub phys_mask: u64,
+    /// Where the machine has memory, from [`MipsCpuConfig::memory`].
+    pub memory: Arc<crate::memory_map::MemoryMap>,
+    /// Frames the JIT's page table has, the end of `memory` in pages. Kept
+    /// apart from `memory` because every new page the CPU fetches from reads it.
+    #[cfg(feature = "jitv2")]
+    jitv2_frames: u64,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -2316,7 +2323,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
         // doc comments on the struct fields.
         #[cfg(feature = "jitv2")]
-        let mut jitv2 = crate::cpu::jitv2::Jitv2::new(crate::cpu::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        let mut jitv2 = crate::cpu::jitv2::Jitv2::for_memory(crate::cpu::jitv2::JITV2_INITIAL_PAGE_CAPACITY, &cfg.memory);
         // The ISA level travels as data rather than through a global: the
         // model's `MIPS4` const goes to the compile pool here and to this
         // executor's own inline analyzer below, and from there into
@@ -2453,6 +2460,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             batch_hook: None,
             phys_alias: None,
             phys_mask: u64::MAX,
+            memory: cfg.memory.clone(),
+            #[cfg(feature = "jitv2")]
+            jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -2503,6 +2513,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// window base and `bitmap` a live `u64` outliving this cache.
     pub unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { self.cache.set_tcache_window(base) };
+    }
+
+    /// tcache: the window's `ppmem::window_shift`, when it is not 4GB's.
+    pub fn set_tcache_shift(&self, shift: u32) {
+        self.cache.set_tcache_shift(shift);
     }
 
     /// tcache: pointer to the cache's inline bitmap field.
@@ -3021,6 +3036,21 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// The JIT frame for a physical address, or `None` above the page table.
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn jitv2_frame(&self, phys_addr: u64) -> Option<crate::cpu::jitv2::jitv2::Pfn> {
+        crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames)
+    }
+
+    /// The JIT frame for an address typed at the monitor, which has to be in
+    /// this machine's memory.
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn jitv2_monitor_pfn(&self, paddr: u64) -> Result<crate::cpu::jitv2::jitv2::Pfn, String> {
+        self.memory.contains(paddr).then(|| self.jitv2_frame(paddr)).flatten().ok_or_else(|| format!(
+            "{:#x} is not in this machine's memory ({}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
+            paddr, self.memory))
+    }
+
     #[cfg(feature = "jitv2")]
     fn jitv2_share(&mut self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>) {
         {
@@ -3068,7 +3098,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn jitv2_track_pcp(&mut self, phys_addr: u64) {
         // Code above the JIT's pfn map gets no page and runs in the
         // interpreter (`step_jit` checks for the null page).
-        let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr) else {
+        let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames) else {
             self.clear_pcp();
             return;
         };
@@ -3087,8 +3117,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // on the page-crossing path (not every fetch) to keep the common
         // same-page case free of this cost even when the toggle is on.
         if jitv2_pagewb_enabled() {
-            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
-            self.cache.writeback(None, page_base as u64, crate::cpu::jitv2::PAGE_SIZE as u64);
+            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+            self.cache.writeback(None, page_base, crate::cpu::jitv2::PAGE_SIZE as u64);
         }
         // A page crossing landing exactly on word 0 (the exception/TLB-refill
         // vector case included — `deliver_exception` in mips_core.rs writes
@@ -3123,7 +3153,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return;
         }
 
-        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
         // ignored by page_for on a lookup hit (an already-claimed page keeps
@@ -5008,13 +5038,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.smc_check_write(virt_addr, phys_addr, SIZE);
         }
 
-        // Track memory write for undo if it's to lomem/himem (production only)
+        // Track memory write for undo if it's to RAM (production only)
         #[cfg(feature = "developer")]
         if !DEBUG && self.undo_buffer.is_enabled() {
-            let phys_addr_32 = phys_addr as u32;
-            let is_main_memory = (phys_addr_32 >= LOMEM_BASE && phys_addr_32 < LOMEM_END) ||
-                                 (phys_addr_32 >= HIMEM_BASE && phys_addr_32 < HIMEM_END);
-            if is_main_memory {
+            if self.memory.is_ram(phys_addr) {
                 let old_value = match self.read_data::<SIZE>(virt_addr) {
                     Ok(v) => v,
                     Err(_) => 0,
@@ -8852,10 +8879,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base as u64);
+            self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
         }
         let mut codegen = self.jitv2.lock().codegen.lock().take();
@@ -8888,10 +8915,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base as u64);
+            self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
         }
         // Re-check is_runnable: handle_request can decline this exact
@@ -10111,6 +10138,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         unsafe { self.executor.lock().set_tcache_window(base) };
     }
 
+    /// tcache: see `MipsExecutor::set_tcache_shift`.
+    pub fn set_tcache_shift(&self, shift: u32) {
+        self.executor.lock().set_tcache_shift(shift);
+    }
+
     /// tcache: pointer to the cache's inline bitmap field.
     pub fn tcache_bitmap_ptr(&self) -> *mut u64 {
         self.executor.lock().tcache_bitmap_ptr()
@@ -10824,6 +10856,8 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_window`.
     unsafe fn set_tcache_window(&self, base: *mut u8);
+    /// tcache: see `MipsExecutor::set_tcache_shift`.
+    fn set_tcache_shift(&self, shift: u32);
     /// tcache: pointer to the cache's inline mapped-region bitmap.
     fn tcache_bitmap_ptr(&self) -> *mut u64;
     /// tcache + jitv2: hand the cache ppmem's generation-window base.
@@ -10880,6 +10914,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
+    fn set_tcache_shift(&self, shift: u32) { MipsCpu::set_tcache_shift(self, shift) }
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { MipsCpu::set_tcache_window(self, base) }
     }
@@ -11375,5 +11410,56 @@ mod round_to_int_mode_tests {
             assert_eq!(round_f32_to_int_mode(f32::INFINITY, rm), f32::INFINITY);
             assert_eq!(round_f32_to_int_mode(f32::NEG_INFINITY, rm), f32::NEG_INFINITY);
         }
+    }
+}
+
+#[cfg(all(test, feature = "developer"))]
+mod undo_range_tests {
+    use super::*;
+    use crate::cpu::mips_cache_v2::PassthroughCache;
+    use crate::cpu::mips_core::STATUS_KX;
+    use crate::cpu::mips_tlb::PassthroughTlb;
+    use crate::memory_map::{MemKind, MemRange, MemoryMap};
+
+    /// The undo buffer records before it writes, so the bus needs no memory.
+    struct NoBus;
+    impl BusDevice for NoBus {}
+
+    fn tracked(ranges: Vec<MemRange>, virt: u64) -> usize {
+        let cfg = MipsCpuConfig { tlb_entries: 48, memory: Arc::new(MemoryMap::new(ranges)) };
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(Arc::new(NoBus), PassthroughTlb::default(), &cfg);
+        exec.core.cp0_status |= STATUS_KX;
+        exec.resync_privilege_state();
+        exec.undo_buffer.enable();
+        let _ = exec.write_data::<4>(virt, 1);
+        exec.pending_memory_writes.len()
+    }
+
+    const HIGH_RAM: u64 = 0x1_2000_0000;
+    const HIGH_VIRT: u64 = 0x9000_0000_0000_0000 | HIGH_RAM | 0x1000;
+
+    fn high_ram() -> MemRange {
+        MemRange::new("ram", MemKind::Ram, HIGH_RAM, HIGH_RAM + (1 << 20))
+    }
+
+    #[test]
+    fn stores_to_ram_above_4_gb_are_recorded() {
+        assert_eq!(tracked(vec![high_ram()], HIGH_VIRT), 1);
+    }
+
+    #[test]
+    fn a_high_address_is_not_taken_for_its_low_32_bits() {
+        let low = MemRange::new("ram", MemKind::Ram, 0x2000_0000, 0x3000_0000);
+        assert_eq!(tracked(vec![low], HIGH_VIRT), 0);
+    }
+
+    #[test]
+    fn stores_to_an_alias_are_recorded_and_to_rom_are_not() {
+        let kseg1 = |phys: u64| 0xFFFF_FFFF_A000_0000 | phys;
+        let alias = MemRange::new("low alias", MemKind::Alias, 0, 0x8_0000);
+        let rom = MemRange::new("prom", MemKind::Rom, 0x1fc0_0000, 0x1fd0_0000);
+        assert_eq!(tracked(vec![alias.clone(), rom.clone()], kseg1(0x1000)), 1);
+        assert_eq!(tracked(vec![alias, rom], kseg1(0x1fc0_0000)), 0);
     }
 }

@@ -1000,8 +1000,12 @@ impl ScsiTarget for ScsiDevice {
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            // No write-back cache to flush — our backend writes are already synchronous.
-            scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
+            // Backend writes reach the host synchronously, but a copy-on-write
+            // overlay's record of its sectors is only written out on a flush.
+            scsi_cmd::SYNCHRONIZE_CACHE_10 => {
+                self.flush()?;
+                ScsiResponse { status: 0x00, data: vec![] }
+            }
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::MODE_SELECT_10 => self.exec_mode_select_10(&req.cdb, req.data_in.as_ref())?,
             // Nothing to do: one initiator, no medium to check, no speed to
@@ -1028,6 +1032,13 @@ impl ScsiTarget for ScsiDevice {
         }
 
         Ok(response)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.is_cdrom() {
+            return Ok(());
+        }
+        self.media.node_mut().flush()
     }
 
     /// Commit the divergence layer into the base image ("apply the changes").

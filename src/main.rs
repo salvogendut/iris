@@ -155,8 +155,9 @@ fn main() {
     // the other iris's monitor, it would exit along with that iris.
     if !ci_enabled {
         if let Some(addr) = machine.monitor_addr() {
+            let slot = machine.machine_slot();
             std::thread::spawn(move || {
-                Machine::run_console_client(addr);
+                Machine::run_console_client(addr, iris::workstation::console_quit(slot));
             });
         }
     }
@@ -186,7 +187,7 @@ fn main() {
         ui.run(event_loop);
     }
 
-    machine.stop();
+    let _ = iris::workstation::stop_and_flush(&mut *machine, "exit");
     #[cfg(feature = "perfetto")]
     iris::perfetto::shutdown();
 }

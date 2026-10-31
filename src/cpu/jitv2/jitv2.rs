@@ -62,23 +62,28 @@ unsafe impl Send for CompileRequest {}
 // See each constant's doc comment for the reasoning behind its specific value.
 // ============================================================================
 
-/// Number of 4 KiB physical frames in the 32-bit physical address space —
-/// the exact entry count of `PfnMap` below. Translation yields up to 40 bits;
-/// [`pfn_of`] keeps frames above this out of the JIT.
-pub const PFN_MAP_ENTRIES: usize = (u32::MAX as usize / PAGE_SIZE as usize) + 1;
+/// Number of 4 KiB physical frames in the largest ppmem window: the `PfnMap`
+/// of a `Jitv2` built with no machine to size it from.
+pub const PFN_MAP_ENTRIES: usize = crate::ppmem::LARGE_WINDOW_SIZE as usize / PAGE_SIZE as usize;
 
-/// The JIT frame for a physical address, or `None` above the 32-bit space
-/// `PfnMap` covers. Code up there is not compiled; it runs in the interpreter.
+/// How many frames a machine's `PfnMap` needs: up to the end of its memory.
+pub fn frames_for(memory: &crate::memory_map::MemoryMap) -> u64 {
+    memory.end().div_ceil(PAGE_SIZE as u64)
+}
+
+/// The JIT frame for a physical address, or `None` above the `frames` that
+/// `PfnMap` covers. Translation yields up to 40 bits. Code up there is not
+/// compiled; it runs in the interpreter.
 #[inline(always)]
-pub fn pfn_of(phys_addr: u64) -> Option<Pfn> {
+pub fn pfn_of(phys_addr: u64, frames: u64) -> Option<Pfn> {
     let pfn = phys_addr / PAGE_SIZE as u64;
-    (pfn < PFN_MAP_ENTRIES as u64).then_some(pfn as Pfn)
+    (pfn < frames).then_some(pfn as Pfn)
 }
 
 /// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
 /// PageSlot>` both page pools used to carry.
 ///
-/// One `u32` per physical frame: 1 Mi entries x 4 B = 4 MiB, allocated once
+/// One `u32` per physical frame: 4 Mi entries x 4 B = 16 MiB, allocated once
 /// and never resized. `PFN_MAP_EMPTY` means "no pool slot for this frame".
 ///
 /// Why not a hash map: `page_for` is on the page-crossing path (see
@@ -101,8 +106,8 @@ pub const PFN_MAP_EMPTY: u32 = u32::MAX;
 
 impl PfnMap {
     /// One allocation, every frame empty.
-    pub fn new() -> Self {
-        PfnMap((0..PFN_MAP_ENTRIES).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
+    pub fn new(frames: usize) -> Self {
+        PfnMap((0..frames).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
     }
 
     /// The slot for `pfn`, or `None` when unmapped.
@@ -125,7 +130,7 @@ impl PfnMap {
         self.0[pfn as usize].store(PFN_MAP_EMPTY, Ordering::Release);
     }
 
-    /// Drop every mapping (`mega_flush`). A 4 MiB memset — flushes are rare
+    /// Drop every mapping (`mega_flush`). A 16 MiB memset — flushes are rare
     /// and already far more expensive than this, so no generation-tag
     /// indirection is worth paying for on every lookup to avoid it.
     pub fn clear(&mut self) {
@@ -142,7 +147,7 @@ impl PfnMap {
 
 
 impl Default for PfnMap {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(PFN_MAP_ENTRIES) }
 }
 
 /// Upfront reservation for the shared `Codegen`'s Cranelift `ArenaMemoryProvider`
@@ -2379,6 +2384,15 @@ impl Jitv2 {
     /// means an earlier flush, not a correctness problem. Does not start the
     /// compile thread — call `compile_queue.start()`.
     pub fn new(capacity: usize) -> Self {
+        Self::with_frames(capacity, PFN_MAP_ENTRIES)
+    }
+
+    /// [`Self::new`] with a page table that covers a machine's memory.
+    pub fn for_memory(capacity: usize, memory: &crate::memory_map::MemoryMap) -> Self {
+        Self::with_frames(capacity, frames_for(memory) as usize)
+    }
+
+    fn with_frames(capacity: usize, frames: usize) -> Self {
         let mut pages: Box<[PhysicalCodePage]> = (0..capacity).map(|_| PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null())).collect();
         // Thread every slot onto the free list up front, index order —
         // `page_for`'s claim path only ever pops from the head, so initial
@@ -2390,7 +2404,7 @@ impl Jitv2 {
         Self {
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
-            pfn_to_slot: PfnMap::new(),
+            pfn_to_slot: PfnMap::new(frames),
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
@@ -2414,7 +2428,7 @@ impl Jitv2 {
     /// if this is the first arrival at this page. Returns `None` if the pool
     /// is exhausted — the caller (mips exec thread) is responsible for
     /// running `mega_flush` and retrying.
-    pub fn page_for(&mut self, pfn: Pfn, phys_addr: u32, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
+    pub fn page_for(&mut self, pfn: Pfn, phys_addr: u64, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
         if let Some(slot) = self.pfn_to_slot.get(pfn) {
             debug_assert_eq!(self.pages[slot as usize].pfn, pfn,
                 "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have                  desynced (a slot was reused/evicted without this map entry being updated to match)",
@@ -2426,7 +2440,7 @@ impl Jitv2 {
         }
         let slot = self.free_head;
         self.free_head = self.pages[slot as usize].next;
-        let gen = bus.gen_ptr(phys_addr as u64);
+        let gen = bus.gen_ptr(phys_addr);
         self.pages[slot as usize].claim(pfn, gen, fr1);
         self.pages[slot as usize].next = NO_SLOT;
         self.pfn_to_slot.insert(pfn, slot);
@@ -5124,20 +5138,25 @@ mod tests {
 
     #[test]
     fn pfn_of_stops_at_the_pfn_map() {
-        assert_eq!(pfn_of(0x1fc0_0004), Some(0x1fc00));
-        assert_eq!(pfn_of(0xFFFF_F000), Some(0xFFFFF));
-        assert_eq!(pfn_of(0x1_0000_0000), None);
-        assert_eq!(pfn_of(0xFF_FFFF_F000), None);
+        let octane = frames_for(&crate::ip30::memory_map(&[2048, 2048, 2048, 2048]));
+        assert_eq!(pfn_of(0x1fc0_0004, octane), Some(0x1fc00));
+        assert_eq!(pfn_of(0xFFFF_F000, octane), Some(0xFFFFF));
+        assert_eq!(pfn_of(0x2_1FFF_F000, octane), Some(0x21FFFF));
+        assert_eq!(pfn_of(0x2_2000_0000, octane), None);
+        assert_eq!(pfn_of(0xFF_FFFF_F000, octane), None);
+        let indy = frames_for(&crate::ip22_bus::memory_map(false));
+        assert_eq!(pfn_of(0x2FFF_F000, indy), Some(0x2FFFF));
+        assert_eq!(pfn_of(0x3000_0000, indy), None);
     }
 
     #[test]
     fn page_for_allocates_once_and_caches_by_pfn() {
         let dev = FakeDevice(AtomicU64::new(0));
         let mut jit = Jitv2::new(4);
-        let slot_a = jit.page_for(3, 3 * PAGE_SIZE, &dev, false).unwrap();
-        let slot_b = jit.page_for(3, 3 * PAGE_SIZE, &dev, false).unwrap();
+        let slot_a = jit.page_for(3, (3 * PAGE_SIZE) as u64, &dev, false).unwrap();
+        let slot_b = jit.page_for(3, (3 * PAGE_SIZE) as u64, &dev, false).unwrap();
         assert_eq!(slot_a, slot_b, "second arrival at the same pfn must reuse the slot");
-        let slot_c = jit.page_for(4, 4 * PAGE_SIZE, &dev, false).unwrap();
+        let slot_c = jit.page_for(4, (4 * PAGE_SIZE) as u64, &dev, false).unwrap();
         assert_ne!(slot_a, slot_c);
     }
 
@@ -5145,8 +5164,8 @@ mod tests {
     fn page_for_returns_none_when_pool_exhausted() {
         let dev = FakeDevice(AtomicU64::new(0));
         let mut jit = Jitv2::new(1);
-        assert!(jit.page_for(0, 0, &dev, false).is_some());
-        assert!(jit.page_for(1, PAGE_SIZE, &dev, false).is_none(), "pool of 1 must reject a second distinct pfn");
+        assert!(jit.page_for(0, (0) as u64, &dev, false).is_some());
+        assert!(jit.page_for(1, (PAGE_SIZE) as u64, &dev, false).is_none(), "pool of 1 must reject a second distinct pfn");
     }
 
     #[test]
@@ -5154,16 +5173,16 @@ mod tests {
         let dev = FakeDevice(AtomicU64::new(0));
         let mut jit = Jitv2::new(4);
         for i in 0..4 as Pfn {
-            jit.page_for(i, i * PAGE_SIZE, &dev, false).unwrap();
+            jit.page_for(i, (i * PAGE_SIZE) as u64, &dev, false).unwrap();
         }
         assert_eq!(jit.pages_used(), 4);
-        assert!(jit.page_for(4, 4 * PAGE_SIZE, &dev, false).is_none());
+        assert!(jit.page_for(4, (4 * PAGE_SIZE) as u64, &dev, false).is_none());
 
         jit.mega_flush();
         assert_eq!(jit.pages_used(), 0);
 
         for i in 0..4 as Pfn {
-            assert!(jit.page_for(i + 10, (i + 10) * PAGE_SIZE, &dev, false).is_some());
+            assert!(jit.page_for(i + 10, ((i + 10) * PAGE_SIZE) as u64, &dev, false).is_some());
         }
         assert_eq!(jit.pages_used(), 4);
     }
@@ -5172,7 +5191,7 @@ mod tests {
     fn fast_lookup_ptrs_lookup_hit() {
         let dev = FakeDevice(AtomicU64::new(0));
         let mut jit = Jitv2::new(4);
-        let slot = jit.page_for(7, 7 * PAGE_SIZE, &dev, false).unwrap();
+        let slot = jit.page_for(7, (7 * PAGE_SIZE) as u64, &dev, false).unwrap();
         let (pfn_map_ptr, pages_base) = jit.fast_lookup_ptrs();
         unsafe {
             let mapped_slot = (*pfn_map_ptr.add(7)).load(Ordering::Acquire);
@@ -5194,11 +5213,11 @@ mod tests {
         let bits0: [u64; BITMAP_WORDS] = { let mut b = [0u64; BITMAP_WORDS]; b[0] |= 1; b };
 
         // Two pages at instr_count=3 (sizes 100, 300), one at instr_count=5 (size 50).
-        let slot_a = jit.page_for(0, 0, &dev, false).unwrap() as usize;
+        let slot_a = jit.page_for(0, (0) as u64, &dev, false).unwrap() as usize;
         assert!(jit.pages[slot_a].publish(&bits0, 0x1000 as *const (), 0, 3, 100, false));
-        let slot_b = jit.page_for(1, PAGE_SIZE, &dev, false).unwrap() as usize;
+        let slot_b = jit.page_for(1, (PAGE_SIZE) as u64, &dev, false).unwrap() as usize;
         assert!(jit.pages[slot_b].publish(&bits0, 0x2000 as *const (), 0, 3, 300, false));
-        let slot_c = jit.page_for(2, 2 * PAGE_SIZE, &dev, false).unwrap() as usize;
+        let slot_c = jit.page_for(2, (2 * PAGE_SIZE) as u64, &dev, false).unwrap() as usize;
         assert!(jit.pages[slot_c].publish(&bits0, 0x3000 as *const (), 0, 5, 50, false));
 
         let hist = jit.code_size_by_instr_count();

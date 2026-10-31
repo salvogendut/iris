@@ -103,6 +103,8 @@ fn put_bank_words(store: &crate::chunk_store::ChunkStore, ram: &crate::dev::crim
 }
 
 pub struct O2Machine {
+    /// Where this machine has memory.
+    pub memory: Arc<crate::memory_map::MemoryMap>,
     pub bus: Arc<Ip32Bus>,
     cpu: Arc<dyn CpuDevice>,
     timer_manager: Arc<TimerManager>,
@@ -236,9 +238,10 @@ impl O2Machine {
         let count_mhz = cfg.clock.fixed_mhz.unwrap_or(O2_COUNT_MHZ);
         let cpu_mhz = (count_mhz * 2.0).round().max(1.0) as u32;
         let boot = Arc::new(BootState::new());
+        let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
+            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
+            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
             CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
@@ -334,6 +337,7 @@ impl O2Machine {
             .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
             .collect();
         Ok(Self {
+            memory,
             bus,
             cpu,
             timer_manager,
@@ -358,13 +362,13 @@ impl O2Machine {
         })
     }
 
-    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
+    fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
                     ram: Arc<O2Memory>) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>();
+        let cfg = MipsCpuConfig::for_model::<C>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         exec.cache.set_pd_tag_store_hook(Box::new(move |tag| ram.stack_tag_store(tag)));
@@ -512,7 +516,9 @@ impl O2Machine {
                     return;
                 }
                 running.store(false, Ordering::SeqCst);
-                std::process::exit(0);
+                crate::workstation::exit_process("power-off", 0, || {
+                    crate::workstation::flushed(bus.flush_disks(), "power-off")
+                });
             }
             std::thread::sleep(poll);
         }
@@ -537,6 +543,11 @@ impl O2Machine {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
         self.bus.save_flash();
+        // Not through the display: this stop leaves the guest's writes durable
+        // whatever follows it.
+        if let Err(e) = self.bus.flush_disks() {
+            eprintln!("iris: disk flush at stop failed: {e} (guest writes may be lost)");
+        }
         // A machine that was never started has nothing to halt.
         self.lifecycle = self.lifecycle.after_stop();
     }
@@ -772,10 +783,12 @@ impl Drop for O2Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = MachineRef::null();
         }
+        self.display.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
 }
@@ -830,6 +843,9 @@ impl Workstation for O2Machine {
     fn pending_chd_sync_count(&self) -> usize {
         self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
     }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.bus.flush_disks()
+    }
     fn sync_chd_disks(
         &self,
         only: Option<usize>,
@@ -857,6 +873,7 @@ impl Workstation for O2Machine {
 pub struct O2Display {
     bus: Arc<Ip32Bus>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     screen: Mutex<Rex3Screen>,
     screenshot_pending: AtomicBool,
     cycles: CyclesPtr,
@@ -871,6 +888,7 @@ impl O2Display {
         Self {
             bus,
             renderer: Mutex::new(None),
+            display_stop: Default::default(),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot_pending: AtomicBool::new(false),
             cycles,
@@ -948,15 +966,16 @@ impl O2Display {
                 std::thread::sleep(frame_time - spent);
             }
         }
-        if let Some(r) = self.renderer.lock().as_mut() {
-            r.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 }
 
 impl crate::gfx_display::GfxDisplay for O2Display {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> {
         &self.renderer
+    }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop {
+        &self.display_stop
     }
     fn screen(&self) -> &Mutex<Rex3Screen> {
         &self.screen

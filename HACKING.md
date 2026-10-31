@@ -65,8 +65,9 @@ around a different chipset implements the same trait and gets the window,
 iris-ci, iris-gui and the monitor's `reset`/`save`/`load`/`machine-status`
 with it.
 
-Guest `MachineEvent::PowerOff` stops the machine before publishing
-`GuestState::PoweredOff` under the shared slot lock. Embedded hosts can disable
+Guest `MachineEvent::PowerOff` flushes disks before and after stopping the
+machine, then publishes `GuestState::PoweredOff` under the shared slot lock.
+Embedded hosts can disable
 process exit with `set_exit_on_guest_poweroff(false)`, observe that state, then
 release their media and renderer. A stopped CPU alone does not imply power-off:
 monitor pauses and breakpoints must remain distinct. Repeated stops preserve the
@@ -78,9 +79,9 @@ machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
 after iris-gui's Stop) gets "machine is not running" instead of freed memory.
 
 Library frontends can call `workstation::set_exit_on_guest_poweroff(false)`
-before starting a workstation. Guest power-off then stops the machine while
-leaving the host process alive to flush storage, display its stopped state or
-start another machine. This process-wide policy avoids mutating environment
+before starting a workstation. Guest power-off then stops the machine and
+flushes its disks while leaving the host process alive to display its stopped
+state or start another machine. This process-wide policy avoids mutating environment
 variables after threads start. The standalone default and the existing
 `IRIS_NO_EXIT_ON_POWEROFF` environment override remain unchanged.
 
@@ -151,6 +152,7 @@ pub trait BusDevice: Send + Sync {
     // read16/write16, read32/write32, read64/write64 ...
     fn dma_read64 / dma_write64 (+ _bulk)              // accesses initiated by a DMA engine
     fn read_block / write_block / write64_masked       // bulk and byte-enable fast paths
+    fn cas32 / cas64                                   // SC on memory the ppmem window does not reach
     fn mem_ptr(&self, addr: u64) -> Option<*const u64>; // direct backing store, for RAM
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64;  // jitv2 page generation counter
 }
@@ -257,6 +259,23 @@ memory without going through the CPU or taking a lock. That works because
 aligned 32- and 64-bit host accesses are atomic (though unordered), and the
 hardware synchronisation points (descriptor ownership bits, interrupts) are
 kept where the real hardware has them.
+
+### The memory map
+
+The decode table says what answers at an address, but not whether that is
+memory. Each machine therefore also builds a `MemoryMap` (`src/memory_map.rs`)
+when it is constructed: a list of named ranges, each one RAM, an alias of RAM,
+or ROM. The Indy and Indigo2 take theirs from `ip22_bus::memory_map`, the O2
+from `ip32::memory_map`, and the Octane from `ip30::memory_map`, which sizes RAM
+from `banks`. The machine keeps it and passes it to the CPU in `MipsCpuConfig`.
+
+Code that needs to tell memory from everything else asks the map, not a
+machine's constants: the undo buffer records stores to RAM, the JIT sizes its
+page table to the map's end, and the `j2` monitor commands check addresses and
+lay out their report by range. A range says where the memory controller can
+answer, so an address in one may have nothing behind it until the firmware has
+programmed the controller. `lomem` and `himem` belong to the Indy and Indigo2
+devices and should not appear outside them.
 
 ### Interrupts
 
