@@ -126,6 +126,18 @@ sector overlay over a read-only CHD when an uncompressed base has no SHA-1.
 The latter refuses commit to prevent raw offsets from corrupting the CHD;
 see [STORAGE.md](STORAGE.md#chd-image-support) for sidecar handling.
 
+Embedded audio uses `AudioConfig.output`, a runtime-only per-machine
+`Arc<dyn host_audio::OutputFactory>`. HAL2, MACE and RAD all reach it through
+`host_audio::open_output`. With a factory installed, CPAL is never opened:
+48 kHz stereo i16 samples go into a lock-free ring capped at 100 ms, and the
+factory receives its `PcmStream` consumer on the device/worker thread. The
+factory must return promptly; frontends hand the consumer to their own audio
+thread. `read` and `discard` commit complete stereo frames and `is_closed`
+reports producer teardown. Frontends should drain/discard while muted or paused
+and clear their host queues when a machine stops or changes. The default
+factory is `None`, preserving standalone CPAL playback. The field is skipped
+by serde; it is an embedding API, not a TOML setting.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit

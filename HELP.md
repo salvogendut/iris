@@ -37,6 +37,14 @@ without consulting the working directory. A different explicit path must be
 readable; errors do not silently fall back. Existing flash state remains
 authoritative; see [O2](docs/o2-ip32.md) and [Octane](docs/octane-ip30.md).
 
+## Audio in embedded frontends
+
+Standalone Iris plays through CPAL with the `[audio]` options documented in
+[FEATURES.md](FEATURES.md#audio). Prismatic uses the same emulated audio devices
+but plays their samples through SDL3, with its own saved mute and volume
+controls. Its host playback is independent of the screenshot shutter. The
+embedding hook is documented in [HACKING.md](HACKING.md).
+
 ## Performance vs inventory (MHz vs MIPS)
 
 IRIX **System Manager** and `hinv` report a **CPU MHz** line (e.g. 166 MHz). That

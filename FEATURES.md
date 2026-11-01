@@ -254,6 +254,12 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. Not used yet: HAL2 prebuffers 20 ms. |
 | `audio.cpal_buffer_frames` | `host default when unset` | Host buffer size in frames (a period; PulseAudio buffers two). Unset: the host's default, except PulseAudio's (about 2 s), which gets 512. A size the device refuses falls back to the default. |
 
+Embedded frontends can set the runtime-only `AudioConfig.output` factory to
+receive bounded 48 kHz stereo PCM instead of opening CPAL. This hook is not a
+TOML option and does not change the standalone defaults above; see
+[HACKING.md](HACKING.md). Host mute should discard samples while keeping
+`no_audio = false`, so the emulated audio hardware remains available.
+
 ### [jitv2]
 
 | Key | Default | Values and behavior |

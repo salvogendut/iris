@@ -262,6 +262,19 @@ struct AesRxState {
     timer_id: Option<TimerId>,
 }
 
+// Keep about one second of 48 kHz stereo loopback at most. TX can run while
+// RX is stopped (including during PROM diagnostics); it must not grow forever.
+const AES_LOOPBACK_WORDS: usize = 96_000;
+
+impl AesRxState {
+    fn push_loopback(&mut self, sample: u32) {
+        if self.loopback.len() >= AES_LOOPBACK_WORDS {
+            self.loopback.pop_front();
+        }
+        self.loopback.push_back(sample);
+    }
+}
+
 // ─── HAL2 register state ──────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -629,7 +642,7 @@ impl Hal2 {
             for _ in 0..pacer.due() {
                 if let Some((val, st, _)) = dma_client.read() {
                     if !st.refused() {
-                        ar_state.lock().loopback.push_back(val);
+                        ar_state.lock().push_loopback(val);
                     }
                 }
             }
@@ -1340,5 +1353,24 @@ mod clkid_tests {
         let (_, clk, _) = s.codecb_cfg();
         assert_eq!(clk, 2);
         assert_eq!(s.bres_rate(clk), 44100, "CLKID 2 is BRES2, not BRES3");
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+
+    #[test]
+    fn idle_receiver_drops_oldest_samples_instead_of_growing_forever() {
+        let mut state = AesRxState {
+            loopback: std::collections::VecDeque::new(),
+            timer_id: None,
+        };
+        for value in 0..AES_LOOPBACK_WORDS + 10 {
+            state.push_loopback(value as u32);
+        }
+        assert_eq!(state.loopback.len(), AES_LOOPBACK_WORDS);
+        assert_eq!(state.loopback.pop_front(), Some(10));
+        assert_eq!(state.loopback.back().copied(), Some((AES_LOOPBACK_WORDS + 9) as u32));
     }
 }

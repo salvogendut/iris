@@ -1295,6 +1295,10 @@ pub enum AudioHost {
 /// HAL2 / cpal audio output tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
+    /// Runtime-only frontend output. None uses the configured CPAL host.
+    /// Never serialized: each embedded machine owns its own audio handoff.
+    #[serde(skip)]
+    pub output: Option<std::sync::Arc<dyn crate::host_audio::OutputFactory>>,
     /// Host audio system to play through. Default: the platform's usual one.
     #[serde(default)]
     pub host: AudioHost,
@@ -1310,7 +1314,7 @@ fn default_audio_prebuf_ms() -> u64 { 20 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
+        Self { output: None, host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None }
     }
 }
 

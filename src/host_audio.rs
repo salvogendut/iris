@@ -1,7 +1,10 @@
 //! Host audio output shared by the machines' sound devices: a persistent
-//! cpal stream fed through a lock-free ring, and the resampler from a
-//! device's own rate to the stream's. HAL2 (Indy, Indigo2) and MACE audio
-//! (O2) both play through it.
+//! CPAL stream or frontend-owned PCM consumer fed through a lock-free ring,
+//! and the resampler from a device's own rate to the stream's. HAL2
+//! (Indy/Indigo2), MACE (O2) and RAD (Octane) all play through it.
+
+mod external;
+pub use external::{OutputFactory, PcmStream};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,7 +30,7 @@ pub struct HostOut {
     // (stream open, nothing enabled yet) isn't reported as an underrun.
     pub playing: Arc<AtomicBool>,
     // Keep stream alive; dropped with the HostOut.
-    _stream: cpal::Stream,
+    _stream: Option<cpal::Stream>,
 }
 
 // cpal::Stream is !Send/!Sync on some platforms (ALSA uses raw pointers internally),
@@ -132,7 +135,8 @@ fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
     }
 }
 
-/// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in
+/// Use the runtime frontend factory when present (48 kHz, no CPAL fallback).
+/// Otherwise open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in
 /// order, with a ring of `ring_samples(rate)` samples. `who` prefixes the
 /// messages; the variable `capture_var`, if set to a file, also records what
 /// the host plays (raw interleaved 16-bit little-endian stereo at the stream
@@ -145,6 +149,9 @@ pub fn open_output(
     who: &str,
     capture_var: &str,
 ) -> Option<HostOut> {
+    if let Some(factory) = &audio.output {
+        return external::open(factory.as_ref(), underruns, playing, ring_samples, who);
+    }
     let host = output_host(audio.host);
     let device = host.default_output_device()?;
     // A fixed size the device refuses falls back to the host's default.
@@ -240,7 +247,7 @@ pub fn open_output(
                 producer,
                 underruns,
                 playing,
-                _stream: stream,
+                _stream: Some(stream),
             });
         }
 

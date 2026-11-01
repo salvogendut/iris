@@ -13,6 +13,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Frontend-owned guest audio
+
+- Bound HAL2's internal AES loopback to 96,000 words, discarding the oldest
+  samples when TX runs without RX instead of growing memory indefinitely.
+
+- Add a per-machine, runtime-only `AudioConfig.output` factory for HAL2, MACE
+  and RAD. Embedded hosts receive bounded stereo PCM and own playback; CPAL
+  remains the standalone default. The ring caps buffering at 100 ms, consumes
+  complete stereo frames, and reports producer shutdown. An installed factory
+  that fails never falls back to a different host backend.
+
 ### Bundled O2 and Octane firmware (fork)
 
 - Embed O2 4.18 and Octane 4.9 as Rust byte arrays, with a reproducible

@@ -277,7 +277,8 @@ avoid advancing into descriptors the guest has not prepared.
 - Mono is duplicated to L/R. Stereo consumes interleaved pairs. Single-stream
   quad consumes all four samples but discards the rear pair.
 - Codec B is an input DMA silence writer, not a second host output stream.
-- AES TX drains DMA into an internal queue; AES RX writes that loopback data
+- AES TX drains DMA into an internal queue capped at 96,000 words, discarding
+  the oldest on overflow when RX is idle; AES RX writes that loopback data
   (or silence) to DMA. This is not host digital audio I/O.
 
 ### Remaining fidelity and validation
