@@ -341,9 +341,9 @@ impl Ip22Bus {
         if let Some(u64) = &d.ultra64 {
             use crate::dev::ultra64::{GIO_SLOT0_BASE, RAMROM_BASE, RAMROM_SIZE};
             // Control registers: 0x1F400000–0x1F4FFFFF (16 × 64KB slots)
-            set(GIO_SLOT0_BASE, RAMROM_BASE, u64.clone(), "ultra64");
+            set(GIO_SLOT0_BASE, RAMROM_BASE, u64.bus_port(), "ultra64");
             // RAMROM window: 0x1F500000–0x1F5FFFFF (16 × 64KB slots)
-            set(RAMROM_BASE, RAMROM_BASE + RAMROM_SIZE, u64.clone(), "ultra64");
+            set(RAMROM_BASE, RAMROM_BASE + RAMROM_SIZE, u64.bus_port(), "ultra64");
         }
         // GIO expansion slot 1 — second Newport when rex3_head1 absent: GIO timeout remains
 

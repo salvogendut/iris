@@ -176,6 +176,7 @@ VINO video input and the IndyCam.
 | [indycam-cdmc-register-map.md](video/indycam-cdmc-register-map.md) | design | IndyCam CDMC register map and power-on defaults |
 | [indycam-end-to-end-capture.md](video/indycam-end-to-end-capture.md) | history | IndyCam end-to-end capture on iris — campaign notes |
 | [vino-attach-via-sysid-bit4.md](video/vino-attach-via-sysid-bit4.md) | rule | IRIX vino driver attach gated on SYSID bit 4 — set it |
+| [embedded-device-lifetime.md](video/embedded-device-lifetime.md) | rule | Embedded VINO/camera teardown, Ultra64 bridge ownership and paused snapshot boundaries |
 | [vino-capture-on-6.5-progress.md](video/vino-capture-on-6.5-progress.md) | history | VINO capture on IRIX 6.5.22 — campaign progress |
 | [vino-gio-alias-offset.md](video/vino-gio-alias-offset.md) | rule | VINO GIO64 alias offset — must subtract 0x1F000000, not 0x01000000 |
 | [vino-verification-checklist.md](video/vino-verification-checklist.md) | howto | VINO / IndyCam verification checklist |

@@ -396,6 +396,21 @@ device-poll loops. Parking starts 60 s after the CPU thread starts
 (`IRIS_IDLE_WARMUP_SECS` overrides), so boot runs at full speed. The monitor's
 `idle on|off|status` controls and reports it.
 
+Library hosts may set a per-machine snapshot root and externally attached disk
+provenance with `Machine::set_snapshot_context`. `save_snapshot_paused` and
+`load_snapshot_paused` leave CPUs and peripherals stopped; normal monitor save
+and load retain their automatic-resume behavior. Callers own compatibility,
+publication and failure recovery policy.
+
+VINO DMA follows machine start/stop. Machine destruction additionally calls
+`Vino::shutdown`, clearing its source and physical-memory back references before
+joining/releasing capture sources. Linux V4L2 waits are bounded and retry delays
+observe cancellation. Ultra64 takes a host bridge lease before unlinking stale
+shared memory, so another compatible running instance cannot be disconnected.
+Its bus adapter holds a weak reference to the board: retained physical buses must
+not retain an old bridge. Drop stops the listener and destroys events before their
+shared-memory mapping, then releases the lease.
+
 ## 5. Locks
 
 The rules, in order of importance:

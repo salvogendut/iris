@@ -80,7 +80,6 @@ pub struct Ultra64 {
     state:    Arc<Mutex<Ultra64State>>,
     /// The board's interrupt: GIO expansion slot 0 on an Indy.
     irq:      IrqLine,
-    shmem:    shared_memory::Shmem,
     // raw pointers into shmem, valid for its lifetime
     hdr_ptr:    *mut ShmHeader,
     ramrom_ptr: *mut u8,
@@ -88,6 +87,10 @@ pub struct Ultra64 {
     evt_n2h:    Arc<SendEvent>,
     running:    Arc<AtomicBool>,
     threads:    Mutex<Vec<JoinHandle<()>>>,
+    // Events contain pointers into this mapping: drop them first, then SHM,
+    // and only then release the bridge lease. Rust drops fields in order.
+    shmem: shared_memory::Shmem,
+    _lease: std::fs::File,
 }
 
 // SAFETY: ShmHeader/ramrom accesses are protected by state Mutex or are
@@ -95,18 +98,102 @@ pub struct Ultra64 {
 unsafe impl Send for Ultra64 {}
 unsafe impl Sync for Ultra64 {}
 
+// Physical memory may outlive a stopped machine through other device back
+// references. Retain only a weak board pointer there so closing a label releases
+// the shared-memory bridge, even while that bus still exists.
+struct Ultra64Port(std::sync::Weak<Ultra64>);
+impl BusDevice for Ultra64Port {
+    fn read8(&self, addr: u64) -> BusRead8 {
+        self.0.upgrade().map_or_else(BusRead8::err, |board| board.read8(addr))
+    }
+    fn write8(&self, addr: u64, value: u8) -> u32 {
+        self.0.upgrade().map_or(crate::traits::BUS_ERR, |board| board.write8(addr, value))
+    }
+    fn read16(&self, addr: u64) -> BusRead16 {
+        self.0.upgrade().map_or_else(BusRead16::err, |board| board.read16(addr))
+    }
+    fn write16(&self, addr: u64, value: u16) -> u32 {
+        self.0.upgrade().map_or(crate::traits::BUS_ERR, |board| board.write16(addr, value))
+    }
+    fn read32(&self, addr: u64) -> BusRead32 {
+        self.0.upgrade().map_or_else(BusRead32::err, |board| board.read32(addr))
+    }
+    fn write32(&self, addr: u64, value: u32) -> u32 {
+        self.0.upgrade().map_or(crate::traits::BUS_ERR, |board| board.write32(addr, value))
+    }
+    fn read64(&self, addr: u64) -> BusRead64 {
+        self.0.upgrade().map_or_else(BusRead64::err, |board| board.read64(addr))
+    }
+    fn write64(&self, addr: u64, value: u64) -> u32 {
+        self.0.upgrade().map_or(crate::traits::BUS_ERR, |board| board.write64(addr, value))
+    }
+}
+
+fn bridge_lease() -> Result<std::fs::File, String> {
+    let path = std::env::temp_dir().join("iris-ultra64-bridge.lock");
+    lock_bridge_at(&path)
+}
+
+fn lock_bridge_at(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).open(path).map_err(|e| format!("Ultra64 bridge lock: {e}"))?;
+    file.try_lock().map_err(|e| format!("Ultra64 bridge already in use or unavailable: {e}"))?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    #[test]
+    fn bridge_stop_drop_and_reopen_release_mapping_and_lease() {
+        use super::*;
+        let name = format!("iris-ultra64-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let path = std::env::temp_dir().join(format!("{name}.lock"));
+        for _ in 0..2 {
+            let board = Arc::new(Ultra64::new_bridge(IrqLine::unconnected(), &name, lock_bridge_at(&path).unwrap()).unwrap());
+            let weak = Arc::downgrade(&board);
+            let port = board.bus_port();
+            for _ in 0..32 { board.start(); board.stop(); }
+            drop(board);
+            assert!(weak.upgrade().is_none(), "bus must not retain the bridge");
+            assert!(lock_bridge_at(&path).is_ok());
+            // A retained bus adapter safely rejects accesses after teardown.
+            assert_eq!(port.write32(GIO_SLOT0_BASE as u64, 0), crate::traits::BUS_ERR);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bridge_lease_excludes_other_instances_and_releases_on_drop() {
+        let path = std::env::temp_dir().join(format!("iris-bridge-test-{}-{}.lock", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let lease = super::lock_bridge_at(&path).unwrap();
+        assert!(super::lock_bridge_at(&path).is_err());
+        drop(lease);
+        drop(super::lock_bridge_at(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 impl Ultra64 {
+    pub fn bus_port(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        Arc::new(Ultra64Port(Arc::downgrade(self)))
+    }
+
     pub fn new(irq: IrqLine) -> Result<Self, String> {
+        // The bridge has a fixed global name. Never unlink a live peer's map.
+        Self::new_bridge(irq, SHM_OS_ID, bridge_lease()?)
+    }
+
+    fn new_bridge(irq: IrqLine, os_id: &str, lease: std::fs::File) -> Result<Self, String> {
         // Unlink any stale shm left by a previous crash before creating fresh.
         // This is safe: the mapping only matters while iris is running, and if
         // gopher64 is already attached it will notice iris restarted via magic check.
         #[cfg(unix)] {
-            let shm_name = std::ffi::CString::new(SHM_OS_ID).unwrap();
+            let shm_name = std::ffi::CString::new(os_id).unwrap();
             unsafe { libc::shm_unlink(shm_name.as_ptr()); } // ignore ENOENT
         }
 
         let shmem = ShmemConf::new()
-            .os_id(SHM_OS_ID)
+            .os_id(os_id)
             .size(SHM_TOTAL_SIZE)
             .create()
             .map_err(|e| format!("ultra64: shm create failed: {e}"))?;
@@ -145,6 +232,7 @@ impl Ultra64 {
 
         Ok(Ultra64 {
             state, irq, shmem, hdr_ptr, ramrom_ptr, evt_h2n, evt_n2h,
+            _lease: lease,
             running: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
         })
@@ -168,6 +256,9 @@ impl Device for Ultra64 {
             return; // already running
         }
 
+        // Clear before spawning: clearing in the listener can erase a stop
+        // notification sent immediately after start.
+        let _ = self.evt_n2h.set(EventState::Clear);
         let state    = Arc::clone(&self.state);
         let irq      = self.irq.clone();
         let evt_n2h  = Arc::clone(&self.evt_n2h);
@@ -177,8 +268,6 @@ impl Device for Ultra64 {
         let handle = std::thread::Builder::new()
             .name("ultra64-gio-int".into())
             .spawn(move || {
-                // Drain any stale signal left over from a previous session.
-                let _ = evt_n2h.set(EventState::Clear);
                 while running.load(Ordering::Relaxed) {
                     match evt_n2h.wait(Timeout::Infinite) {
                         Ok(()) => {
@@ -400,10 +489,9 @@ impl Device for Ultra64 {
 
 impl Drop for Ultra64 {
     fn drop(&mut self) {
-        // The Arc<SendEvent>s will drop their Box<dyn EventImpl> here, which runs
-        // pthread_cond_destroy on Unix. The shm mapping outlives the Events because
-        // Shmem is the last field (fields drop in order), and the SendEvent Arcs
-        // drop before shmem due to struct field ordering.
+        self.stop();
+        // Field ordering keeps EventImpl storage mapped through its destructor.
+
     }
 }
 

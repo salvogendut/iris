@@ -81,6 +81,13 @@ fn best_yuyv_resolution(dev: &Device) -> Option<(u32, u32)> {
         .max_by_key(|&(w, h)| w * h)
 }
 
+fn retry_wait(running: &AtomicBool, seconds: u64) {
+    for _ in 0..seconds * 10 {
+        if !running.load(Ordering::Relaxed) { return; }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u32,
                             camera_index: u32, running: Arc<AtomicBool>) {
     // Outer retry loop: reopens the device from scratch after stream loss or
@@ -96,7 +103,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
                 if open_attempts == 0 {
                     eprintln!("camera: no usable V4L2 device — waiting for hot-plug");
                 }
-                thread::sleep(Duration::from_secs(delay.max(2) as u64));
+                retry_wait(&running, delay.max(2) as u64);
                 open_attempts += 1;
                 continue 'outer;
             }
@@ -105,7 +112,8 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         if open_attempts > 0 {
             let delay = (open_attempts * 2).min(30);
             eprintln!("camera: reopening /dev/video{} in {}s (attempt {})", cur_idx, delay, open_attempts + 1);
-            thread::sleep(Duration::from_secs(delay as u64));
+            retry_wait(&running, delay as u64);
+            if !running.load(Ordering::Relaxed) { return; }
         }
         open_attempts += 1;
 
@@ -148,6 +156,8 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
             }
         };
 
+        stream.set_timeout(Duration::from_millis(500));
+
         // Reset open_attempts on a successful stream start.
         open_attempts = 0;
 
@@ -179,4 +189,15 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         }
         } // inner frame loop
     } // outer reopen loop
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn cancelled_hotplug_wait_does_not_sleep() {
+        let start = std::time::Instant::now();
+        retry_wait(&AtomicBool::new(false), 30);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 }

@@ -140,6 +140,7 @@ pub struct Machine {
     /// size per SCSI id). Written into snapshot manifests and validated on
     /// restore so captured state never lands on a different base disk.
     disks: Vec<DiskRef>,
+    snapshot_root: std::path::PathBuf,
     /// Configured nvram file path, recorded in snapshot manifests.
     nvram_path: String,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
@@ -651,7 +652,8 @@ impl Machine {
         // Connect HPC3 to System Memory (via Physical)
         hpc3.set_phys(phys.clone());
 
-        // Connect VINO to System Memory, install a video source, start DMA.
+        // Connect VINO to System Memory and install a video source.
+        // DMA starts with the other peripherals, not during construction.
         // Source kind + broadcast standard come from `[vino]` in iris.toml.
         board.vino.set_phys(phys.clone());
         if let Some(mgras) = &board.mgras { mgras.set_phys(phys.clone()); }
@@ -688,7 +690,6 @@ impl Machine {
             let adjusted: Arc<dyn crate::video_source::VideoSource> =
                 Arc::new(crate::video_source::CdmcAdjustedSource::new(source, board.vino.clone()));
             board.vino.set_source(adjusted);
-            board.vino.start();
         }
 
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
@@ -933,6 +934,7 @@ impl Machine {
             last_restore_checkpoint: None,
             scratch_path,
             disks: disk_provenance,
+            snapshot_root: "saves".into(),
             nvram_path: nvram_provenance,
             display_resolution,
             newport_active,
@@ -983,6 +985,7 @@ impl Machine {
             self.lifecycle = starting;
         }
         // Start peripherals
+        if self.board.vino.has_source() { self.board.vino.start(); }
         self.mc.start();
         self.hpc3.start();
         // Program VC2 before the refresh thread runs so the first frame has size.
@@ -1037,6 +1040,7 @@ impl Machine {
         // Graphics last: a board's stop joins its display thread, which can
         // fail to end, and the disks must be stopped by then.
         self.hpc3.stop();
+        self.board.vino.stop();
         self.mc.stop();
         if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
@@ -1120,8 +1124,12 @@ impl Machine {
         self.hpc3.ioc().ps2()
     }
 
-    /// Borrow the HPC3 controller — used by CI socket commands that touch
-    /// RTC/SCSI directly (`rtc-save`, `cdrom-eject`).
+    /// Active video source status without acquiring the monitor device lock.
+    pub fn vino_source_status(&self) -> String { self.board.vino.source_status() }
+
+    pub fn has_ultra64(&self) -> bool { self.board.ultra64.is_some() }
+
+    /// Borrow the HPC3 controller for RTC/SCSI host operations.
     pub fn hpc3(&self) -> &Hpc3 {
         &self.hpc3
     }
@@ -1420,7 +1428,7 @@ impl Machine {
         // knows which dirty sectors to import back. The files were just
         // consumed by load_snapshot but they're tiny and re-reading from
         // page cache is cheap (~µs).
-        let overlay_dir = std::path::PathBuf::from("saves").join(name);
+        let overlay_dir = self.snapshot_root.join(name);
         let snap = Snapshot::new(&overlay_dir);
         let overlay_sets = snap.read_toml("cow.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
         let overlay_sets1 = snap.read_toml("cow1.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
@@ -1584,6 +1592,7 @@ impl Machine {
     /// Restart everything `stop` stopped, less the CPU, without restarting the
     /// monitor server.
     fn restart_peripherals(&mut self) {
+        if self.board.vino.has_source() { self.board.vino.start(); }
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self.board.rex3 { rex3.start(); }
@@ -1639,11 +1648,26 @@ impl Machine {
         self.restart_peripherals();
     }
 
-    /// Save full machine snapshot to `saves/<name>/`.
+    /// Library callers supply the storage root and provenance for externally attached disks.
+    pub fn set_snapshot_context(&mut self, root: std::path::PathBuf, disks: Vec<DiskRef>) {
+        self.snapshot_root = root;
+        self.disks = disks;
+    }
+
+    /// Save a snapshot under the configured root and resume execution.
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.save_snapshot_inner(name, true)
+    }
+
+    /// Save without restarting CPUs or peripherals, including on failure.
+    pub fn save_snapshot_paused(&mut self, name: &str) -> Result<(), String> {
+        self.save_snapshot_inner(name, false)
+    }
+
+    fn save_snapshot_inner(&mut self, name: &str, resume: bool) -> Result<(), String> {
         self.stop();
 
-        let dir = std::path::PathBuf::from("saves").join(name);
+        let dir = self.snapshot_root.join(name);
         let snap = Snapshot::new(&dir);
         snap.ensure_dir().map_err(|e| e.to_string())?;
 
@@ -1711,7 +1735,7 @@ impl Machine {
         // raw bank{N}.bin files. Chunk hashes go in chunks.bin so load can
         // walk the right chunks back out.
         if sv >= 3 {
-            let store = ChunkStore::new("saves");
+            let store = ChunkStore::new(&self.snapshot_root);
             let mut chunks = ChunksManifest::default();
             for i in 0..4 {
                 let words = self.board.phys.snapshot_bank_inmem(i);
@@ -1751,12 +1775,11 @@ impl Machine {
                 .map_err(|e| e.to_string())?;
         }
 
-        self.restart_peripherals();
-        // Resume execution so the session feels like it never paused.
-        // Without this the user sees JIT shutdown stats and a dead prompt
-        // after `save` — the CPU would otherwise stay stopped.
-        self.cpu.start();
-        println!("Snapshot saved to saves/{}", name);
+        if resume {
+            self.restart_peripherals();
+            self.cpu.start();
+        }
+        println!("Snapshot saved to {}", dir.display());
         Ok(())
     }
 
@@ -1764,9 +1787,9 @@ impl Machine {
     /// at the end so the guest resumes from the snapshotted PC.
     /// For determinism validation use `load_snapshot_paused` instead.
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
-        self.load_snapshot_inner(name)?;
+        self.load_snapshot_inner(name, true)?;
         self.cpu.start();
-        println!("Snapshot loaded from saves/{}", name);
+        println!("Snapshot loaded from {}", self.snapshot_root.join(name).display());
         Ok(())
     }
 
@@ -1775,13 +1798,7 @@ impl Machine {
     /// must prevent any thread from running between load and digest, since
     /// thread scheduling jitter would mask CPU determinism issues.
     pub fn load_snapshot_paused(&mut self, name: &str) -> Result<(), String> {
-        self.load_snapshot_inner(name)?;
-        // load_snapshot_inner restarted peripherals; stop them again.
-        self.hpc3.stop();
-        self.mc.stop();
-        if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
-        if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
-        if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
+        self.load_snapshot_inner(name, false)?;
         Ok(())
     }
 
@@ -1793,7 +1810,7 @@ impl Machine {
     /// explicit invalidation is needed here as long as that ownership
     /// pattern holds. The persistent JIT profile uses content_hash to skip
     /// stale entries (see `profile_stale` in dispatch.rs).
-    fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
+    fn load_snapshot_inner(&mut self, name: &str, restart: bool) -> Result<(), String> {
         self.stop();
 
         // Any prior in-memory rollback checkpoint is now stale (it described
@@ -1804,7 +1821,7 @@ impl Machine {
         // Reset to clean state before loading
         self.power_on_devices();
 
-        let dir = std::path::PathBuf::from("saves").join(name);
+        let dir = self.snapshot_root.join(name);
         let snap = Snapshot::new(&dir);
 
         // Validate the manifest before reading anything else. Legacy snapshots
@@ -1984,7 +2001,7 @@ impl Machine {
         // Bulk memory: v3+ comes from the content-addressable chunk store
         // shared across snapshots; v2 reads raw bank{N}.bin files.
         if schema_version >= 3 {
-            let store = ChunkStore::new("saves");
+            let store = ChunkStore::new(&self.snapshot_root);
             let chunks = snap.read_chunks_manifest()
                 .map_err(|e| format!("read chunks.bin: {}", e))?;
             for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
@@ -2023,7 +2040,7 @@ impl Machine {
             eprintln!("load_snapshot: no cow.toml in snapshot — overlays left unchanged");
         }
 
-        self.restart_peripherals();
+        if restart { self.restart_peripherals(); }
         Ok(())
     }
 }
@@ -2041,6 +2058,7 @@ impl Drop for Machine {
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
         crate::workstation::flush_on_drop(self);
+        self.board.vino.shutdown();
         // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();

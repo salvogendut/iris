@@ -336,15 +336,24 @@ impl Default for VinoState {
 
 struct DmaWake {
     cond:  Condvar,
-    mutex: Mutex<()>,
+    mutex: Mutex<bool>,
 }
 
 impl DmaWake {
     fn new() -> Arc<Self> {
-        Arc::new(Self { cond: Condvar::new(), mutex: Mutex::new(()) })
+        Arc::new(Self { cond: Condvar::new(), mutex: Mutex::new(false) })
     }
-    fn notify(&self) { self.cond.notify_all(); }
-    fn wait(&self)   { self.cond.wait(&mut self.mutex.lock()); }
+    // Keep notifications that arrive before the DMA worker starts waiting.
+    // In particular, immediate start/stop must not lose its shutdown wakeup.
+    fn notify(&self) {
+        *self.mutex.lock() = true;
+        self.cond.notify_all();
+    }
+    fn wait(&self) {
+        let mut pending = self.mutex.lock();
+        while !*pending { self.cond.wait(&mut pending); }
+        *pending = false;
+    }
 }
 
 // ─── Public device handle ─────────────────────────────────────────────────────
@@ -377,6 +386,23 @@ impl Vino {
             running: Arc::new(AtomicBool::new(false)),
             thread:  Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn source_status(&self) -> String {
+        let source = self.source_d1.lock().clone();
+        source.map_or_else(|| "Off".into(), |s| s.status())
+    }
+
+    pub fn has_source(&self) -> bool { self.source_d1.lock().is_some() }
+
+    /// Release host capture and break source/physical-memory back references.
+    /// Drop sources outside their locks: camera destruction joins a worker.
+    pub fn shutdown(&self) {
+        self.stop();
+        let d0 = self.source_d0.lock().take();
+        let d1 = self.source_d1.lock().take();
+        self.sys_mem.lock().take();
+        drop((d0, d1));
     }
 
     /// Set the interrupt callback (called from machine setup after IOC is ready).
@@ -1421,20 +1447,15 @@ impl Device for Vino {
                 }
             }
             "status" => {
-                let st = self.state.lock();
                 let log = devlog_is_active(LogModule::Vino);
-
                 writeln!(writer, "VINO Status  (debug {})", if log { "on" } else { "off" })
                     .map_err(|e| e.to_string())?;
-
-                let d0_status = self.source_d0.lock()
-                    .as_ref()
-                    .map(|s| s.status())
-                    .unwrap_or_else(|| "none".to_string());
-                let d1_status = self.source_d1.lock()
-                    .as_ref()
-                    .map(|s| s.status())
-                    .unwrap_or_else(|| "none".to_string());
+                // Source status may consult CDMC registers on this VINO.
+                // Do not call it under the device or source lock.
+                let source_d0 = self.source_d0.lock().clone();
+                let d0_status = source_d0.map_or_else(|| "none".into(), |s| s.status());
+                let d1_status = self.source_status();
+                let st = self.state.lock();
                 writeln!(writer, "  source D0 (composite): {}", d0_status).map_err(|e| e.to_string())?;
                 writeln!(writer, "  source D1 (IndyCam):   {}", d1_status).map_err(|e| e.to_string())?;
                 writeln!(writer, "  REV_ID      = {:#010x}  (chip_id={:#x} rev={})",
@@ -1865,5 +1886,24 @@ mod tests {
         let p = &field.pixels;
         assert_eq!(&bytes[..],
                    &[p[0], p[1], p[2], p[5], p[8], p[9], p[10], p[13]][..]);
+    }
+}
+
+#[cfg(test)]
+mod host_lifetime_tests {
+    use super::*;
+    use crate::video_source::{BlackSource, CdmcAdjustedSource, VideoStandard};
+    #[test]
+    fn shutdown_releases_source_back_reference_and_can_be_repeated() {
+        let vino = Vino::new();
+        let source = Arc::new(CdmcAdjustedSource::new(Arc::new(BlackSource::new(VideoStandard::Ntsc)), vino.clone()));
+        let weak = Arc::downgrade(&source);
+        vino.set_source(source);
+        vino.execute_command("vino", &["status"], Box::new(std::io::sink())).unwrap();
+        for _ in 0..32 { vino.start(); vino.stop(); }
+        assert!(vino.has_source());
+        vino.shutdown(); vino.shutdown();
+        assert!(!vino.has_source());
+        assert!(weak.upgrade().is_none());
     }
 }
