@@ -1485,6 +1485,35 @@ mod tests {
         assert!(exec.core.hot.cycles >= before);
     }
 
+    /// The stall moves the cycle counter at the pacing rate so cycle readers
+    /// see time pass, but it retires nothing: the MIPS figure must not count
+    /// it, or an idle guest sitting in WAIT reads about 100 MIPS.
+    #[test]
+    fn test_wait_stall_is_not_retired() {
+        let (mut exec, _) = create_executor();
+        exec.core.pc = 0xFFFF_FFFF_8000_1000;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::CAUSE_IP2;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        let cycles = exec.cycles_ptr();
+        let before = cycles.retired();
+
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let raiser = std::thread::spawn(move || {
+            let irq = irq;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: the executor outlives this thread, which is joined below.
+            unsafe { &*irq.0 }.fetch_or(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::SeqCst);
+        });
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        raiser.join().unwrap();
+
+        assert!(cycles.get() >= before + 1_000_000, "20 ms of stall is 2M cycles at 10 ns each");
+        assert_eq!(cycles.retired(), before, "a stall retires nothing");
+    }
+
     /// A soft reset must escape the stall even when interrupts are enabled but
     /// nothing is pending — otherwise a reset could not break into an idle
     /// guest.
@@ -6144,24 +6173,41 @@ mod tests {
     #[cfg(not(feature = "lightning"))]
     #[test]
     fn breakpoints_can_be_set_while_running_and_report_their_hit() {
-        let cpu = nop_cpu();
+        // The guest spins on one instruction, so it is running for as long as
+        // the test needs and cannot reach the breakpoint on its own schedule:
+        // the breakpoint's condition is false until the test makes it true.
+        // (A sled that ran into the breakpoint raced the checks below, which
+        // need a running CPU, whenever the host was busy.)
+        let (mut exec, mem) = create_executor();
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.write_gpr(4, 1); // a0 != 0
+        let cpu = crate::cpu::mips_exec::MipsCpu::new(exec);
         crate::traits::Device::start(&cpu);
         assert!(cpu.is_running());
         // Adding a breakpoint pauses the core and resumes it.
-        let (r, out) = mon(&cpu, "bp add 0x80040000 pc if a0 == 0");
+        let (r, out) = mon(&cpu, "bp add 0x80001000 pc if a0 == 0");
         assert!(r.is_ok(), "{:?}", r);
         assert!(out.contains("Breakpoint added: 1:") && out.contains("if a0 == 0"), "{}", out);
+        assert!(cpu.is_running(), "the core resumes after the breakpoint is added");
         // Run control is refused while running, with one clear message.
         let (r, _) = mon(&cpu, "step");
         assert!(r.unwrap_err().contains("CPU is running"));
         // Status never blocks.
         let (r, out) = mon(&cpu, "status");
         assert!(r.is_ok());
-        assert!(out.starts_with("running") || out.starts_with("stopped"), "{}", out);
-        // The NOP sled reaches the breakpoint; wait says which one stopped it.
+        assert!(out.starts_with("running"), "{}", out);
+        // The condition is false, so the spin passes the breakpoint untouched.
+        let (r, out) = mon(&cpu, "wait 50");
+        assert!(r.is_ok());
+        assert!(out.contains("still running after 50 ms"), "{}", out);
+        // Make the condition true; the breakpoint stops the core, and wait says which one.
+        let (r, _) = mon(&cpu, "setreg a0 0");
+        assert!(r.is_ok());
         let (r, out) = mon(&cpu, "wait 10000");
         assert!(r.is_ok());
-        assert!(out.contains("stopped pc=ffffffff80040000"), "{}", out);
+        assert!(out.contains("stopped pc=ffffffff80001000"), "{}", out);
         assert!(out.contains("breakpoint 1:") && out.contains("hit 1 time"), "{}", out);
         assert!(!cpu.is_running());
         let (_, out) = mon(&cpu, "bp list");

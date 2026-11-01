@@ -477,6 +477,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   now gives a busy engine up to 100 us of host time before it answers.
   Tested to login with 32, 64, 128, 256, 224 (128+64+32), 384, 512 MB and
   1 GB, and headless.
+- **The same early panic on a loaded host.** That wait gave the kernel's
+  whole loop about 0.4 s of host time, which a busy host can keep the
+  engine's thread from getting: a 400 MHz R12000 O2 panicked in early
+  console setup in five boots of eleven, and holding the engine's thread for
+  a few seconds brought the same panic with either R12000 revision. A status read that follows
+  another busy one with no write between now waits up to 20 ms, ending as
+  soon as the engine is idle; the first read after a write still waits only
+  100 us, so drawing overlaps the engine as before.
 - **O2 SCSI commands run on their own thread.** Each AIC-7880 now has a
   worker (`AIC-7880-0`, `AIC-7880-1`) that fetches the command, moves the
   data and does the disk I/O; the CPU's register write only queues the tag.
@@ -785,6 +793,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Networking
 
+- **Bulk receive on the Indy no longer resets the interface.** The emulated
+  network can deliver frames far faster than IRIX re-arms its receive ring.
+  When the ring ran out in the middle of IRIX's interrupt handler, IRIX reset
+  the Ethernet and every frame in the ring was lost. Frames for the guest now
+  wait in iris while the next one would end a ring the driver has not finished
+  reaping, and flow as soon as it re-arms it (`[network] rx_hold`, on by
+  default). Frames that reach a receive channel that has stopped are lost, as
+  on the wire, and are not delivered after a restart.
 - **The Indy's HPC3 hands a filled Ethernet descriptor back before its channel
   stops.** It stopped first and wrote the descriptor back a moment later, so a
   driver that saw it stopped could restart it on the descriptor it had just
