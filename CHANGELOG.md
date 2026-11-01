@@ -21,6 +21,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Live NAT forwarding
+
+- Release old TCP and UDP forwarding listeners before binding replacement
+  rules. Reusing a host port or changing its localhost/LAN bind scope no longer
+  collides with the previous listener. Transient FTP forwards and established
+  connections remain intact.
+
 ### Frontend-owned guest audio
 
 - Bound HAL2's internal AES loopback to 96,000 words, discarding the oldest

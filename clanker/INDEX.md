@@ -156,6 +156,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | Note | Kind | Title |
 |---|---|---|
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
+| [release-forward-listeners-before-rebind.md](net/release-forward-listeners-before-rebind.md) | rule | Release old forwarding sockets before rebinding their ports |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
