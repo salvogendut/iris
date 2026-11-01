@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 use crate::config::{NetMode, NetworkConfig};
 
@@ -35,6 +36,21 @@ pub struct Link {
     /// Cleared to stop the backend.
     running: Arc<AtomicBool>,
     config: GatewayConfig,
+    worker: Arc<Mutex<Option<BackendWorker>>>,
+}
+
+struct BackendWorker {
+    thread: Option<std::thread::JoinHandle<()>>,
+    running: Arc<AtomicBool>,
+    wake: Arc<Wake>,
+}
+
+impl BackendWorker {
+    fn stop(mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.wake.notify();
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
 }
 
 impl Link {
@@ -57,14 +73,17 @@ impl Link {
     /// runs on its next start.
     pub fn renew(&self) -> Result<Link, String> {
         let r = &self.rings;
-        Ok(Self::build(self.config.clone(), self.frames.clone(), self.nat.clone(), r.tx_wake.clone(), r.rx_wake.clone()))
+        let mut next = Self::build(self.config.clone(), self.frames.clone(), self.nat.clone(), r.tx_wake.clone(), r.rx_wake.clone());
+        next.worker = self.worker.clone();
+        Ok(next)
     }
 
     fn build(config: GatewayConfig, frames: Arc<AtomicU64>, nat: Arc<NatControl>, tx_wake: Arc<Wake>, rx_wake: Arc<Wake>) -> Link {
         let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
         let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
         let rings = Rings { to_net, from_net, tx_wake, rx_wake };
-        Link { rings, far: Some((tx_cons, rx_prod)), frames, nat, running: Arc::new(AtomicBool::new(false)), config }
+        Link { rings, far: Some((tx_cons, rx_prod)), frames, nat, running: Arc::new(AtomicBool::new(false)), config,
+               worker: Arc::new(Mutex::new(None)) }
     }
 
     /// Which backend, for the adapter's log line.
@@ -105,7 +124,7 @@ impl Link {
     /// when built. `None` if it was built already.
     pub fn backend(&mut self) -> Option<Box<dyn NetBackend>> {
         let (tx_cons, rx_prod) = self.far.take()?;
-        let config = self.config.clone();
+        let config = self.nat.runtime_config(self.config.clone());
         let (rx_wake, tx_wake) = (self.rings.rx_wake.clone(), self.rings.tx_wake.clone());
         let (running, ctl) = (self.running.clone(), self.nat.clone());
         #[cfg(feature = "pcap")]
@@ -116,12 +135,19 @@ impl Link {
     }
 
     /// Run the backend on a thread called `name` until `running` clears. The
-    /// thread is detached: a stopped adapter does not wait for it, and the
-    /// next start runs a renewed link on a thread of its own.
+    /// stopped adapter need not join here: the next start waits for its old
+    /// backend to release sockets before binding replacements. An adapter
+    /// which consumes a link without renewing it still owns the running flag;
+    /// dropping the link alone does not stop that detached backend.
     pub fn spawn(&mut self, name: &str) {
+        if self.far.is_none() { return; }
+        let shared = self.worker.clone();
+        let mut worker = shared.lock();
+        if let Some(previous) = worker.take() { previous.stop(); }
         let Some(mut backend) = self.backend() else { return };
         self.running.store(true, Ordering::SeqCst);
-        std::thread::Builder::new().name(name.into()).spawn(move || backend.run()).expect("network backend thread");
+        let thread = std::thread::Builder::new().name(name.into()).spawn(move || backend.run()).expect("network backend thread");
+        *worker = Some(BackendWorker { thread: Some(thread), running: self.running.clone(), wake: self.rings.tx_wake.clone() });
     }
 
     /// Rings to nowhere, and their far ends, for adapter tests.
@@ -136,6 +162,54 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewed_links_retain_consumed_live_settings() {
+        use crate::config::{ForwardBind, ForwardProto, PortForwardConfig};
+        let first = Link::open(&NetworkConfig::default()).unwrap().unwrap();
+        let next = first.renew().unwrap(); // Already prepared before the edit.
+        let ctl = first.nat();
+        ctl.request_subnet("10.44.0.1".parse().unwrap(), "10.44.0.2".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        ctl.set_port_forwards(vec![PortForwardConfig { proto: ForwardProto::Tcp, host_port: 23456, guest_port: 23, bind: ForwardBind::Localhost }]);
+        ctl.request_pcap_interface(Some("test-interface".into()));
+        // The previous backend has applied the notifications already.
+        ctl.apply_subnet.store(false, Ordering::Release);
+        ctl.apply_forwards.store(false, Ordering::Release);
+        ctl.apply_pcap_iface.store(false, Ordering::Release);
+        ctl.pending_forwards.lock().take();
+        let config = next.nat.runtime_config(next.config.clone());
+        assert_eq!(config.gateway_ip.to_string(), "10.44.0.1");
+        assert_eq!(config.client_ip.to_string(), "10.44.0.2");
+        assert_eq!(config.port_forwards.len(), 1);
+        assert_eq!(config.port_forwards[0].host_port, 23456);
+        assert_eq!(config.pcap_interface.as_deref(), Some("test-interface"));
+        ctl.set_port_forwards(vec![]);
+        ctl.request_pcap_interface(None);
+        let config = next.nat.runtime_config(config);
+        assert!(config.port_forwards.is_empty());
+        assert!(config.pcap_interface.is_none());
+    }
+
+    #[test]
+    fn rapid_restart_releases_old_forwarding_ports_before_binding() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use crate::config::{ForwardBind, ForwardProto, PortForwardConfig};
+        let reserve = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let cfg = GatewayConfig { port_forwards: vec![PortForwardConfig {
+            proto: ForwardProto::Tcp, host_port: port, guest_port: 23, bind: ForwardBind::Localhost,
+        }], ..Default::default() };
+        let mut first = Link::with_gateway(cfg).unwrap().unwrap();
+        let mut next = first.renew().unwrap();
+        first.spawn("test-net-old");
+        // Do not wait for the old backend to observe its stop flag.
+        first.running.store(false, Ordering::SeqCst);
+        next.spawn("test-net-new");
+        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok());
+        next.worker.lock().take().unwrap().stop();
+        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+    }
 
     /// A renewed link has fresh rings and a backend that has not been built,
     /// and shares the wake-ups and controls.

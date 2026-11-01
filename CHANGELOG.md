@@ -23,6 +23,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Live NAT forwarding
 
+- Preserve live subnet, forwarding and PCAP interface choices across peripheral
+  restarts. Renewed links wait for the preceding backend to release its sockets
+  before opening replacements, including during a rapid pause/resume.
+
 - Release old TCP and UDP forwarding listeners before binding replacement
   rules. Reusing a host port or changing its localhost/LAN bind scope no longer
   collides with the previous listener. Transient FTP forwards and established

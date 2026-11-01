@@ -344,6 +344,14 @@ Every device that has real work to do runs on its own thread:
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
 | `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
 
+Network links renewed by SEEQ/DaynaPort share their backend worker handle.
+Starting a renewed link signals and joins the preceding backend before binding
+new listeners; backend threads access frame rings without acquiring adapter
+state locks. Live subnet, forwarding
+and PCAP interface overrides survive in the shared `NatControl` and are applied
+when constructing each backend. Adapters which consume a single link retain the
+existing detached-thread lifetime, controlled by the link's running flag.
+
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds
 when the guest is in its idle loop. A producer that adds work, or a device

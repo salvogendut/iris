@@ -244,6 +244,16 @@ pub struct NatControl {
     /// reboot. Unused in NAT mode.
     pub pending_pcap_iface: Mutex<Option<String>>,
     pub apply_pcap_iface:   AtomicBool,
+    // Explicit embedder choices survive a device stop/start, even after the
+    // running backend has consumed their one-shot notification flags.
+    overrides: Mutex<NetworkOverrides>,
+}
+
+#[derive(Default)]
+struct NetworkOverrides {
+    subnet: Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>,
+    forwards: Option<Vec<PortForwardConfig>>,
+    interface: Option<Option<String>>,
 }
 
 impl NatControl {
@@ -274,6 +284,7 @@ impl NatControl {
             pcap_status:      AtomicU8::new(PcapStatus::Inactive as u8),
             pending_pcap_iface: Mutex::new(None),
             apply_pcap_iface:   AtomicBool::new(false),
+            overrides: Mutex::new(NetworkOverrides::default()),
         })
     }
 
@@ -281,6 +292,7 @@ impl NatControl {
     /// `iface` (`None` = auto-pick), applied on the engine's next loop. The guest
     /// keeps running — only the host-side capture handle is swapped. No-op in NAT.
     pub fn request_pcap_interface(&self, iface: Option<String>) {
+        self.overrides.lock().interface = Some(iface.clone());
         *self.pending_pcap_iface.lock() = iface;
         self.apply_pcap_iface.store(true, Ordering::Release);
     }
@@ -317,6 +329,7 @@ impl NatControl {
     /// Ask the running NAT to move to a new subnet (applied on the NAT thread's
     /// next loop: config swapped + connection tables flushed). No reboot needed.
     pub fn request_subnet(&self, gateway: Ipv4Addr, client: Ipv4Addr, netmask: Ipv4Addr) {
+        self.overrides.lock().subnet = Some((gateway, client, netmask));
         self.apply_gateway.store(u32::from(gateway), Ordering::Relaxed);
         self.apply_client.store(u32::from(client), Ordering::Relaxed);
         self.apply_netmask.store(u32::from(netmask), Ordering::Relaxed);
@@ -332,8 +345,21 @@ impl NatControl {
     /// Replace the running NAT's port-forward rules (rebound on the NAT thread's
     /// next loop). No reboot needed.
     pub fn set_port_forwards(&self, rules: Vec<PortForwardConfig>) {
+        self.overrides.lock().forwards = Some(rules.clone());
         *self.pending_forwards.lock() = Some(rules);
         self.apply_forwards.store(true, Ordering::Release);
+    }
+
+    fn runtime_config(&self, mut config: GatewayConfig) -> GatewayConfig {
+        let saved = self.overrides.lock();
+        if let Some((gateway, client, mask)) = saved.subnet {
+            config.gateway_ip = gateway;
+            config.client_ip = client;
+            config.netmask = mask;
+        }
+        if let Some(rules) = &saved.forwards { config.port_forwards = rules.clone(); }
+        if let Some(iface) = &saved.interface { config.pcap_interface = iface.clone(); }
+        config
     }
 
     /// Whether `net/prefix` overlaps any recorded host network — i.e. adopting
