@@ -11,6 +11,17 @@ history; author dates can differ after rebases or cherry-picks. Historical
 feature names describe the build at the time, not flags to use today. Commit
 hashes are given where a change is easiest to understand by reading the commit.
 
+## November 2026
+
+### Bundled O2 and Octane firmware (fork)
+
+- Embed O2 4.18 and Octane 4.9 as Rust byte arrays, with a reproducible
+  `tools/embed-prom.py` converter and source hashes. Both machines now have a
+  firmware fallback when the default files are absent. An empty `prom` selects
+  embedded firmware directly; explicit external paths remain supported and
+  report errors instead of silently substituting firmware. Existing persisted
+  flash and NVRAM are unchanged.
+
 ## October 2026
 
 ### Guest power-off state for embedded hosts

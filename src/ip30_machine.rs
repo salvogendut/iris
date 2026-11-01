@@ -41,7 +41,7 @@ use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
 /// The PROM image tried when `prom` is left at the shared default, named
-/// as IRIX ships it in /usr/cpu/firmware. The Octane has no embedded PROM.
+/// as IRIX ships it in /usr/cpu/firmware, before the embedded 4.9 fallback.
 pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
 /// The 195 MHz R10000 of SGI's standard 128 MB Octane configurations (the
 /// OCTANE Technical Report): Count at half that.
@@ -115,17 +115,14 @@ impl OctaneMachine {
         if cfg.machine.cpu != CpuModel::R10000 {
             return Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into());
         }
-        // `prom`, or IRIX's file name when `prom` is the shared default and
-        // that file is not there: there is no embedded Octane PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            OCTANE_PROM_FILE.to_string()
-        };
-        let prom = std::fs::read(&prom_path)
-            .map_err(|e| format!("Octane PROM {prom_path}: {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
+        let prom = crate::firmware::load_flash_prom(
+            &cfg.prom,
+            &[std::path::Path::new(crate::config::DEFAULT_PROM), std::path::Path::new(OCTANE_PROM_FILE)],
+            &crate::prombinip30::PROM_IP30_REV4_9,
+            "Octane",
+        )?;
         if prom.len() > FLASH_SIZE {
-            return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
+            return Err(format!("Octane PROM is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
         }
         let cpu_count = cfg.machine.cpus;
         if !(1..=2).contains(&cpu_count) {

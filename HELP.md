@@ -27,6 +27,16 @@ release.
 
 ---
 
+## Bundled firmware
+
+This fork includes PROMs for all five machine profiles, including O2 4.18 and
+Octane 4.9. On O2/Octane, leaving `prom` unset tries `prom.bin`, then
+`ip32prom.rev4.18.bin` or `IP30prom.bin` respectively, and then the embedded
+image if both files are absent. `prom = ""` selects embedded firmware directly,
+without consulting the working directory. A different explicit path must be
+readable; errors do not silently fall back. Existing flash state remains
+authoritative; see [O2](docs/o2-ip32.md) and [Octane](docs/octane-ip30.md).
+
 ## Performance vs inventory (MHz vs MIPS)
 
 IRIX **System Manager** and `hinv` report a **CPU MHz** line (e.g. 166 MHz). That
@@ -574,7 +584,7 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image)
+prom     = "prom.bin"       # PROM image; all five profiles have embedded firmware (see the model guides)
 nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 

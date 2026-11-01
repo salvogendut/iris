@@ -31,7 +31,7 @@ An Octane is set up with the shared keys; `[octane]` holds what only an
 Octane has.
 
 ```toml
-prom  = "IP30prom.bin"        # the stock IP30 PROM (not built in)
+prom  = ""                   # embedded Octane 4.9; or a path to an external IP30 PROM
 nvram = "nvram.bin"           # the DS1685 clock's NVRAM: the PROM's settings
 banks = [128]                 # MB in each HEART bank
 headless = true               # no window; console=d in the NVRAM for a serial console
@@ -65,8 +65,13 @@ fixed_mhz` sets CP0 Count; unset it is 97.5 MHz, half of the R10000's
 
 ## PROM and flash
 
-The PROM image is not built in and is not shipped with iris: `prom` must name
-the stock IP30 PROM, at most 1 MiB. It is loaded into the boot flash, a 1 MiB
+This fork embeds the 1 MiB Octane 4.9 PROM in `src/prombinip30.rs`
+(SHA-1 `de250875c608add63749d3f9fb81a82cb58c3586`). An explicit `prom` path
+overrides it and must be readable; images can be at most 1 MiB, including the
+879,312-byte IRIX `IP30prom.bin` used for the OS checks described above.
+Leaving `prom` unset tries `prom.bin`, then `IP30prom.bin`, then embedded 4.9
+if neither file exists. `prom = ""` selects embedded directly without searching
+the working directory. The chosen image is loaded into the boot flash, a 1 MiB
 part with the Intel/Sharp command set on the Bridge's first chip select,
 where the PROM also keeps its persistent records. `[octane] flash` names a
 file holding the whole flash, so those records survive from run to run; it
@@ -74,6 +79,11 @@ is created from `prom` when missing or empty, and an existing file of
 exactly 1 MiB is used as it stands (delete it after changing `prom`). A
 file of any other size is refused with an error and left untouched. Without it the flash starts from
 `prom` every run.
+
+With the bundled 4.9 image, a Prismatic diskless check at 128 MB reaches the
+firmware menu after acknowledging internal/external SCSI device/cable diagnostic
+failures with Enter. The IRIX boot results above used the other external PROM;
+that OS path has not been revalidated with bundled 4.9.
 
 ## Memory
 

@@ -151,7 +151,7 @@ pub struct O2Machine {
 const SNAPSHOT_MACHINE: &str = "o2_ip32";
 
 /// The PROM image tried when `prom` is left at the shared default: the last
-/// release's, named as SGI shipped it. The O2 has no embedded PROM.
+/// release's, named as SGI shipped it, before the embedded 4.18 fallback.
 pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 
 /// CP0 Count when `[clock] fixed_mhz` is unset: half of a 180 MHz CPU.
@@ -160,15 +160,12 @@ pub const O2_COUNT_MHZ: f64 = 90.0;
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         let o2 = &cfg.o2;
-        // `prom`, or the last release's file when `prom` is the shared default
-        // and that file is not there: there is no embedded O2 PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            O2_PROM_FILE.to_string()
-        };
-        let prom = std::fs::read(&prom_path)
-            .map_err(|e| format!("O2 PROM {prom_path}: {e} (set `prom` to the O2 PROM image; 4.18 is the last release)"))?;
+        let prom = crate::firmware::load_flash_prom(
+            &cfg.prom,
+            &[std::path::Path::new(crate::config::DEFAULT_PROM), std::path::Path::new(O2_PROM_FILE)],
+            &crate::prombinip32::PROM_IP32_REV4_18,
+            "O2",
+        )?;
         // `banks`: the kit in each DIMM pair from A (validate checked them).
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;

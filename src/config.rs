@@ -860,7 +860,7 @@ impl Default for MachineSection {
 }
 
 /// What only an O2 has (`[o2]` section). The rest of an O2 is the shared
-/// keys: `prom` (its PROM image, not embedded), `nvram` (the PROM's flash,
+/// keys: `prom` (optional override of embedded 4.18), `nvram` (the PROM's flash,
 /// which holds its environment), `banks` (the kit in each DIMM pair),
 /// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (a serial
 /// console instead of the graphics console), `[clock] fixed_mhz` (CP0 Count,
@@ -1648,8 +1648,8 @@ pub fn ci_socket_tcp_addr(path: &str) -> String {
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 fn default_lock_aspect_ratio() -> bool { true }
 
-/// `prom` when a config does not set it. The O2 then tries
-/// `ip32_machine::O2_PROM_FILE` as well, having no embedded PROM.
+/// `prom` when a config does not set it. O2 and Octane then try their
+/// model-specific filename before falling back to embedded firmware.
 pub const DEFAULT_PROM: &str = "prom.bin";
 /// `nvram` when a config does not set it: the DS1386's file on the Indy, the
 /// PROM's flash on the O2, the DS1685's RAM on the Octane.

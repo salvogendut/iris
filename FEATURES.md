@@ -138,7 +138,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
+| `prom` | `"prom.bin"` | PROM path; all five models have embedded firmware in this fork. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28). O2/Octane try `prom.bin`, then `ip32prom.rev4.18.bin` / `IP30prom.bin`, then embedded 4.18 / 4.9 if those files are absent. On O2/Octane, `""` selects embedded directly; other explicit paths must be readable. |
 | `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
 | `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
@@ -305,8 +305,8 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
-keys: `prom` (its PROM image, not embedded; `ip32prom.rev4.18.bin` is tried
-when `prom` is left at its default), `nvram` (the PROM's flash, which holds
+keys: `prom` (optional override; the default tries local files before embedded
+4.18, while `""` selects embedded directly), `nvram` (the PROM's flash, which holds
 its environment), `banks` (the kit in each of the four DIMM pairs: 32, 64,
 128 or 256 MB, largest first), `serial_port_a`/`serial_port_b`/`serial_log`,
 `headless` (serial console instead of the graphics console and keyboard),
@@ -328,8 +328,8 @@ the file is loaded, with a note, and never written back.
 ### [octane]
 
 Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
-"r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
-not embedded; `IP30prom.bin` is tried when it is left unset), `nvram` (the
+"r10000"`. An Octane is configured by the shared keys: `prom` (optional IP30
+override; local files precede embedded 4.9 by default, `""` selects embedded directly), `nvram` (the
 DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256,
 512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),

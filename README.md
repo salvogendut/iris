@@ -100,7 +100,9 @@ You need:
   original media CDs into an empty CHD/raw disk).
 - An external PROM image (optional): `070-9101-011.bin` for Indy,
   `070-1367-012.bin` for Indigo2 IP22, or `070-1477-002.bin` for Indigo2 IP28.
-  Each machine has its own embedded fallback.
+  This fork also embeds O2 4.18 (`src/prombinip32.rs`) and Octane 4.9
+  (`src/prombinip30.rs`). All five models have an embedded fallback; external
+  firmware remains optional. See the model guides for selection and flash state.
 
 Now, if you feel like typing some commands in console. Sync the project and:
 

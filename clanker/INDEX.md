@@ -100,6 +100,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [embedded-flash-prom-selection.md](devices/embedded-flash-prom-selection.md) | rule | Fork O2/Octane firmware: empty path selects embedded bytes, defaults probe local files, explicit override errors never fall back |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [audio-test-suite.md](devices/audio-test-suite.md) | howto | The audio test suite (`test/audiotest`): rates x channels x widths through the audio library, playaiff and sfplay, checked against the Octane's capture |
 | [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |

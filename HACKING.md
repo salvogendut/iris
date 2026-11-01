@@ -597,10 +597,14 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   R10000, and IMPACT graphics (see the [Octane guide](docs/octane-ip30.md)
   for the boards).
 
-The Indy and Indigo2 profiles each have an embedded PROM fallback;
-`src/platform.rs` and `src/machine.rs` wire their differences, and
-`platform_profile_tests.rs` pins them down. The O2 and the Octane have no
-embedded PROM and are built by `workstation::build`.
+All five profiles have embedded PROMs in `src/prombin*.rs`.
+`src/platform.rs` and `src/machine.rs` wire the Indy/Indigo2 differences, and
+`platform_profile_tests.rs` pins them down. O2 and Octane are built by
+`workstation::build`; `src/firmware.rs` selects their external or embedded
+flash image. An empty `prom` selects embedded bytes directly, while the shared
+default searches the working directory first. Explicit unreadable overrides
+are errors. `tools/embed-prom.py` reproduces the IP30/IP32 Rust arrays without
+byte-swapping; each generated file records the source size and SHA-1.
 
 ## 10. Building and testing
 

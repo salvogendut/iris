@@ -10,8 +10,8 @@ headless = false
 # Can also be set with --noaudio.
 no_audio = false
 
-# PROM ROM image. Indy and Indigo2 have an embedded fallback; the O2 needs its
-# own (ip32prom.rev4.18.bin is tried when this is left as is).
+# PROM ROM image. All five models have an embedded fallback in this fork.
+# O2/Octane also try their model filename; an empty path selects embedded directly.
 prom = "prom.bin"
 
 # Window scale factor. Uses logical points (macOS) / DPI-scaled pixels, so

@@ -14,10 +14,12 @@ Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
 Release workflow, and a sandboxed build ships on the Mac App Store.
 
 The platform list has the Indy, Indigo2 (IP22), Indigo2 IMPACT (IP28) and Octane
-(IP30). The Octane needs the IP30 PROM image (no built-in PROM), is fixed to the
+(IP30). The Octane is fixed to the
 R10000, takes Solid IMPACT or no graphics board and 64 to 512 MB banks from
 bank 0, and keeps its PROM records in an optional flash file; see
-[docs/octane-ip30.md](docs/octane-ip30.md). The O2 is not selectable here yet.
+[docs/octane-ip30.md](docs/octane-ip30.md). This fork includes an Octane 4.9
+firmware fallback in the core; the GUI retains its external-PROM controls.
+The O2 is not selectable here yet.
 
 ---
 
