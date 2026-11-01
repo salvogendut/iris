@@ -344,6 +344,31 @@ Every device that has real work to do runs on its own thread:
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
 | `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
 
+Library frontends own `gdb_stub::GdbServer` and `vnc::VncServer` for each
+workstation. Drop closes active client sockets (including incomplete protocol
+handshakes) and joins listener/protocol/capture workers before releasing CPU,
+display and input references. On the first viewer, VNC requests a fresh board
+readback before publishing, with a bounded wait for paused machines. Drop these handles before stopping or replacing
+the workstation. `perfetto::stop_if_running` supports idempotent trace cleanup
+after a monitor stop; flush the recorder before its guest-cycle source disappears.
+GDB's standalone `start_gdb_server` retains its process-lifetime
+behavior; `GdbServer::start` reports bind errors synchronously and exposes the
+actual address, including an automatically allocated port.
+
+`thread_affinity::init` replaces the previous configuration, so library frontends
+call it before each workstation construction, after the previous machine stops.
+`available_cores` returns processor IDs allowed by the host affinity mask on
+Linux/Windows, not an assumed contiguous processor count. Unsupported systems
+return `None`; out-of-range IDs never reach the host mask operation.
+
+In `jitv2` builds, library frontends can call `pcache::configure(Some(base))` or
+`configure(None)` between machines to enable a dedicated persistent cache or
+disable it without changing process environment variables. Standalone environment
+configuration remains the fallback. The cache writer has a bounded, nonblocking
+queue: excess cache writes are skipped. Each queued write captures its directory
+so it cannot be redirected to the next machine's cache. Startup pruning touches
+only marked hexadecimal build directories, preserving unrelated folders.
+
 Network links renewed by SEEQ/DaynaPort share their backend worker handle.
 Starting a renewed link signals and joins the preceding backend before binding
 new listeners; backend threads access frame rings without acquiring adapter

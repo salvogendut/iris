@@ -55,7 +55,31 @@ const HEADER_LEN: usize = 8 + 4 + 4 + 16 + 16 + BITMAP_WORDS * 8 * 2 + 4 + 4 + 4
 const WORDS_LEN: usize = ENTRIES_PER_PAGE * 4;
 const SUM_LEN: usize = 16;
 
+static OVERRIDE: parking_lot::RwLock<Option<Option<PathBuf>>> = parking_lot::RwLock::new(None);
+
+/// Configure persistent reuse for a library frontend. Call only between machines.
+/// None disables caching. A directory is an application-owned cache base.
+pub fn configure(base: Option<&Path>) -> Result<(), String> {
+    let dir = base.map(setup_root).transpose()?;
+    *OVERRIDE.write() = Some(dir);
+    Ok(())
+}
+
+fn setup_root(base: &Path) -> Result<PathBuf, String> {
+    static ID: OnceLock<Result<String, String>> = OnceLock::new();
+    let id = ID.get_or_init(|| {
+        let exe = std::env::current_exe().and_then(std::fs::read).map_err(|e| e.to_string())?;
+        Ok(hex(&blake3::hash(&exe).as_bytes()[..16]))
+    }).as_ref().map_err(Clone::clone)?;
+    let dir = base.join(id);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let _ = std::fs::File::create(dir.join(".used"));
+    prune_builds(base);
+    Ok(dir)
+}
+
 pub fn enabled() -> bool {
+    if let Some(dir) = OVERRIDE.read().as_ref() { return dir.is_some(); }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = matches!(std::env::var("IRIS_JIT_CACHE").as_deref(), Ok("1") | Ok("on"));
@@ -86,7 +110,8 @@ fn default_base() -> Option<PathBuf> {
 }
 
 /// `<base>/<build-id>`, created on first use; `None` if it can't be.
-fn root() -> Option<&'static PathBuf> {
+fn root() -> Option<PathBuf> {
+    if let Some(dir) = OVERRIDE.read().as_ref() { return dir.clone(); }
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     ROOT.get_or_init(|| {
         let base = match std::env::var_os("IRIS_JIT_CACHE_DIR") {
@@ -101,7 +126,7 @@ fn root() -> Option<&'static PathBuf> {
         let _ = std::fs::File::create(dir.join(".used"));
         prune_builds(&base);
         Some(dir)
-    }).as_ref()
+    }).clone()
 }
 
 /// Keep the `KEEP_BUILDS` most recently used build directories.
@@ -110,6 +135,7 @@ fn prune_builds(base: &Path) {
     let mut builds: Vec<(std::time::SystemTime, PathBuf)> = rd
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.len() == 32 && n.bytes().all(|b| b.is_ascii_hexdigit())) && e.path().join(".used").is_file())
         .map(|e| {
             let used = std::fs::metadata(e.path().join(".used")).and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -400,6 +426,7 @@ pub fn known_entries(fp: &Fingerprint, ph: &PageHash, fr1: bool) -> Entries {
 // ---- writer --------------------------------------------------------------
 
 struct Job {
+    dir: PathBuf,
     fp: Fingerprint,
     ph: PageHash,
     fr1: bool,
@@ -409,9 +436,10 @@ struct Job {
 /// Queue a successful compile for writing. Returns at once; a background
 /// thread does the filesystem work.
 pub fn store(fp: Fingerprint, ph: PageHash, fr1: bool, blob: Blob) {
-    static TX: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+    let Some(dir) = page_dir(&fp, &ph, fr1) else { return };
+    static TX: OnceLock<std::sync::Mutex<std::sync::mpsc::SyncSender<Job>>> = OnceLock::new();
     let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(32);
         std::thread::Builder::new()
             .name("jitcache-writer".into())
             .spawn(move || {
@@ -422,11 +450,11 @@ pub fn store(fp: Fingerprint, ph: PageHash, fr1: bool, blob: Blob) {
             .expect("spawn jitcache writer");
         std::sync::Mutex::new(tx)
     });
-    let _ = tx.lock().unwrap().send(Job { fp, ph, fr1, blob });
+    let _ = tx.lock().unwrap().try_send(Job { dir, fp, ph, fr1, blob });
 }
 
 fn write_job(job: Job) {
-    let Some(dir) = page_dir(&job.fp, &job.ph, job.fr1) else { return };
+    let dir = &job.dir;
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -459,12 +487,64 @@ fn write_job(job: Job) {
 mod tests {
     use super::*;
 
+    struct TempDirectory(PathBuf);
+    impl TempDirectory {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("iris-pcache-{}-{nanos}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path { &self.0 }
+    }
+    impl Drop for TempDirectory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
     fn blob(entries: Entries, seed: u32) -> Blob {
         let mut words = Box::new([0u32; ENTRIES_PER_PAGE]);
         for (i, w) in words.iter_mut().enumerate() {
             *w = seed.wrapping_mul(2654435761).wrapping_add(i as u32);
         }
         Blob { entries, used: [!0; BITMAP_WORDS], instr_count: 7, align: 16, words, code: vec![0xd5, 0x03, 0x20, 0x1f, 1, 2, 3] }
+    }
+
+    #[test]
+    fn configured_cache_writes_keep_their_original_destination() {
+        // Cache configuration is process-wide; isolate from parallel CPU tests.
+        if std::env::var_os("IRIS_PCACHE_TEST_CHILD").is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cpu::jitv2::pcache::tests::configured_cache_writes_keep_their_original_destination"])
+                .env("IRIS_PCACHE_TEST_CHILD", "1").status().unwrap().success());
+            return;
+        }
+        let root = TempDirectory::new();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        configure(Some(&first)).unwrap();
+        assert!(enabled());
+        let fp = [1; 16];
+        let blob = blob([1; BITMAP_WORDS], 7);
+        let ph = page_hash(&blob.words);
+        let dir = page_dir(&fp, &ph, false).unwrap();
+        let job = Job { dir: dir.clone(), fp, ph, fr1: false, blob };
+        configure(Some(&second)).unwrap();
+        write_job(job);
+        assert_eq!(variant_files(&dir).len(), 1);
+        assert_eq!(variant_files(&page_dir(&fp, &ph, false).unwrap()).len(), 0);
+        configure(None).unwrap();
+        assert!(!enabled());
+        assert!(page_dir(&fp, &ph, false).is_none());
+    }
+
+    #[test]
+    fn pruning_does_not_remove_unrelated_directories() {
+        let root = TempDirectory::new();
+        for name in ["documents", "other-cache", "photos", "not-a-build", "notes"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        prune_builds(root.path());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 5);
     }
 
     #[test]

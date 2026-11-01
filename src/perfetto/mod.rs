@@ -535,14 +535,23 @@ pub fn start(path: &str, cats: u32, clock: Clock) -> Result<(), String> {
 
 /// Stop the running session, flush it, and describe what was written.
 pub fn stop() -> Result<String, String> {
-    let sess = SESSION.lock().take().ok_or("no perfetto session running")?;
+    stop_if_running()?.ok_or_else(|| "no perfetto session running".into())
+}
+
+/// Flush a session if present. Library lifecycle cleanup may follow a monitor
+/// `perfetto stop`, so an already stopped recorder is a successful no-op.
+pub fn stop_if_running() -> Result<Option<String>, String> {
+    // Serialize stop/start and other stop callers until the writer has joined;
+    // a frontend may otherwise free the guest clock while a monitor stop flushes.
+    let mut session = SESSION.lock();
+    let Some(sess) = session.take() else { return Ok(None); };
     MASK.store(0, Ordering::Relaxed);
     let path = sess.path.clone();
     let st = sess.finish()?;
-    Ok(format!(
+    Ok(Some(format!(
         "perfetto: wrote {path}: {} events, {} dropped, {} bytes",
         st.events, st.dropped, st.bytes
-    ))
+    )))
 }
 
 pub fn status() -> String {
@@ -565,11 +574,10 @@ pub fn status() -> String {
 
 /// Stop the session if one is running (process shutdown).
 pub fn shutdown() {
-    if SESSION.lock().is_some() {
-        match stop() {
-            Ok(msg) => eprintln!("{msg}"),
-            Err(e) => eprintln!("perfetto: {e}"),
-        }
+    match stop_if_running() {
+        Ok(Some(msg)) => eprintln!("{msg}"),
+        Ok(None) => {},
+        Err(e) => eprintln!("perfetto: {e}"),
     }
 }
 

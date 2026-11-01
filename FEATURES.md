@@ -695,6 +695,12 @@ default and needs a build with `jitv2`. Cache entries are checked against the
 executable, codegen settings, and page bytes. See
 [Persistent JIT cache](docs/jitv2-persistent-cache.md).
 
+Library frontends can select an application-owned cache directory with
+`cpu::jitv2::pcache::configure(Some(base))`, or disable it with `configure(None)`,
+between machines. This overrides the environment fallback without mutating it.
+Cache writes use a bounded background queue and keep the directory selected when
+enqueued. Pruning only removes marked build-ID directories.
+
 #### Measuring emitted code against a real corpus
 
 `j2 corpus [dir]` (default `jitv2_corpus/`) writes every page in the live JIT

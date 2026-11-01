@@ -651,6 +651,12 @@ it stop), `locks` (who holds what), the device's own `status` command, then
 
 ## GDB stub
 
+Library frontends can use `gdb_stub::GdbServer::start` for an owned, loopback-only
+listener. It returns bind errors immediately, and `addr()` reports the actual
+endpoint. Dropping it disconnects an active debugger, removes its breakpoints and
+joins the protocol thread before the machine is replaced. The standalone entry
+point keeps listening for the process lifetime.
+
 `--gdb-port <port>` starts a GDB Remote Serial Protocol stub
 (`src/gdb_stub.rs`) on `127.0.0.1:<port>`, one client at a time. Breakpoints
 set by GDB are removed when the client disconnects.

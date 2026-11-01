@@ -19,7 +19,9 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::sync::Arc;
 use std::thread;
 
@@ -769,6 +771,7 @@ impl gdbstub::conn::ConnectionExt for LoggingStream {
         self.0.set_nonblocking(true)?;
         let mut buf = [0u8; 1];
         match TcpStream::peek(&mut self.0, &mut buf) {
+            Ok(0) => Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(_) => Ok(Some(buf[0])),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
@@ -783,66 +786,73 @@ impl gdbstub::conn::ConnectionExt for LoggingStream {
 /// Accepts one connection at a time. Breakpoints set by GDB are automatically
 /// removed when the client disconnects.
 pub fn start_gdb_server(port: u16, cpu: Arc<dyn CpuDebug>) {
-    thread::Builder::new()
-        .name("gdb-listener".to_string())
-        .spawn(move || {
-            let addr = format!("127.0.0.1:{}", port);
-            let listener = match TcpListener::bind(&addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("GDB stub: failed to bind {}: {}", addr, e);
-                    return;
-                }
-            };
-            eprintln!(
-                "GDB stub: listening on {} (GDB: target remote {})",
-                addr, addr
-            );
+    match GdbServer::start(port, cpu) {
+        // Standalone entry point intentionally lives until process exit.
+        Ok(server) => std::mem::forget(server),
+        Err(e) => eprintln!("GDB stub: {e}"),
+    }
+}
 
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let peer = stream
-                            .peer_addr()
-                            .map(|a| a.to_string())
-                            .unwrap_or_default();
-                        eprintln!("GDB stub: connected from {}", peer);
+/// Owned loopback listener. Drop disconnects the active debugger, joins the
+/// protocol worker and releases its CPU before a frontend replaces a machine.
+pub struct GdbServer {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    client: Arc<Mutex<Option<TcpStream>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
 
-                        // Stop the CPU before starting a GDB session so we start
-                        // from a known-halted state. (In developer mode it's already stopped.)
-                        cpu.stop();
-
-                        let mut target = IrisTarget::new(cpu.clone());
-                        let stream = LoggingStream(stream);
-                        let gdb = GdbStub::new(stream);
-
-                        match gdb.run_blocking::<IrisEventLoop>(&mut target) {
-                            Ok(DisconnectReason::Disconnect) => {
-                                eprintln!("GDB stub: client disconnected");
-                            }
-                            Ok(DisconnectReason::TargetExited(code)) => {
-                                eprintln!("GDB stub: target exited ({})", code);
-                            }
-                            Ok(DisconnectReason::TargetTerminated(sig)) => {
-                                eprintln!("GDB stub: target terminated ({:?})", sig);
-                            }
-                            Ok(DisconnectReason::Kill) => {
-                                eprintln!("GDB stub: killed by GDB");
-                            }
-                            Err(e) if e.is_target_error() => {
-                                eprintln!("GDB stub: target error: {}", e.into_target_error().unwrap());
-                            }
-                            Err(e) => {
-                                eprintln!("GDB stub: error: {:?}", e);
-                            }
+impl GdbServer {
+    pub fn start(port: u16, cpu: Arc<dyn CpuDebug>) -> io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let client = Arc::new(Mutex::new(None));
+        let worker_stop = stop.clone();
+        let worker_client = client.clone();
+        let thread = thread::Builder::new().name("gdb-listener".into()).spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        {
+                            let mut active = worker_client.lock().unwrap();
+                            if worker_stop.load(Ordering::Acquire) { break; }
+                            let Ok(shutdown) = stream.try_clone() else { continue; };
+                            *active = Some(shutdown);
                         }
-                        // IrisTarget::drop() removes all GDB breakpoints.
+                        cpu.stop();
+                        let mut target = IrisTarget::new(cpu.clone());
+                        let gdb = GdbStub::new(LoggingStream(stream));
+                        match gdb.run_blocking::<IrisEventLoop>(&mut target) {
+                            Ok(DisconnectReason::Disconnect) => eprintln!("GDB stub: client disconnected"),
+                            Ok(reason) => eprintln!("GDB stub: {reason:?}"),
+                            Err(e) if !worker_stop.load(Ordering::Acquire) => eprintln!("GDB stub: {e:?}"),
+                            Err(_) => {},
+                        }
+                        // Drop target and its breakpoints before releasing the CPU.
+                        drop(target);
+                        *worker_client.lock().unwrap() = None;
                     }
-                    Err(e) => {
-                        eprintln!("GDB stub: accept error: {}", e);
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
                     }
+                    Err(e) => { eprintln!("GDB stub: accept: {e}"); break; }
                 }
             }
-        })
-        .expect("failed to spawn gdb-listener thread");
+        })?;
+        eprintln!("GDB stub: listening on {addr}");
+        Ok(Self { addr, stop, client, thread: Some(thread) })
+    }
+    pub fn addr(&self) -> SocketAddr { self.addr }
+}
+
+impl Drop for GdbServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(client) = self.client.lock().unwrap().as_ref() {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
 }

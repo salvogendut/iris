@@ -276,6 +276,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 
 | Note | Kind | Title |
 |---|---|---|
+| [owned-expert-services.md](gui/owned-expert-services.md) | rule | Remote services and performance overrides follow machine lifetime |
 | [prismatic-paused-reset.md](gui/prismatic-paused-reset.md) | open | Paused Indy in-place reset stalls the PROM; Prismatic uses a cold reset |
 | [embedded-guest-poweroff-state.md](gui/embedded-guest-poweroff-state.md) | design | Distinguish completed guest power-off from stopped CPUs in embedded hosts |
 | [01-overview.md](gui/01-overview.md) | design | iris-gui — overview |
