@@ -149,6 +149,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
 | `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
 | `serial_port_b` | `8881 when unset` | SCC channel B listener (tty1/console); the O2's second serial port. GUI halt uses this port. |
+| `serial_socket_a` | `unset` | Also serve serial channel A on this Unix socket (raw bytes, one client at a time). |
+| `serial_socket_b` | `unset` | Likewise for channel B. With `ci` the console stays readable through `serial-read` and `wait-serial` as well. |
 | `load_elf` | `unset` | Load a static big-endian MIPS ELF32 binary before starting the CPU. |
 | `test_device` | `false` | Map the bare-metal test device in GIO slot 0. |
 | `test_device_dump` | `iris-testdev-dump.json when unset` | Test-device machine-state JSON output. |
@@ -160,6 +162,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. |
+| `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's). Truncated at start on the Octane and O2, appended to on the Indy and Indigo2, like `serial_log`. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript) or `wall`: prefix each completed serial-log line with a UTC ISO-8601 stamp. A partial line is held until its newline and written on stop. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
@@ -168,7 +171,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)). |
-| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. |
+| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. An O2 takes r5000 or r10000 (an r4400 is refused when the machine is built); the Octane is r10000 only. |
 | `machine.cpus` | `1` | Processors fitted. 2 only on the Octane; see [its guide](docs/Octane/multiprocessor.md). |
 
 ### [graphics]
@@ -243,7 +246,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; no password). Every board, with a window or `ci`; not `headless`. Standalone `iris` only. See [HELP.md](HELP.md#vnc). |
+| `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; no password). Every board, with a window or `ci`; not `headless`. Standalone `iris` and iris-gui. See [HELP.md](HELP.md#vnc) and [iris-gui-README.md](iris-gui-README.md#vnc). |
 | `vnc.max_fps` | `30` | Most updates a second sent to a viewer (1–120). |
 
 ### [audio]
@@ -416,6 +419,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--vnc [ADDR]` | Serve the screen, keyboard and mouse over VNC on ADDR (`host:port` or a port; default 127.0.0.1:5900). Sets `vnc.listen`. |
 | `--serial-port-a` | Serial channel A (tty2) port on 127.0.0.1 (default 8880). |
 | `--serial-port-b` | Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881). |
+| `--serial-socket-a`, `--serial-socket-b` | Also serve channel A or B on a Unix socket. |
+| `--serial-log-a`, `--serial-log-b` | Log what the guest sends on channel A or B when it is not the console. |
 | `--test-device` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. |
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
@@ -504,6 +509,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_JIT_DISPATCH` | off or 0 disables normal JIT v2 dispatch at startup. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_HASHSTATS` | 1 enables page/entry reuse diagnostics. | [src/cpu/jitv2/hashstats.rs](src/cpu/jitv2/hashstats.rs) |
 | `IRIS_JIT_HASHSTATS_LOG` | Append per-compile reuse diagnostic records to this file. | [src/cpu/jitv2/hashstats.rs](src/cpu/jitv2/hashstats.rs) |
+| `IRIS_JIT_VERIFY` | 1 or on runs Cranelift's IR verifier on every JIT v2 compile. Already on in unit tests and `--features developer` builds. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_JIT_ARENA_FLUSH_MB` | Flush compiled code when the arena holds this many MiB, for testing the compile workers' flush. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
 | `IRIS_JIT_ATOMIC_GEN` | Any presence makes inline stores bump the page generation atomically with one CPU too, as they always do with several. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_PIC` | Any presence disables core-address constants for JIT code. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |

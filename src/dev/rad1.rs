@@ -37,6 +37,19 @@
 //! * The sample clock, UST and status schedule run on host wall time, less
 //!   the time the machine was stopped; they are not tied to the emulated
 //!   CPU's progress.
+//! * Hold-up approximation, an emulator policy with no hardware
+//!   counterpart: while continuous status runs, a completion more than one
+//!   interval late means the host held up the timer thread that also
+//!   delivers the clock interrupt IRIX refills the ring from, so the card's
+//!   clock is set back to the completion's due time (see
+//!   [`Inner::absorb_stall`]). The clock, output rate and UST fall behind
+//!   wall time by the hold-ups; on-time completions win 1/32 of an interval
+//!   back each, and at most 200 ms is held back. Time the guest has read is
+//!   never taken back.
+//! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
+//!   output while the transfer runs on. That they mute is inferred from
+//!   when the PROM, IRIX and Linux write them; the power-on state is
+//!   unknown and taken as not muted.
 //! * A BAR0 access the model does not recognise is logged and reads zero.
 //!   The model fails the bus access instead, which the PCI bus layer here
 //!   cannot express.
@@ -74,6 +87,7 @@ const REG_CLOCKGEN_CTRL: u32 = 0xa0;
 const REG_CLOCKGEN_REM: u32 = 0xa4;
 /// Four master-clock selects, one per clock generator, generator 3 first.
 const REG_CLOCKGEN_MUX_FIRST: u32 = 0xa8;
+const REG_CLOCKGEN_MUX_LAST: u32 = 0xb4;
 
 const POS_FIRST: u32 = 0x04;
 const POS_LAST: u32 = 0x2c;
@@ -105,8 +119,32 @@ const SUBCODE_WORDS: usize = ((SUBCODE_LAST - SUBCODE_FIRST) / 8 + 1) as usize;
 
 const ENABLE_BIT: u32 = 1;
 const SUBCODE_ENABLE_BIT: u32 = 4;
-const CTRL_TAG_SHIFT: u32 = 3;
-const CTRL_TAG_MASK: u32 = 0xf;
+/// Control word bits 6:3: the index of the next descriptor in the descriptor
+/// RAM (mediaio-rad1-audio, output channel). The old channel-type tags are
+/// those indices.
+const CTRL_NEXT_SHIFT: u32 = 3;
+const CTRL_NEXT_MASK: u32 = 0xf;
+/// Control word bit 2: end of descriptor; the transfer stops after it.
+const CTRL_EOD: u32 = 4;
+/// The descriptor RAM: 16 entries of three words from 0x400, all stored. A
+/// link to an entry still all zero is in no source and stops the output (see
+/// [`State::descriptor_end`]).
+const DESC_RAM_ENTRY_BYTES: u32 = 12;
+const DESC_RAM_ENTRIES: u32 = 16;
+const DESC_RAM_LAST: u32 = DMA_BANK_FIRST + DESC_RAM_ENTRIES * DESC_RAM_ENTRY_BYTES - 4;
+/// The analog output's enable register: bit 0 starts the channel, bit 29 or
+/// 30 picks generator 1 or 2 (mediaio-rad1-audio, output channel). The
+/// "bit 28 + n" pattern is inferred from those two; other bits are unknown.
+const OUT_SELECT_GEN1: u32 = 1 << 29;
+const OUT_SELECT_GEN2: u32 = 1 << 30;
+/// The relay (0x88) and DAC (0x8c) mute words: the values the Octane PROM
+/// and IRIX write. Other values change no mute state.
+const REG_RELAY: u32 = 0x88;
+const REG_DAC_MUTE: u32 = 0x8c;
+const RELAY_RELEASE: u32 = 3;
+const RELAY_MUTE: u32 = 2;
+const DAC_MUTE: u32 = 3;
+const DAC_UNMUTE: u32 = 2;
 const CTRL_LEN_SHIFT: u32 = 7;
 const CTRL_LEN_MASK: u32 = 0x1ff_ffff;
 const DMA_UNIT_BYTES: u64 = 128;
@@ -118,6 +156,10 @@ const STATUS_ONESHOT_START: u32 = 0x40001;
 const STATUS_STOP: u32 = 0x1fffc;
 
 const UST_NS_PER_TICK: i64 = 960;
+/// Most of the card's clock held back for hold-ups, and the share of an
+/// interval won back per on-time completion (see [`Inner::absorb_stall`]).
+const STALL_MAX_NS: i64 = 200_000_000;
+const STALL_REPAY_DIV: i64 = 32;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// The rate of a clock generator no guest has programmed.
@@ -254,27 +296,47 @@ impl Rate {
 /// plain buffer of the card's own frames.
 struct Sink {
     host: Option<(HostOut, Resampler)>,
+    /// When the host stream was last tried and failed to open.
+    host_failed_at: Option<Instant>,
     wav: Option<Wav>,
     tap: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
+/// How long to wait before trying to open the host stream again.
+const HOST_RETRY: Duration = Duration::from_secs(1);
+
 impl Sink {
-    /// Play stereo frames the card produced at `rate` Hz.
-    fn play(&mut self, pcm: &[i16], rate: u32) {
+    /// Whether the host stream, wanted but not open, is due another try.
+    fn host_retry_due(&self, now: Instant) -> bool {
+        self.host.is_none() && self.host_failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
+    }
+
+    /// Play stereo frames the card produced at `rate` Hz. A muted output
+    /// still moves the ring; the host and the WAV get silence. Returns the
+    /// host ring's free and total samples.
+    fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) -> Option<(usize, usize)> {
+        let silence;
+        let host_pcm = if muted {
+            silence = vec![0i16; pcm.len()];
+            &silence[..]
+        } else {
+            pcm
+        };
         if let Some((out, rs)) = self.host.as_mut() {
             if rs.in_rate != rate {
                 *rs = Resampler::new(rate, out.stream_rate);
             }
-            for p in pcm.chunks_exact(PCM_CHANNELS) {
+            for p in host_pcm.chunks_exact(PCM_CHANNELS) {
                 rs.push(p[0], p[1], &mut out.producer);
             }
         }
         if let Some(w) = self.wav.as_mut() {
-            w.play(pcm, rate);
+            w.play(host_pcm, rate);
         }
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
         }
+        self.host.as_ref().map(|(out, _)| (out.producer.slots(), out.producer.buffer().capacity()))
     }
 }
 
@@ -353,10 +415,13 @@ const CH_IN: usize = 0;
 const CH_OUT: usize = 1;
 const CH_AES_SUB: usize = 2;
 const NUM_CH: usize = 3;
+/// The generator the analog output uses until 0x58 names one.
+const OUT_DEFAULT_CG: usize = 1;
 
 struct ChanInfo {
     name: &'static str,
     ring: RingRegs,
+    /// The next-descriptor index IRIX writes for this channel type.
     tag: u32,
     /// Bytes in one frame of the ring.
     frame_bytes: u64,
@@ -403,12 +468,31 @@ const CHAN_INFO: [ChanInfo; NUM_CH] = [
 #[derive(Default, Clone, Copy)]
 struct Chan {
     running: bool,
-    /// Ring latched from set A at the enable edge.
+    /// Ring latched from the working registers at the enable edge.
     base: u64,
     len: u64,
     offset: u64,
     start_ns: i64,
     frames: u64,
+    /// End of descriptor: the transfer ends with this descriptor.
+    eod: bool,
+    /// The next-descriptor index, used when `eod` is clear.
+    next: u32,
+    /// The entry `next` names holds this very descriptor: loop on it.
+    looping: bool,
+    /// A link led to a never-programmed descriptor. What the chip does then
+    /// is in no source: the channel moves nothing more.
+    stalled: bool,
+}
+
+/// One decoded descriptor.
+#[derive(Clone, Copy)]
+struct Desc {
+    base: u64,
+    len: u64,
+    eod: bool,
+    next: u32,
+    looping: bool,
 }
 
 struct State {
@@ -417,6 +501,15 @@ struct State {
     dma_bank: [u32; DMA_BANK_WORDS],
     sample_pos: [u32; POS_WORDS],
     analog_out_en: u32,
+    /// The clock generator the analog output runs from (0x58 selects it).
+    out_cg: usize,
+    /// Each generator's last control and remainder words; the master select
+    /// (0xa8..0xb4) can arrive after the load.
+    cg_loaded: [Option<(u32, u32)>; NUM_CG],
+    /// The relay (0x88) and DAC (0x8c) mutes once written. The power-on
+    /// state is unknown, so before that the output is not muted.
+    relay_muted: Option<bool>,
+    dac_muted: Option<bool>,
     status_dma_ctrl: u32,
     status_running: bool,
     chan: [Chan; NUM_CH],
@@ -449,6 +542,10 @@ impl State {
             dma_bank: [0; DMA_BANK_WORDS],
             sample_pos: [0; POS_WORDS],
             analog_out_en: 0,
+            out_cg: OUT_DEFAULT_CG,
+            cg_loaded: [None; NUM_CG],
+            relay_muted: None,
+            dac_muted: None,
             status_dma_ctrl: 0,
             status_running: false,
             chan: [Chan::default(); NUM_CH],
@@ -480,10 +577,20 @@ impl State {
 
     /// A channel's sample rate.
     fn rate(&self, idx: usize) -> Rate {
-        match CHAN_INFO[idx].clockgen {
+        match self.cg_of(idx) {
             Some(cg) => self.clock[cg],
             None => Rate::hz(CHAN_INFO[idx].freq),
         }
+    }
+
+    /// The clock generator pacing a channel; 0x58 chooses the output's.
+    fn cg_of(&self, idx: usize) -> Option<usize> {
+        if idx == CH_OUT { Some(self.out_cg) } else { CHAN_INFO[idx].clockgen }
+    }
+
+    /// Whether the guest has muted the analog output's relay or DAC.
+    fn muted(&self) -> bool {
+        self.relay_muted == Some(true) || self.dac_muted == Some(true)
     }
 
     fn pos(&mut self, reg: u32) -> &mut u32 {
@@ -556,36 +663,115 @@ impl State {
         }
     }
 
-    /// The enable edge: latch set A and start. A ring that is not
-    /// programmed, or not a whole number of frames, starts nothing.
-    fn chan_start(&mut self, idx: usize, now: i64) {
+    /// The words of descriptor RAM entry `index`.
+    fn desc_entry(&self, index: u32) -> (u32, u32, u32) {
+        let at = DMA_BANK_FIRST + index * DESC_RAM_ENTRY_BYTES;
+        (self.bank(at), self.bank(at + 4), self.bank(at + 8))
+    }
+
+    /// Whether the analog output's working registers hold a transfer: an
+    /// address and a length.
+    fn out_programmed(&self) -> bool {
+        let ring = &RING_OUTPUT;
+        (self.bank(ring[0]) != 0 || self.bank(ring[1]) != 0)
+            && (self.bank(ring[2]) >> CTRL_LEN_SHIFT) & CTRL_LEN_MASK != 0
+    }
+
+    /// Decode a descriptor for channel `idx`, or say why it cannot run. A
+    /// partial frame is refused: what hardware does with one is unknown.
+    fn decode_desc(&self, idx: usize, words: (u32, u32, u32)) -> Option<Desc> {
         let info = &CHAN_INFO[idx];
-        let lo = self.bank(info.ring[0]);
-        let hi = self.bank(info.ring[1]);
-        let ctrl = self.bank(info.ring[2]);
+        let (lo, hi, ctrl) = words;
         let base = (u64::from(hi) << 32) | u64::from(lo);
         let neg = (ctrl >> CTRL_LEN_SHIFT) & CTRL_LEN_MASK;
         let units = 0u32.wrapping_sub(neg) & CTRL_LEN_MASK;
         let mut len = u64::from(units) * DMA_UNIT_BYTES;
-        let tag = (ctrl >> CTRL_TAG_SHIFT) & CTRL_TAG_MASK;
+        let next = (ctrl >> CTRL_NEXT_SHIFT) & CTRL_NEXT_MASK;
+        // Only the analog output's end-of-descriptor form is established.
+        let eod = info.output && ctrl & CTRL_EOD != 0;
 
         if base == 0 || len == 0 {
             crate::dlog!(LogModule::Rad1, "rad1: {} enabled with no ring programmed (address {base:#x}, control {ctrl:#x})", info.name);
-            return;
+            return None;
         }
         if len > DMA_MAX_BYTES {
             crate::dlog!(LogModule::Rad1, "rad1: {} ring length {len:#x} exceeds the modelled cap; clamping", info.name);
             len = DMA_MAX_BYTES;
         }
-        // What hardware does with a partial frame is unknown; start nothing.
         if !len.is_multiple_of(info.frame_bytes) {
             crate::dlog!(LogModule::Rad1, "rad1: {} ring length {len:#x} is not a whole number of frames", info.name);
-            return;
+            return None;
         }
-        if tag != info.tag {
-            crate::dlog!(LogModule::Rad1, "rad1: {} control word {ctrl:#x} carries tag {tag}, not the channel type {}", info.name, info.tag);
+        if !eod && !info.output && next != info.tag {
+            crate::dlog!(LogModule::Rad1, "rad1: {} control word {ctrl:#x} carries tag {next}, not the channel type {}", info.name, info.tag);
         }
-        self.chan[idx] = Chan { running: true, base, len, offset: 0, start_ns: now, frames: 0 };
+        let looping = info.output && !eod && self.desc_entry(next) == words;
+        Some(Desc { base, len, eod, next, looping })
+    }
+
+    /// The enable edge: latch the working descriptor and start. A ring that
+    /// is not programmed, or not a whole number of frames, starts nothing.
+    fn chan_start(&mut self, idx: usize, now: i64) {
+        let info = &CHAN_INFO[idx];
+        let words = (self.bank(info.ring[0]), self.bank(info.ring[1]), self.bank(info.ring[2]));
+        let Some(d) = self.decode_desc(idx, words) else { return };
+        self.chan[idx] = Chan {
+            running: true,
+            base: d.base,
+            len: d.len,
+            offset: 0,
+            start_ns: now,
+            frames: 0,
+            eod: d.eod,
+            next: d.next,
+            looping: d.looping,
+            stalled: false,
+        };
+    }
+
+    /// The channel has played its descriptor to the end; returns whether it
+    /// goes on. End of descriptor stops it and clears the enable bit;
+    /// otherwise the entry the index names is loaded, and a never-programmed
+    /// one is reported and left standing.
+    fn descriptor_end(&mut self, idx: usize) -> bool {
+        let c = self.chan[idx];
+        if c.eod {
+            self.chan[idx].running = false;
+            if idx == CH_OUT {
+                self.analog_out_en &= !ENABLE_BIT;
+            }
+            return false;
+        }
+        if c.looping || idx != CH_OUT {
+            self.chan[idx].offset = 0;
+            return true;
+        }
+        let words = self.desc_entry(c.next);
+        let linked = if words == (0, 0, 0) { None } else { self.decode_desc(idx, words) };
+        match linked {
+            Some(d) => {
+                self.chan[idx] = Chan {
+                    base: d.base,
+                    len: d.len,
+                    offset: 0,
+                    eod: d.eod,
+                    next: d.next,
+                    looping: d.looping,
+                    ..c
+                };
+                true
+            }
+            None => {
+                crate::dlog!(
+                    LogModule::Rad1,
+                    "rad1: {} links to descriptor {} which was never programmed (unsupported); output stopped",
+                    CHAN_INFO[idx].name,
+                    c.next
+                );
+                self.chan[idx].stalled = true;
+                false
+            }
+        }
     }
 }
 
@@ -640,6 +826,10 @@ pub struct Inner {
     /// them.
     stopped_ns: AtomicI64,
     stopped_at: Mutex<Option<Instant>>,
+    /// Nanoseconds taken off the card's clock for timer hold-ups (see
+    /// [`Inner::absorb_stall`]), and the latest time it has handed out.
+    stalled_ns: AtomicI64,
+    seen_ns: AtomicI64,
     /// Held across each timer callback's work, so a stop can wait one out.
     tick_pass: Mutex<()>,
     timers: OnceLock<Arc<TimerManager>>,
@@ -651,8 +841,19 @@ pub struct Inner {
     /// `no_audio`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<Sink>>,
+    /// Opens the host stream; tests put their own ring behind it.
+    open_host: fn(&Inner, &AudioConfig) -> Option<HostOut>,
+    /// Whether the host ring is full, so each run of dropped output is
+    /// logged once.
+    host_full: AtomicBool,
     underruns: Arc<AtomicU64>,
     me: Weak<Inner>,
+}
+
+/// The host stream: 200 ms of stereo ring at the stream's rate.
+fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
+    let ring = |rate: u32| rate as usize * 2 / 5;
+    crate::host_audio::open_output(cfg, card.underruns.clone(), Arc::new(AtomicBool::new(true)), ring, "Octane audio", "IRIS_OCTANE_AUDIO_CAPTURE")
 }
 
 impl Inner {
@@ -670,6 +871,8 @@ impl Inner {
             start: Instant::now(),
             fake_ns: AtomicI64::new(i64::MIN),
             stopped_ns: AtomicI64::new(0),
+            stalled_ns: AtomicI64::new(0),
+            seen_ns: AtomicI64::new(i64::MIN),
             stopped_at: Mutex::new(None),
             tick_pass: Mutex::new(()),
             timers: OnceLock::new(),
@@ -677,14 +880,24 @@ impl Inner {
             dma: OnceLock::new(),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
+            open_host: open_host_output,
+            host_full: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
             me,
         }
     }
 
-    /// Play the analog output through the host with `audio`'s settings. The
-    /// stream opens when the output first starts. While the output runs, a
-    /// timer keeps its frames moving between the guest's own looks.
+    /// Play the analog output through the host with `audio`'s settings. While
+    /// the output runs, a timer keeps its frames moving between the guest's
+    /// own looks.
+    ///
+    /// The host stream opens when the machine starts, before the guest
+    /// runs, so a host slow to open or to take its first samples is ready
+    /// before the guest plays.
+    ///
+    /// The card's clock runs on wall time: frames falling due before the
+    /// host drains its 200 ms ring are dropped. A failed open is retried
+    /// when the output starts and then once a second.
     pub fn enable_output(&self, audio: AudioConfig) {
         *self.audio_cfg.lock() = Some(audio);
         let mut s = self.state.lock();
@@ -732,10 +945,17 @@ impl Inner {
         if self.stopped() {
             return TimerReturn::Continue;
         }
-        let now = self.now();
+        // Status completions move the output while they run; a pump read
+        // inside a hold-up would keep the late completion from absorbing it.
+        let now = (!self.state.lock().status_running).then(|| self.now());
         let mut s = self.state.lock();
-        self.sync_chan(&mut s, CH_OUT, now);
+        if let Some(now) = now {
+            self.sync_chan(&mut s, CH_OUT, now);
+        }
         if s.chan[CH_OUT].running {
+            if self.sink.lock().as_ref().is_some_and(|sk| sk.host_retry_due(Instant::now())) {
+                self.open_sink(false);
+            }
             TimerReturn::Continue
         } else {
             s.audio_timer = None;
@@ -748,38 +968,80 @@ impl Inner {
         let _ = self.timers.set(tm);
     }
 
-    /// Open the output sink on the first start of the analog output.
-    fn open_sink(&self) {
+    /// Open the output sink when host output is enabled, and retry a failed
+    /// host stream open so an early sound is not lost for the run. `force`
+    /// skips the wait between tries.
+    fn open_sink(&self, force: bool) {
         let mut sink = self.sink.lock();
-        if sink.is_some() {
+        let Some(cfg) = self.audio_cfg.lock().clone() else {
             return;
+        };
+        let now = Instant::now();
+        match sink.as_mut() {
+            Some(sk) if !(sk.host_retry_due(now) || force && sk.host.is_none()) => return,
+            _ => {}
         }
-        let Some(cfg) = self.audio_cfg.lock().clone() else { return };
-        let ring = |rate: u32| rate as usize * 2 / 5; // 200 ms of stereo
-        let host = crate::host_audio::open_output(
-            &cfg,
-            self.underruns.clone(),
-            Arc::new(AtomicBool::new(true)),
-            ring,
-            "Octane audio",
-            "IRIS_OCTANE_AUDIO_CAPTURE",
-        )
-        .map(|out| {
+        let host = (self.open_host)(self, &cfg);
+        crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if host.is_some() { "open" } else { "failed" });
+        let host = host.map(|out| {
             let rs = Resampler::new(FREQ_ANALOG as u32, out.stream_rate);
             (out, rs)
         });
-        let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
-        *sink = Some(Sink { host, wav, tap: None });
+        let failed_at = host.is_none().then_some(now);
+        match sink.as_mut() {
+            Some(sk) => {
+                sk.host = host;
+                sk.host_failed_at = failed_at;
+            }
+            None => {
+                let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
+                *sink = Some(Sink { host, host_failed_at: failed_at, wav, tap: None });
+            }
+        }
     }
 
     fn now(&self) -> i64 {
-        match self.fake_ns.load(Ordering::Relaxed) {
+        let at = self.stopped_at.lock();
+        let t = self.clock_locked(&at);
+        self.seen_ns.fetch_max(t, Ordering::SeqCst);
+        t
+    }
+
+    /// The card's clock, with `stopped_at` held; not recorded as seen.
+    fn clock_locked(&self, at: &Option<Instant>) -> i64 {
+        let t = match self.fake_ns.load(Ordering::Relaxed) {
             i64::MIN => {
-                let at = self.stopped_at.lock().unwrap_or_else(Instant::now);
+                let at = at.unwrap_or_else(Instant::now);
                 at.duration_since(self.start).as_nanos() as i64 - self.stopped_ns.load(Ordering::SeqCst)
             }
             t => t,
-        }
+        };
+        t - self.stalled_ns.load(Ordering::SeqCst)
+    }
+
+    /// The card's clock as a status completion due at `due` sees it. One
+    /// more than `interval` late means the host held up the timer thread and
+    /// the guest's clock interrupt with it; crediting that would carry the
+    /// pointer past IRIX's write point (36 to 90 frames ahead) and replay a
+    /// stale lap. So the clock goes back to `due`, at most [`STALL_MAX_NS`]
+    /// in all and never behind a time already handed out. An on-time one
+    /// wins back `interval / STALL_REPAY_DIV` of what is held back.
+    /// Emulator approximation; see the module notes.
+    fn absorb_stall(&self, due: i64, interval: i64) -> i64 {
+        let at = self.stopped_at.lock();
+        let t = self.clock_locked(&at);
+        let held = self.stalled_ns.load(Ordering::SeqCst);
+        let late = t - due;
+        let shift = if late > interval {
+            let floor = self.seen_ns.load(Ordering::SeqCst);
+            -late.min(STALL_MAX_NS - held).min(t.saturating_sub(floor)).max(0)
+        } else {
+            held.min(interval / STALL_REPAY_DIV)
+        };
+        self.stalled_ns.fetch_sub(shift, Ordering::SeqCst);
+        let t = t + shift;
+        self.seen_ns.fetch_max(t, Ordering::SeqCst);
+        t
     }
 
     /// Stop the card's clock and hold the timers off guest memory while the
@@ -795,8 +1057,10 @@ impl Inner {
         drop(self.tick_pass.lock());
     }
 
-    /// Run the clock again from where it stopped.
+    /// Run the clock again from where it stopped. The first start opens the
+    /// host stream (see [`Inner::enable_output`]).
     fn resume(&self) {
+        self.open_sink(false);
         {
             let mut at = self.stopped_at.lock();
             if let Some(t) = at.take() {
@@ -846,7 +1110,7 @@ impl Inner {
     }
 
     fn is_descriptor(off: u32) -> bool {
-        RINGS.iter().any(|r| r.contains(&off))
+        RINGS.iter().any(|r| r.contains(&off)) || (DMA_BANK_FIRST..=DESC_RAM_LAST).contains(&off)
     }
 
     fn subcode_access(off: u32, width: usize) -> bool {
@@ -880,6 +1144,8 @@ impl Inner {
                 return s.sample_pos[((off - POS_FIRST) / 4) as usize];
             }
             if off == REG_ANALOG_OUT_EN {
+                // The enable bit clears when a one-shot transfer ends.
+                self.sync_chan(&mut s, CH_OUT, now);
                 return s.analog_out_en;
             }
             if off == REG_STATUS_DMA_CTRL {
@@ -938,8 +1204,23 @@ impl Inner {
                     self.enable_write(s, CH_AES_SUB, val, now);
                 }
                 s.startup[i] = val;
-                if off == REG_CLOCKGEN_CTRL {
-                    self.clockgen_write(s, val, now);
+                match off {
+                    REG_CLOCKGEN_CTRL => self.clockgen_write(s, val, now),
+                    REG_CLOCKGEN_MUX_FIRST..=REG_CLOCKGEN_MUX_LAST => {
+                        let cg = NUM_CG - 1 - ((off - REG_CLOCKGEN_MUX_FIRST) / 4) as usize;
+                        self.clockgen_reselect(s, cg, now);
+                    }
+                    REG_RELAY => match val {
+                        RELAY_RELEASE => s.relay_muted = Some(false),
+                        RELAY_MUTE => s.relay_muted = Some(true),
+                        _ => {}
+                    },
+                    REG_DAC_MUTE => match val {
+                        DAC_MUTE => s.dac_muted = Some(true),
+                        DAC_UNMUTE => s.dac_muted = Some(false),
+                        _ => {}
+                    },
+                    _ => {}
                 }
                 return Some(());
             }
@@ -956,12 +1237,13 @@ impl Inner {
                     s.dma_bank[((off - DMA_BANK_FIRST) / 4) as usize] = val;
                     return Some(());
                 }
-            } else if off == REG_ANALOG_OUT_EN && (val == 0x2000_0000 || val == 0x2000_0001) {
-                if val == 0x2000_0000 || s.ring_valid(&RING_OUTPUT, false, 0xffff_f008) {
-                    self.enable_write(s, CH_OUT, val, now);
-                    s.analog_out_en = val;
-                    return Some(());
-                }
+            } else if (DMA_BANK_FIRST..=DESC_RAM_LAST).contains(&off) {
+                // A descriptor RAM entry no supported ring's registers
+                // cover: stored for a link to load.
+                s.dma_bank[((off - DMA_BANK_FIRST) / 4) as usize] = val;
+                return Some(());
+            } else if off == REG_ANALOG_OUT_EN {
+                return self.analog_out_write(s, val, now);
             } else if off == REG_STATUS_DMA_CTRL {
                 self.status_ctrl_write(s, val, now)?;
                 s.status_dma_ctrl = val;
@@ -996,26 +1278,72 @@ impl Inner {
     }
 
     /// A clock generator control word: each generator it selects takes the
-    /// rate the remainder and master-select words describe. A channel that
-    /// runs from one is brought up to `now` at the old rate first, and counts
-    /// on from there at the new one.
+    /// rate the remainder and master-select words describe.
     fn clockgen_write(&self, s: &mut State, ctrl: u32, now: i64) {
         let rem = s.startup[Self::startup_index(REG_CLOCKGEN_REM).unwrap()];
         for cg in (0..NUM_CG).filter(|cg| ctrl & (1 << (CG_SELECT_SHIFT + *cg as u32)) != 0) {
-            let mux_reg = REG_CLOCKGEN_MUX_FIRST + 4 * (NUM_CG - 1 - cg) as u32;
-            let mux = s.startup[Self::startup_index(mux_reg).unwrap()];
-            let rate = Rate::from_clockgen(ctrl, rem, mux);
-            for idx in (0..NUM_CH).filter(|&i| CHAN_INFO[i].clockgen == Some(cg)) {
-                self.sync_chan(s, idx, now);
-                let c = &mut s.chan[idx];
-                if c.running {
-                    c.start_ns = now;
-                    c.frames = 0;
-                }
-            }
-            crate::dlog!(LogModule::Rad1, "rad1: clock generator {cg} at {:.3} Hz", rate.num as f64 / rate.den as f64);
-            s.clock[cg] = rate;
+            s.cg_loaded[cg] = Some((ctrl, rem));
+            self.clockgen_apply(s, cg, ctrl, rem, now);
         }
+    }
+
+    /// A master-clock select written after its generator was loaded (the
+    /// Octane PROM's order) re-evaluates it with the words it was loaded with.
+    fn clockgen_reselect(&self, s: &mut State, cg: usize, now: i64) {
+        if let Some((ctrl, rem)) = s.cg_loaded[cg] {
+            self.clockgen_apply(s, cg, ctrl, rem, now);
+        }
+    }
+
+    /// Set generator `cg`'s rate from its words. A channel that runs from
+    /// it is brought up to `now` at the old rate first, and counts on from
+    /// there at the new one.
+    fn clockgen_apply(&self, s: &mut State, cg: usize, ctrl: u32, rem: u32, now: i64) {
+        let mux_reg = REG_CLOCKGEN_MUX_FIRST + 4 * (NUM_CG - 1 - cg) as u32;
+        let mux = s.startup[Self::startup_index(mux_reg).unwrap()];
+        let rate = Rate::from_clockgen(ctrl, rem, mux);
+        if rate == s.clock[cg] {
+            return;
+        }
+        for idx in 0..NUM_CH {
+            if s.cg_of(idx) != Some(cg) {
+                continue;
+            }
+            self.sync_chan(s, idx, now);
+            let c = &mut s.chan[idx];
+            if c.running {
+                c.start_ns = now;
+                c.frames = 0;
+            }
+        }
+        crate::dlog!(LogModule::Rad1, "rad1: clock generator {cg} at {:.3} Hz", rate.num as f64 / rate.den as f64);
+        s.clock[cg] = rate;
+    }
+
+    /// A write to the analog output's enable register: bit 0 runs the
+    /// channel, one select bit names its clock generator. Other values are
+    /// unsupported and leave the register as it was.
+    fn analog_out_write(&self, s: &mut State, val: u32, now: i64) -> Option<()> {
+        let cg = match val & !ENABLE_BIT {
+            OUT_SELECT_GEN1 => 1,
+            OUT_SELECT_GEN2 => 2,
+            _ => return None,
+        };
+        if val & ENABLE_BIT != 0 && !s.chan[CH_OUT].running && !s.out_programmed() {
+            return None;
+        }
+        if cg != s.out_cg {
+            self.sync_chan(s, CH_OUT, now);
+            s.out_cg = cg;
+            let c = &mut s.chan[CH_OUT];
+            if c.running {
+                c.start_ns = now;
+                c.frames = 0;
+            }
+        }
+        self.enable_write(s, CH_OUT, val, now);
+        s.analog_out_en = val;
+        Some(())
     }
 
     /// The status-DMA control word: stop, one-shot start, or ring start.
@@ -1130,7 +1458,14 @@ impl Inner {
     /// with wrap, so the driver's servicer, which consumes consecutive done
     /// slots, keeps finding fresh ones.
     fn status_tick(&self, gen: u64) -> Option<i64> {
-        let now = self.now();
+        let (due, interval) = {
+            let s = self.state.lock();
+            if s.status_gen != gen || !s.status_running {
+                return None;
+            }
+            (Self::status_deadline(&s, s.status_done + 1), Self::status_deadline(&s, 1) - s.status_start_ns)
+        };
+        let now = self.absorb_stall(due, interval);
         let mut s = self.state.lock();
         if s.status_gen != gen || !s.status_running {
             return None;
@@ -1207,7 +1542,7 @@ impl Inner {
             if !s.chan[idx].running {
                 s.chan_start(idx, now);
                 if idx == CH_OUT && s.chan[idx].running {
-                    self.open_sink();
+                    self.open_sink(true);
                 }
             }
         } else {
@@ -1231,7 +1566,8 @@ impl Inner {
         // anything. The position fields are 14 bits, so the count's
         // truncation to 32 bits loses nothing.
         let ring_frames = s.chan[idx].len / info.frame_bytes;
-        if ring_frames != 0 && frames >= 2 * ring_frames {
+        let repeats = idx != CH_OUT || s.chan[idx].looping;
+        if repeats && ring_frames != 0 && frames >= 2 * ring_frames {
             let skip = (frames / ring_frames - 1) * ring_frames;
             s.chan[idx].frames += skip;
             s.advance_pos(idx, skip as u32);
@@ -1241,6 +1577,9 @@ impl Inner {
         let mut pcm = [0i16; CHUNK_BYTES as usize / 4];
         while frames != 0 {
             let c = s.chan[idx];
+            if !c.running || c.stalled {
+                break;
+            }
             let bytes = (frames * info.frame_bytes).min(c.len - c.offset);
             let chunk = bytes.min(CHUNK_BYTES);
             let n = chunk / info.frame_bytes;
@@ -1268,17 +1607,26 @@ impl Inner {
                 let samples = &mut pcm[..n as usize * PCM_CHANNELS];
                 frames_to_pcm(buf, samples, ANALOG_WORDS);
                 if let Some(sink) = self.sink.lock().as_mut() {
-                    sink.play(samples, s.rate(idx).rounded_hz());
+                    if let Some((free, size)) = sink.play(samples, s.rate(idx).rounded_hz(), s.muted()) {
+                        let was = self.host_full.load(Ordering::Relaxed);
+                        // Full until half the ring is free again.
+                        let full = if was { free < size / 2 } else { free < PCM_CHANNELS };
+                        if full != was {
+                            self.host_full.store(full, Ordering::Relaxed);
+                            crate::dlog!(LogModule::Rad1, "rad1: host audio ring {}", if full { "full: the host is not taking samples, output is being dropped" } else { "draining again" });
+                        }
+                    }
                 }
             }
             let c = &mut s.chan[idx];
             c.offset += chunk;
             c.frames += n;
-            if c.offset >= c.len {
-                c.offset = 0;
-            }
+            let done = c.offset >= c.len;
             s.advance_pos(idx, n as u32);
             frames -= n;
+            if done && !s.descriptor_end(idx) {
+                break;
+            }
         }
         true
     }

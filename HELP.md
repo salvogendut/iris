@@ -475,6 +475,21 @@ The ports are the defaults: `serial_port_a` and `serial_port_b` in the config
 (or `--serial-port-a` / `--serial-port-b`) move them, as `monitor_port` moves the
 monitor, so that two iris processes can run at once.
 
+Each serial line can also be served on a Unix socket:
+`serial_socket_a` / `serial_socket_b` (or `--serial-socket-a` /
+`--serial-socket-b`). The socket carries raw bytes with no telnet negotiation,
+takes one client at a time, and is removed when iris exits; a stale socket file
+from a crashed run is replaced, a file that is not a socket is refused. A
+client that reads too slowly loses output, as on the TCP port. `serial_log`
+writes the console's transcript and `serial_log_a` / `serial_log_b` the other
+line's (the Indy and Indigo2 console is channel B, the Octane's and O2's
+channel A). With `ci`, a console that has a socket still feeds the control
+socket's `serial-read` and `wait-serial`, and either side may type.
+
+```bash
+socat - UNIX-CONNECT:/tmp/octane-console.sock
+```
+
 ### Connect to a serial port
 
 ```bash
@@ -554,8 +569,12 @@ max_fps = 30                 # most updates a second per viewer
 It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
 the O2), with the normal window open or under `--ci` with no window. Not with
 `--headless`, which has no screen to serve. The window, the monitor and any
-number of viewers can type and click at the same time. iris-gui has no VNC
-server.
+number of viewers can type and click at the same time.
+
+**iris-gui** serves the screen too: set **Serve on** in the Performance tab
+(a port for `127.0.0.1`, or `host:port`), which is the same `vnc.listen` key
+the machine's TOML carries. The server starts with the machine and stops with
+it, and a port already in use is reported rather than failing the start.
 
 What you see is the guest's screen, without the window's status bar. Only
 the parts of the screen that change are sent, so an idle desktop costs next
@@ -805,6 +824,10 @@ Automation and debugging
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
+  --serial-socket-a <PATH>    Also serve channel A on a Unix socket
+  --serial-socket-b <PATH>    Likewise channel B
+  --serial-log-a <FILE>       Log channel A when it is not the console
+  --serial-log-b <FILE>       Likewise channel B
   --gdb-port <PORT>           Start the GDB stub
   --jitv2-threads <N>         jitv2 compile-pool thread count
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry

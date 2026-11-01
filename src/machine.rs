@@ -391,41 +391,57 @@ impl Machine {
         // after the executor/CPU exist — see Hot::cycles's doc comment.)
         let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see Rex3::HB_*
         let fasttick_count = Arc::new(AtomicU64::new(0)); // CP0 Compare match counter
-        let decoded_count = Arc::new(AtomicU64::new(0)); // pre-decoded instruction count
-        let l1i_hit_count        = Arc::new(AtomicU64::new(0)); // L1-I hit counter
-        let l1i_fetch_count      = Arc::new(AtomicU64::new(0)); // L1-I fetch counter
-        let uncached_fetch_count = Arc::new(AtomicU64::new(0)); // uncached instruction fetches
+        // What every graphics board's status bar reads; the CPU feeds its
+        // fetch counters and the cycle counter is wired in below.
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick_count.clone());
+        let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
 
-        // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
-        // bindings so multiple `--ci` instances can coexist.
-        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
+        // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
+        // nothing; each gets its host end below.
+        let ioc = Ioc::new_for_profile(guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
 
         // One sink for both serial paths, so the CI and TCP logs are the same
         // bytes (timestamps included). Opened once, before any peripheral
         // `start()` clones the current backend Arc into the RX/TX threads.
-        let serial_log = crate::dev::serial_host::open_log(&cfg, "Indy", crate::dev::serial_host::LogMode::Append);
+        let tag = if guinness { "Indy" } else { "Indigo2" };
+        let serial_log = crate::dev::serial_host::open_log(&cfg, tag, crate::dev::serial_host::LogMode::Append);
 
-        // CI mode replaces the default TCP backend on channel B (tty1, the
-        // SGI serial console) with an in-process backend the control socket
-        // drives directly. Channel A (tty2) keeps its default TCP backend.
-        let ci_serial = if ci_enabled {
-            let b = Arc::new(crate::dev::serial_host::CiSerialBackend::new());
-            if let Some(log) = &serial_log {
-                b.set_log(log.clone());
-            }
-            ioc.scc().set_backend_b(b.clone());
-            Some(b)
-        } else {
-            // Non-CI mode: channel B already has its TCP listener on
-            // 127.0.0.1:8881 (or `serial_port_b`). Wrap it in a TeeBackend so
-            // guest-emitted bytes also reach the file.
-            if let Some(log) = &serial_log {
-                let inner = ioc.scc().backend_b();
-                ioc.scc().set_backend_b(Arc::new(crate::dev::serial_host::TeeBackend::new(inner, log.clone())));
-            }
-            None
-        };
+        // Channel B (tty1) is the SGI serial console: in CI mode the
+        // in-process backend the control socket drives directly, otherwise
+        // TCP on `serial_port_b`, either teed to `serial_log`. Channel A
+        // (tty2) serves TCP on `serial_port_a` outside CI mode, so several
+        // `--ci` instances can run side by side.
+        let [port_a, port_b] = cfg.serial_ports();
+        let ci_serial = ci_enabled.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
+        let label = format!("{tag} serial channel B");
+        let (console, _) = crate::dev::serial_host::serial_line(
+            &crate::dev::serial_host::SerialLine {
+                label: &label,
+                tcp_port: Some(port_b),
+                tcp_setting: "serial_port_b",
+                socket: cfg.serial_socket_b.as_deref(),
+                socket_setting: "serial_socket_b",
+            },
+            serial_log.clone(),
+            ci_serial.as_ref(),
+        );
+        ioc.scc().set_backend_b(console);
+        let label = format!("{tag} serial channel A");
+        let log_a = crate::dev::serial_host::open_log_at(
+            &cfg, cfg.serial_log_a.as_deref(), &label, crate::dev::serial_host::LogMode::Append);
+        let (channel_a, _) = crate::dev::serial_host::serial_line(
+            &crate::dev::serial_host::SerialLine {
+                label: &label,
+                tcp_port: (!ci_enabled).then_some(port_a),
+                tcp_setting: "serial_port_a",
+                socket: cfg.serial_socket_a.as_deref(),
+                socket_setting: "serial_socket_a",
+            },
+            log_a,
+            None,
+        );
+        ioc.scc().set_backend_a(channel_a);
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
@@ -497,7 +513,7 @@ impl Machine {
         let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(status.clone()));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
             r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
@@ -507,7 +523,7 @@ impl Machine {
         let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(status.clone()));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
             r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
@@ -518,9 +534,9 @@ impl Machine {
         // selecting the board is explicit, and the PROM needs it to probe.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
-                use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant};
+                use crate::dev::gr2::{Gr2, Gr2Variant};
                 let variant = if cfg.graphics_board() == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
-                let g = Gr2::new(variant, Gr2Stats { heartbeat: heartbeat.clone(), fasttick: fasttick_count.clone() });
+                let g = Gr2::new(variant, status.clone());
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
                 // latch the guest clears (see Ioc::write8/int2_write8), so only
@@ -549,7 +565,7 @@ impl Machine {
                 Some(crate::dev::mgras::Mgras::new(cfg.graphics_board(), {
                     use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
                     [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
-                }, heartbeat.clone(), fasttick_count.clone()))
+                }, status.clone()))
             }
             _ => None,
         };
@@ -740,9 +756,8 @@ impl Machine {
             crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
         };
 
-        // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
-        #[cfg(feature = "developer")]
-        if let Some(rex3) = &board.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
+        // The developer status bar shows the CPU's Count rate.
+        status.set_count_hz(cpu.count_hz_atomic());
 
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -785,14 +800,11 @@ impl Machine {
         }
 
         // Wire up the CPU cycle counter for every device that reads it —
-        // Rex3::new/Wd33c93a::new run before the CPU exists, so this can't
-        // be a constructor parameter (see Hot::cycles's doc comment). Must
-        // happen before hpc3.scsi().start() (called later, from
+        // the boards and Wd33c93a::new run before the CPU exists, so this
+        // can't be a constructor parameter (see Hot::cycles's doc comment).
+        // Must happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
-        if let Some(rex3) = &board.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(mgras) = &board.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(rex3) = &board.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(gr2) = &board.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
+        status.set_cpu_cycles(cpu.cycles_ptr());
         if let Some(td) = &board.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
             if board.testdev.is_none() {

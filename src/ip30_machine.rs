@@ -209,7 +209,8 @@ impl OctaneMachine {
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
-        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone()));
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());
@@ -295,11 +296,12 @@ impl OctaneMachine {
                 c.share_jitv2(jit.clone(), world.clone());
             }
         }
+        status.set_cpu_cycles(cpu.cycles_ptr());
+        status.set_count_hz(cpu.count_hz_atomic());
+        for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
+            status.add_cpu_stats(c.cycles_ptr(), tick.clone());
+        }
         if let Some(g) = &gfx {
-            g.mgras().set_cpu_cycles(cpu.cycles_ptr());
-            for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
-                g.mgras().add_cpu_stats(c.cycles_ptr(), tick.clone());
-            }
             // Host GL frames composite straight into the IMPACT framebuffer.
             #[cfg(feature = "hostgl")]
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(g.mgras().clone())));
@@ -688,6 +690,9 @@ impl Workstation for OctaneMachine {
     }
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.cpus[0].fasttick_count()
+    }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.cpus.iter().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
     }
     fn get_ci_serial(&self) -> Option<Arc<crate::dev::serial_host::CiSerialBackend>> {
         self.ci_serial.clone()

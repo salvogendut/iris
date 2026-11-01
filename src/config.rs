@@ -499,18 +499,25 @@ pub enum MachineProfile {
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui's
-    /// machine editor has no `[o2]` section.) Single source of truth for the
+    /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    pub const ALL: [Self; 4] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::OctaneIp30];
+    ///
+    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
+    /// the Octane does, and iris-gui says so in the New-machine dialog.
+    pub const ALL: [Self; 5] = [
+        Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
+    ];
 
     /// The bank sizes in MB (0 is an empty bank) that `validate()` accepts
     /// for this profile. The Octane's banks are matched DIMM pairs of 64 MB
-    /// to 2 GB; the IP22/IP24 MC stops at 128 MB.
+    /// to 2 GB; the IP22/IP24 MC stops at 128 MB. An O2's banks are DIMM-pair
+    /// kits, so they are the four kit sizes and nothing the MC could express
+    /// (see `dev::crime_mem::check_kits`).
     pub fn bank_sizes(self) -> &'static [u32] {
         match self {
             Self::OctaneIp30 => &[0, 64, 128, 256, 512, 1024, 2048],
-            Self::Indigo2Ip28 | Self::O2Ip32 => MC_BANK_SIZES,
+            Self::O2Ip32 => &[0, 32, 64, 128, 256],
+            Self::Indigo2Ip28 => MC_BANK_SIZES,
             _ => &[0, 8, 16, 32, 64, 128],
         }
     }
@@ -556,6 +563,21 @@ impl MachineProfile {
 
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
+    }
+
+    /// The CPU models this machine can be built with. The O2 has an R5000 or
+    /// an R10000 (an R4400 is refused when the machine is built, not by
+    /// `validate()`); the Octane shipped only with the 195 MHz R10000; the
+    /// Indy and the Indigo2 take any of the three.
+    ///
+    /// Single source of truth for the front-ends' Processor pickers, so they
+    /// cannot offer a CPU the machine will refuse.
+    pub fn cpus(self) -> &'static [CpuModel] {
+        match self {
+            Self::OctaneIp30 => &[CpuModel::R10000],
+            Self::O2Ip32 => &[CpuModel::R5000, CpuModel::R10000],
+            _ => &CpuModel::ALL,
+        }
     }
 
     /// The R10000 Indigo2. Selects the IP28 decodes inside the shared
@@ -1455,6 +1477,15 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_port_b: Option<u16>,
 
+    /// Unix socket paths that serve serial channels A and B as well as their
+    /// TCP ports: raw bytes, one client at a time. Where the machine has a CI
+    /// socket, a console on a socket is also still readable through
+    /// `serial-read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_socket_a: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_socket_b: Option<String>,
+
     /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Set `jis`
     /// with a Japanese keyboard and the PROM's `keybd` set to Japanese. See
     /// [`KeyboardLayout`].
@@ -1537,6 +1568,16 @@ pub struct MachineConfig {
     /// `off` (the default) writes raw bytes, byte-for-byte a transcript.
     #[serde(default)]
     pub serial_log_timestamps: crate::dev::serial_log::SerialLogTimestamps,
+
+    /// Files that receive what the guest sends on serial channel A or B when
+    /// that channel is not the console (`serial_log` is the console's):
+    /// channel B on the Octane and O2, channel A on the Indy and Indigo2.
+    /// Written from the start on the Octane and O2, appended to on the Indy
+    /// and Indigo2, like `serial_log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_log_a: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_log_b: Option<String>,
 
     // --- table / array-of-table fields: must be emitted after all scalars ---
 
@@ -1685,6 +1726,15 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
+/// The first four banks of a full `banks` array. Every machine today has
+/// four banks or fewer, so the rest of the array is always zeros; the
+/// front-ends' per-bank pickers work on a `[u32; 4]`.
+pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
+    let mut four = [0u32; 4];
+    four.copy_from_slice(&banks[..4]);
+    four
+}
+
 /// `banks` as TOML: any length from 1 to [`MAX_BANKS`] is read and padded
 /// with zeros; it is written with at least four entries and no trailing
 /// zeros beyond them, so a four-bank machine's config looks as it always has.
@@ -1743,6 +1793,8 @@ impl Default for MachineConfig {
             monitor_port: None,
             serial_port_a: None,
             serial_port_b: None,
+            serial_socket_a: None,
+            serial_socket_b: None,
             keyboard: KeyboardLayout::default(),
             load_elf: None,
             perfetto: None,
@@ -1757,6 +1809,8 @@ impl Default for MachineConfig {
             ci_display: false,
             serial_log: None,
             serial_log_timestamps: Default::default(),
+            serial_log_a: None,
+            serial_log_b: None,
             vino: VinoConfig::default(),
             vnc: VncConfig::default(),
             network: NetworkSection::default(),
@@ -1985,6 +2039,7 @@ impl MachineConfig {
                 ));
             }
         }
+        self.validate_serial_sockets()?;
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
@@ -2114,6 +2169,30 @@ impl MachineConfig {
             );
         }
         Ok(())
+    }
+
+    /// The Unix serial sockets and per-line logs: each path names one line,
+    /// and the console line's log is `serial_log`, not a per-line key.
+    fn validate_serial_sockets(&self) -> Result<(), String> {
+        let sockets = [("serial_socket_a", self.serial_socket_a.as_deref()), ("serial_socket_b", self.serial_socket_b.as_deref())];
+        for (i, (setting, path)) in sockets.iter().enumerate() {
+            let Some(path) = path else { continue };
+            if path.is_empty() {
+                return Err(format!("{setting}: the socket path is empty"));
+            }
+            if let Some((other, _)) = sockets[..i].iter().find(|(_, p)| *p == Some(*path)) {
+                return Err(format!("{setting} and {other} both name {path}"));
+            }
+        }
+        match self.machine.profile {
+            MachineProfile::OctaneIp30 | MachineProfile::O2Ip32 if self.serial_log_a.is_some() => {
+                Err("serial_log_a: channel A is the console here; its log is serial_log".into())
+            }
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 if self.serial_log_b.is_some() => {
+                Err("serial_log_b: channel B is the console here; its log is serial_log".into())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Extract network-related settings into a `NetworkConfig`.
@@ -2325,6 +2404,14 @@ pub struct Cli {
     #[arg(long = "serial-port-b", value_name = "PORT")]
     pub serial_port_b: Option<u16>,
 
+    /// Also serve serial channel A on this Unix socket.
+    #[arg(long = "serial-socket-a", value_name = "PATH")]
+    pub serial_socket_a: Option<String>,
+
+    /// Also serve serial channel B on this Unix socket.
+    #[arg(long = "serial-socket-b", value_name = "PATH")]
+    pub serial_socket_b: Option<String>,
+
     /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis`
     /// for a Japanese keyboard with the PROM's `keybd` set to JP.
     #[arg(long = "keyboard", value_name = "LAYOUT")]
@@ -2401,6 +2488,16 @@ pub struct Cli {
     #[arg(long = "serial-log-timestamps", value_name = "MODE")]
     pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
 
+    /// Write what the guest sends on serial channel A to this file when A is
+    /// not the console (Indy, Indigo2).
+    #[arg(long = "serial-log-a", value_name = "FILE")]
+    pub serial_log_a: Option<String>,
+
+    /// Write what the guest sends on serial channel B to this file when B is
+    /// not the console (Octane, O2).
+    #[arg(long = "serial-log-b", value_name = "FILE")]
+    pub serial_log_b: Option<String>,
+
     /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
@@ -2456,6 +2553,8 @@ impl Cli {
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
+        if let Some(p) = &self.serial_log_a { cfg.serial_log_a = Some(p.clone()); }
+        if let Some(p) = &self.serial_log_b { cfg.serial_log_b = Some(p.clone()); }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
@@ -2474,6 +2573,8 @@ impl Cli {
         if let Some(a) = &self.vnc { cfg.vnc.listen = Some(a.clone()); }
         if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
+        if let Some(p) = &self.serial_socket_a { cfg.serial_socket_a = Some(p.clone()); }
+        if let Some(p) = &self.serial_socket_b { cfg.serial_socket_b = Some(p.clone()); }
         if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
@@ -2829,6 +2930,40 @@ mod export_tests {
         let mut indy = MachineConfig::default();
         indy.network.mode = NetMode::Off;
         assert!(indy.validate().unwrap_err().contains("only available on the O2"));
+    }
+
+    /// The serial sockets come from the file and the command line, must
+    /// differ, and a log key for the console line is refused.
+    #[test]
+    fn serial_sockets_and_line_logs_are_read_and_checked() {
+        let mut octane: MachineConfig = toml::from_str(r#"
+            serial_socket_a = "/run/a.sock"
+            serial_socket_b = "/run/b.sock"
+            serial_log_b = "b.log"
+            banks = [128, 0, 0, 0]
+            [machine]
+            profile = "octane_ip30"
+            cpu = "r10000"
+        "#).expect("parse");
+        assert_eq!(octane.serial_socket_a.as_deref(), Some("/run/a.sock"));
+        assert_eq!(octane.serial_log_b.as_deref(), Some("b.log"));
+        octane.validate().expect("an Octane serves sockets");
+        octane.serial_socket_b = octane.serial_socket_a.clone();
+        assert!(octane.validate().unwrap_err().contains("both name /run/a.sock"));
+        octane.serial_socket_b = Some("/run/b.sock".into());
+        octane.serial_log_a = Some("a.log".into());
+        assert!(octane.validate().unwrap_err().contains("channel A is the console"));
+
+        let cli = Cli::parse_from(["iris", "--serial-socket-a", "/run/x.sock", "--serial-log-a", "y.log"]);
+        let cfg = cli.apply(MachineConfig::default());
+        assert_eq!(cfg.serial_socket_a.as_deref(), Some("/run/x.sock"));
+        assert_eq!(cfg.serial_log_a.as_deref(), Some("y.log"));
+        cfg.validate().expect("the Indy serves sockets and logs channel A");
+        let mut indy = cfg.clone();
+        indy.serial_log_b = Some("y.log".into());
+        assert!(indy.validate().unwrap_err().contains("channel B is the console"));
+        let back: MachineConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.serial_socket_a.as_deref(), Some("/run/x.sock"));
     }
 
     /// Every old `[o2]` key lands on the shared key it stood for, and the
