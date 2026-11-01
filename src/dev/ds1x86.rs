@@ -28,6 +28,9 @@ struct RtcData {
     base_centiseconds: u64,
     // Timestamp when time registers were last set (for delta calculation)
     time_base: Instant,
+    // Calendar registers already represent this tick. Never serialized: loads
+    // and guest writes invalidate it, including writes within the same tick.
+    converted_centiseconds: Option<u64>,
 }
 
 pub struct Ds1x86 {
@@ -52,6 +55,7 @@ impl Ds1x86 {
                 regs: vec![0; size],
                 base_centiseconds: 0,
                 time_base: Instant::now(),
+                converted_centiseconds: None,
             }),
             size,
             nvram_path,
@@ -72,6 +76,7 @@ impl Ds1x86 {
         rtc.set_current_time(&mut data.regs);
         data.base_centiseconds = rtc.regs_to_centiseconds(&data.regs, 0);
         data.time_base = Instant::now();
+        data.converted_centiseconds = None;
         drop(data);
 
         // Load NVRAM if exists
@@ -198,12 +203,18 @@ impl Ds1x86 {
     // Update time registers based on elapsed time since time_base
     // Should only be called when TE bit is 1 (updates enabled)
     fn update_time(&self, rtc_data: &mut RtcData) {
-        let now = Instant::now();
+        self.update_time_at(rtc_data, Instant::now());
+    }
+
+    fn update_time_at(&self, rtc_data: &mut RtcData, now: Instant) {
         let elapsed = now.duration_since(rtc_data.time_base);
         let elapsed_centiseconds = (elapsed.as_secs() * 100) + (elapsed.subsec_nanos() / 10_000_000) as u64;
         let current_centiseconds = rtc_data.base_centiseconds + elapsed_centiseconds;
 
-        self.centiseconds_to_regs(current_centiseconds, &mut rtc_data.regs, 0);
+        if rtc_data.converted_centiseconds != Some(current_centiseconds) {
+            self.centiseconds_to_regs(current_centiseconds, &mut rtc_data.regs, 0);
+            rtc_data.converted_centiseconds = Some(current_centiseconds);
+        }
     }
 
     pub fn save_nvram(&self, filename: &str) -> std::io::Result<()> {
@@ -228,6 +239,7 @@ impl Ds1x86 {
         self.set_current_time(&mut data.regs);
         data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
         data.time_base = Instant::now();
+        data.converted_centiseconds = None;
 
         Ok(())
     }
@@ -294,6 +306,9 @@ impl Ds1x86 {
         let is_time_reg = offset >= base && offset <= base + 0x0A;
         let is_cmd_reg = offset == base + CMD_REG_OFFSET;
 
+        if is_time_reg || is_cmd_reg {
+            rtc_data.converted_centiseconds = None;
+        }
         if is_time_reg {
             // Update base time when time registers are written
             rtc_data.base_centiseconds = self.regs_to_centiseconds(&rtc_data.regs, base);
@@ -410,6 +425,9 @@ impl Device for Ds1x86 {
                         return Err(format!("rtc w: offset {:#x} out of range (0-{:#x})", offset, data.regs.len() - 1));
                     }
                     data.regs[offset] = val;
+                    if offset <= CMD_REG_OFFSET {
+                        data.converted_centiseconds = None;
+                    }
                     writeln!(writer, "{:04X}: {:02X}", offset, val).unwrap();
                     return Ok(());
                 }
@@ -489,6 +507,7 @@ impl Saveable for Ds1x86 {
         // same as load_nvram does — no need to store it separately.
         data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
         data.time_base = Instant::now();
+        data.converted_centiseconds = None;
         Ok(())
     }
 }
@@ -496,6 +515,71 @@ impl Saveable for Ds1x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_calendar_advances_at_centisecond_boundaries() {
+        let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
+        let mut data = rtc.data.lock();
+        let now = Instant::now();
+        // 2000-02-28 23:59:59.99 UTC, immediately before leap day.
+        data.base_centiseconds = 95178239999;
+        data.time_base = now;
+        rtc.update_time_at(&mut data, now);
+        let before = data.regs.clone();
+        rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(9));
+        assert_eq!(data.regs, before);
+        rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(10));
+        assert_eq!(data.regs[0], 0);
+        assert_eq!(data.regs[1], 0);
+        assert_eq!(data.regs[2], 0);
+        assert_eq!(data.regs[4], 0);
+        assert_eq!(data.regs[8], 0x29);
+        assert_eq!(data.regs[9] & 0x1f, 0x02);
+    }
+
+    #[test]
+    fn raw_monitor_write_invalidates_calendar_cache() {
+        let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
+        let now = Instant::now();
+        let before = {
+            let mut data = rtc.data.lock();
+            data.time_base = now;
+            rtc.update_time_at(&mut data, now);
+            data.regs[1]
+        };
+        rtc.execute_command("rtc", &["w", "1", "99"], Box::new(std::io::sink())).unwrap();
+        let mut data = rtc.data.lock();
+        assert!(data.converted_centiseconds.is_none());
+        // Raw monitor writes do not reset the time base. The next update
+        // must still restore the running clock, even in the same tick.
+        rtc.update_time_at(&mut data, now);
+        assert_eq!(data.regs[1], before);
+    }
+
+    #[test]
+    fn calendar_cache_is_invalidated_by_writes_and_restore() {
+        let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
+        {
+            let mut data = rtc.data.lock();
+            rtc.update_time(&mut data);
+            assert!(data.converted_centiseconds.is_some());
+        }
+        // Freeze then write seconds, just as a guest sets the clock.
+        rtc.write8(CMD_REG_OFFSET as u64, 0);
+        rtc.write8(1, 0x42);
+        assert!(rtc.data.lock().converted_centiseconds.is_none());
+        let saved = rtc.save_state();
+        rtc.write8(CMD_REG_OFFSET as u64, TE_BIT);
+        assert_eq!(rtc.read8(1).data, 0x42);
+        assert!(rtc.data.lock().converted_centiseconds.is_some());
+        rtc.load_state(&saved).unwrap();
+        assert!(rtc.data.lock().converted_centiseconds.is_none());
+        assert_eq!(rtc.read8(1).data, 0x42);
+        // Re-enabling within the same tick must not reuse pre-restore data.
+        rtc.write8(CMD_REG_OFFSET as u64, TE_BIT);
+        assert!(rtc.data.lock().converted_centiseconds.is_none());
+        assert_eq!(rtc.read8(1).data, 0x42);
+    }
 
     /// Phase 1.7 round-trip: a fresh RTC loaded from a captured save_state must
     /// re-serialize byte-identically. Save_state flushes the live host clock

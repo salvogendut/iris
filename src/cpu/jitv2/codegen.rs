@@ -18,7 +18,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, Block, InstBuilder, MemFlagsData, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::Module;
 
 use crate::cpu::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
@@ -209,6 +209,10 @@ struct EmitCtx<'a, 'b> {
     /// case every access inlines its guard exactly as before.
     mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT],
     core_ptr: Value,
+    /// SSA copies of the guest GPRs. Writes also update MipsCore, so every
+    /// exception, interrupt and memory helper sees precise register state.
+    /// Only integer regions without interpreter fallbacks use these copies.
+    gpr_cache: Option<&'a [Variable; 31]>,
     raw: u32,
     word: WordOffset,
     /// Compile-time-known Cause.BD value for whatever `emit_exception_exit`
@@ -1304,6 +1308,7 @@ impl Codegen {
                 // implementation. All-None forces the inline guard here.
                 mem_helpers: [None; MEM_HELPER_COUNT],
                 core_ptr,
+                gpr_cache: None,
                 raw: 0,
                 word: 0,
                 dc_geometry,
@@ -1639,7 +1644,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1670,9 +1675,34 @@ impl Codegen {
         // start, because the armed foreign-slot transfer was destroyed.
         if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
+
+        // SGIEmu keeps frequently used guest registers in host registers. Here
+        // SSA variables let Cranelift choose the host allocation across loops
+        // and branches, instead of reloading MipsCore after each interrupt
+        // check. Keep stores write-through: helpers and every early exit still
+        // see the architectural state without a separate spill protocol.
+        // Interpreter fallbacks can write arbitrary GPRs; instrumentation can
+        // inspect or change them too. Keep those regions on the memory path.
+        // FPU regions also keep that path: retaining page-wide GPR values
+        // regressed call-heavy FP benchmarks. Limit this optimization to
+        // integer regions until a selective cache pays off for mixed code.
+        let gpr_cache: Option<[Variable; 31]> = if !cfg!(any(feature = "developer", feature = "jitv2_lockstep"))
+            && !has_fpu
+            && !instrs_linear(instrs).any(|instr| instr.is_fallback)
+        {
+            Some(std::array::from_fn(|i| {
+                let var = builder.declare_var(ir::types::I64);
+                let value = builder.ins().load(ir::types::I64, MemFlagsData::trusted(),
+                    core_ptr, core_offset_of_gpr(i as u32 + 1));
+                builder.def_var(var, value);
+                var
+            }))
+        } else {
+            None
+        };
 
         // Dispatch: a `Switch` over every entry this compile covers, jumping
         // to that entry's own body block (bypassing its preamble, when
@@ -1750,7 +1780,7 @@ impl Codegen {
             builder.switch_to_block(stub);
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
@@ -1884,7 +1914,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: gpr_cache.as_ref(), raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -6048,6 +6078,9 @@ fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
     if reg == 0 {
         return ctx.builder.ins().iconst(ir::types::I64, 0);
     }
+    if let Some(vars) = ctx.gpr_cache {
+        return ctx.builder.use_var(vars[reg as usize - 1]);
+    }
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
@@ -6067,6 +6100,9 @@ fn emit_write_gpr(ctx: &mut EmitCtx, reg: u32, value: Value) {
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+    if let Some(vars) = ctx.gpr_cache {
+        ctx.builder.def_var(vars[reg as usize - 1], value);
+    }
 }
 
 /// Compile-time FPU register-file addressing mode, resolved once per
@@ -9893,6 +9929,15 @@ fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
         let dst_off = ctx.builder.ins().iconst(ir::types::I64, dst_off);
         let status = emit_mem_helper_call(ctx, addr, vaddr, dst_off);
         emit_check_mem_status(ctx, status);
+        // This helper writes the architectural destination itself. Refresh
+        // its SSA copy only on success; a fault must retain the old value.
+        if rt != 0 {
+            if let Some(vars) = ctx.gpr_cache {
+                let value = ctx.builder.ins().load(ir::types::I64,
+                    MemFlagsData::trusted(), ctx.core_ptr, core_offset_of_gpr(rt));
+                ctx.builder.def_var(vars[rt as usize - 1], value);
+            }
+        }
         return;
     }
 
@@ -11122,7 +11167,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves

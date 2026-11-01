@@ -2430,6 +2430,68 @@ mod tests {
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, /*max_instrs=*/16, steps);
     }
 
+    #[test]
+    fn gpr_cache_loop_survives_memory_helpers_and_fault() {
+        // Helpers are a process-wide option. Isolate both configurations so
+        // another test changing that option cannot bypass this regression.
+        let Ok(mode) = std::env::var("IRIS_TEST_GPR_CACHE") else {
+            for mode in ["inline", "helpers"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args(["--exact", "cpu::jitv2::equiv_test::tests::gpr_cache_loop_survives_memory_helpers_and_fault"])
+                    .env("IRIS_TEST_GPR_CACHE", mode)
+                    .env_remove("IRIS_MEM_HELPERS");
+                if mode == "helpers" { child.env("IRIS_MEM_HELPERS", "1"); }
+                assert!(child.status().unwrap().success(), "{mode} regression failed");
+            }
+            return;
+        };
+        use crate::cpu::mips_isa::*;
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let page = [
+            (0, make_i(OP_ADDIU, 0, 2, 3)),
+            (1, make_i(OP_ADDIU, 0, 3, 10)),
+            (2, make_i(OP_SW, 1, 3, 0)),
+            (3, make_i(OP_LW, 1, 4, 0)),
+            (4, make_i(OP_ADDIU, 4, 3, 7)),
+            (5, make_i(OP_ADDIU, 2, 2, 0xffff)),
+            (6, make_i(OP_BNE, 2, 0, (-5i16) as u16)),
+            (7, make_i(OP_ADDIU, 5, 5, 1)),
+            (8, make_i(OP_LW, 1, 4, 1)), // ADEL: retain r4's previous value
+            (9, JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_A010_0000; // uncached: exercise Rust bus callbacks
+        let interp = run_interpreter_page(&page, gpr, pc, 2 + 6 * 3 + 1);
+
+        let mut words = [0; ENTRIES_PER_PAGE];
+        for &(word, raw) in &page { words[word as usize] = raw; }
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&words, 0, pc as u32, 32);
+        assert!(non_empty);
+        let mut instrs = *walked;
+        assert!(!crate::cpu::jitv2::analyzer::instrs_linear(&instrs).any(|i| i.is_fallback));
+        let mut codegen = Codegen::new();
+        if mode == "helpers" {
+            assert!(crate::cpu::jitv2::codegen::mem_helpers_enabled());
+            // Build the real destination-writing helpers, but force their
+            // slow path: PassthroughCache has no L1D backing pointers.
+            codegen.dc_geometry.supported = true;
+            crate::cpu::jitv2::codegen::set_inline_mem_enabled(false);
+            codegen.emit_mem_helpers();
+        }
+        let jit_fn = codegen.compile_region(&mut instrs, 0, true, false).unwrap();
+        let (exec, _) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        let jit = CoreSnapshot::capture(&exec.core);
+        assert_eq!(jit.gpr[3], 31);
+        assert_eq!(jit.gpr[4], 24, "faulting load must preserve its destination");
+        assert_eq!(jit.gpr[5], 3, "delay slot must retire on every loop iteration");
+        assert_eq!(jit.cp0_epc, pc + 8 * 4);
+        assert_eq!(jit, interp, "{mode}: loop, callbacks and exception must preserve GPR state");
+    }
+
     // ---- Branches and jumps: batch B (unconditional J/JAL) ------
 
     fn make_j(op: u32, target26: u32) -> u32 {

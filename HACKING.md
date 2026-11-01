@@ -634,9 +634,14 @@ code into host code with Cranelift. The concepts:
   counter owned by the memory device (`gen_ptr`). Any write to the page, from
   the CPU or from DMA, bumps it; compiled code checks it and stops being
   dispatched once stale. Aliased pages share a counter.
-- **No speculation.** Guest registers live in `MipsCore` memory; compiled
-  code reads and writes them there, so the interpreter can take over at any
-  instruction boundary and exceptions need no rollback.
+- **No speculation.** Guest registers stay current in `MipsCore` memory,
+  so the interpreter can take over at any instruction boundary and exceptions
+  need no rollback. Integer regions with no interpreter fallbacks also keep GPR
+  copies in Cranelift SSA variables, letting the compiler reuse values across
+  loops, interrupt checks and memory calls. Writes update both copies; a shared load
+  helper refreshes its destination's SSA copy after success. Developer and
+  lockstep builds, and regions containing FPU instructions, use the memory-only
+  path.
 - **Memory access.** Loads and stores that hit an already-cached L1D line are
   inlined; everything else calls back into Rust. Callouts take the core
   pointer as their first argument and return status in registers.

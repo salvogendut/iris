@@ -1,5 +1,11 @@
 # The pending-interrupt check, not block structure, is what blocks GPR forwarding
 
+Status: historical measurements of implicit memory forwarding, before the
+SGIEmu-inspired explicit GPR SSA cache (2026-11-01). Native integer regions can
+now retain GPR values across interrupt checks and callouts; FPU/fallback regions
+still use the memory path described here. See
+[the port measurements](../perf/sgiemu-register-and-rtc-cache.md).
+
 Measured 2026-09-19 with `zz_forwarding::zz_cl_forwarding` (a six-shape
 Cranelift probe, `src/cpu/jitv2/mod.rs`) plus real emitted code from the corpus.
 

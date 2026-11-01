@@ -21,6 +21,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### SGIEmu-inspired emulation optimizations
+
+- Keep guest GPR values in compiler SSA variables across native integer JIT
+  regions, reducing repeated loads around interrupt checks and memory calls. Register
+  writes still update architectural state immediately for faults and exits.
+  Regions containing FPU instructions or interpreter fallbacks, developer builds
+  and lockstep builds retain the existing register access path.
+- Cache DS1286/DS1386 calendar conversion for each centisecond. Clock writes,
+  command changes and state restoration invalidate the cache, preserving clock
+  freeze and snapshot behavior while reducing the cost of repeated RTC reads.
+
 ### Live NAT forwarding
 
 - Preserve live subnet, forwarding and PCAP interface choices across peripheral

@@ -80,7 +80,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [gpr0-was-loaded-from-memory.md](jitv2/gpr0-was-loaded-from-memory.md) | rule | `$zero` was being loaded from memory, 79 times in one region |
 | [inlined-slot-pc-bd-bracket.md](jitv2/inlined-slot-pc-bd-bracket.md) | rule | The inlined delay slot's `core.pc` / `in_delay_slot` bracket |
 | [instructions-jitv2-still-interprets.md](jitv2/instructions-jitv2-still-interprets.md) | history | What jitv2 still interprets, and which of it is worth compiling |
-| [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | measure | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
+| [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | history | Pre-SSA measurements of GPR forwarding across interrupt checks and callouts |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
 | [jit-page-probe-must-be-retired-on-drop.md](jitv2/jit-page-probe-must-be-retired-on-drop.md) | history | The jitv2 dirty-page probe must be retired when its cache dies |
 | [jit-v2-design.md](jitv2/jit-v2-design.md) | design | IRIS JIT v2 — Design Plan (draft for discussion) |
@@ -352,6 +352,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [idle-poll-backoffs-for-small-hosts.md](perf/idle-poll-backoffs-for-small-hosts.md) | rule | Idle poll backoffs: sleeps in milliseconds, not microseconds |
 | [phase3-platform.md](perf/phase3-platform.md) | design | Phase 3 platform notes |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
+| [sgiemu-register-and-rtc-cache.md](perf/sgiemu-register-and-rtc-cache.md) | measure | SGIEmu-inspired GPR caching and centisecond RTC conversion caching |
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
 
 ## testing/
