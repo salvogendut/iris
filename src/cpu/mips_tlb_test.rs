@@ -213,46 +213,56 @@ mod tests {
 
     #[test]
     fn test_o32_cannot_alias_extended_tlb_entries() {
-        // NetBSD's LP64 kernel maps xkseg while running o32 user processes.
-        // Neither Region nor VPN[39:32] may disappear when UX becomes zero.
-        for upper in [0xC000_0000_0000_0000, 0x4000_0000_0000_0000,
-                      0x0000_0001_0000_0000] {
-            for global in [false, true] {
-                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
-                let va = 0x2a000;
-                let mut extended = TlbEntry::new();
-                extended.entry_hi = upper | va | 4 | if global { 0x1000 } else { 0 };
-                extended.entry_lo = [(0x17f7a << 6) | 0x1e, (0x17f7b << 6) | 0x1e];
-                tlb.write(5, extended);
-                for access in [AccessType::Fetch, AccessType::Read, AccessType::Write] {
-                    assert!(matches!(tlb.translate::<0>(va + 0x13b8, 4, access),
-                        TlbResult::Miss { .. }), "o32 must not hit an extended mapping");
-                }
-                assert_eq!(tlb.probe(va, 4, false), 0x80000000);
-                assert_eq!(tlb.probe(upper | va, 4, false), 5,
-                    "TLBP compares the full EntryHi register even with KX clear");
+        // The live and restored TLBs each contain an inline vmap. Keep their
+        // construction copies off the default test-thread stack, as in the
+        // snapshot round-trip tests below.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                // NetBSD's LP64 kernel maps xkseg while running o32 user processes.
+                // Neither Region nor VPN[39:32] may disappear when UX becomes zero.
+                for upper in [0xC000_0000_0000_0000, 0x4000_0000_0000_0000,
+                              0x0000_0001_0000_0000] {
+                    for global in [false, true] {
+                        let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                        let va = 0x2a000;
+                        let mut extended = TlbEntry::new();
+                        extended.entry_hi = upper | va | 4 | if global { 0x1000 } else { 0 };
+                        extended.entry_lo = [(0x17f7a << 6) | 0x1e, (0x17f7b << 6) | 0x1e];
+                        tlb.write(5, extended);
+                        for access in [AccessType::Fetch, AccessType::Read, AccessType::Write] {
+                            assert!(matches!(tlb.translate::<0>(va + 0x13b8, 4, access),
+                                TlbResult::Miss { .. }), "o32 must not hit an extended mapping");
+                        }
+                        assert_eq!(tlb.probe(va, 4, false), 0x80000000);
+                        assert_eq!(tlb.probe(upper | va, 4, false), 5,
+                            "TLBP compares the full EntryHi register even with KX clear");
 
-                // A real user mapping must win even if an extended mapping is
-                // the most recent candidate for the same vmap slot.
-                let mut user = TlbEntry::new();
-                user.entry_hi = va | 4;
-                user.entry_lo = [(0x17ac0 << 6) | 0x1e, (0x17ac1 << 6) | 0x1e];
-                tlb.write(6, user);
-                tlb.write(5, extended);
-                let saved = tlb.save_state();
-                let mut restored = MipsTlb::new(TLB_NUM_ENTRIES);
-                restored.load_state(&saved).unwrap();
-                for t in [&mut tlb, &mut restored] {
-                    for access in [AccessType::Fetch, AccessType::Read, AccessType::Write] {
-                        assert!(matches!(t.translate::<0>(va + 0x13b8, 4, access),
-                            TlbResult::Hit { phys_addr: 0x17ac13b8, .. }));
+                        // A real user mapping must win even if an extended mapping is
+                        // the most recent candidate for the same vmap slot.
+                        let mut user = TlbEntry::new();
+                        user.entry_hi = va | 4;
+                        user.entry_lo = [(0x17ac0 << 6) | 0x1e, (0x17ac1 << 6) | 0x1e];
+                        tlb.write(6, user);
+                        tlb.write(5, extended);
+                        let saved = tlb.save_state();
+                        let mut restored = MipsTlb::new(TLB_NUM_ENTRIES);
+                        restored.load_state(&saved).unwrap();
+                        for t in [&mut tlb, &mut restored] {
+                            for access in [AccessType::Fetch, AccessType::Read, AccessType::Write] {
+                                assert!(matches!(t.translate::<0>(va + 0x13b8, 4, access),
+                                    TlbResult::Hit { phys_addr: 0x17ac13b8, .. }));
+                            }
+                            assert_eq!(t.probe(va, 4, false), 6);
+                            assert!(matches!(t.translate::<0>(va, 9, AccessType::Read),
+                                TlbResult::Miss { .. }));
+                        }
                     }
-                    assert_eq!(t.probe(va, 4, false), 6);
-                    assert!(matches!(t.translate::<0>(va, 9, AccessType::Read),
-                        TlbResult::Miss { .. }));
                 }
-            }
-        }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
