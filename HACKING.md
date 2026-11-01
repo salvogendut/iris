@@ -472,7 +472,10 @@ straight through.
   ([docs/nutlb-design.md](docs/nutlb-design.md)) and an 8 KB `vmap` from VPN
   to TLB entry sit in front of the JTLB. All of them are invalidated on ASID
   changes and TLB writes; every write to CP0 Status must resynchronise the
-  cached privilege state.
+  cached privilege state. TLB comparisons retain the full Region and VPN tag
+  in both address modes: a 32-bit user access must not match a 64-bit kernel
+  mapping that shares its low address bits. Refill-vector selection still
+  follows the current mode.
 - Three access paths: `fetch_instr()` (I-cache), `read_data()` /
   `write_data()` (D-cache), and `debug_read()` / `debug_write()`, which use
   kernel privilege, never change CP0 and ignore breakpoints.

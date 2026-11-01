@@ -175,7 +175,10 @@ pub struct TlbEntry {
     pub selector_bit_shift: u8,
 
     /// Pre-masked VPN comparison fields (derived, not stored in hardware).
-    /// `vcmp32` / `vcmp64`: VPN compare mask for 32-bit / 64-bit mode.
+    /// `vcmp32` / `vcmp64`: full VPN/Region compare masks in both modes.
+    /// Valid 32-bit addresses are sign-extended; changing UX/KX does not
+    /// discard a live entry's Region or VPN[39:32]. Otherwise an o32 process
+    /// can hit an LP64 kernel mapping with the same low VPN bits.
     /// `vpn_hi32` / `vpn_hi64`: `entry_hi & vcmp32/64` — ready to compare directly
     /// against `virt_addr & vcmp32/64` with no per-lookup masking of entry_hi.
     pub vcmp32:   u64,
@@ -203,7 +206,7 @@ impl TlbEntry {
             // page_mask=0 → mask|0x1FFF = 0x1FFF → trailing_ones=13 → shift=12 (bit 12 = 4KB selector)
             selector_bit_shift: 12,
             // entry_hi=0 so all pre-masked VPN fields are 0
-            vcmp32: !0x1FFF_u64 & 0x0000_0000_FFFF_E000,
+            vcmp32: !0x1FFF_u64 & 0xC000_00FF_FFFF_E000,
             vpn_hi32: 0,
             vcmp64: !0x1FFF_u64 & 0xC000_00FF_FFFF_E000,
             vpn_hi64: 0,
@@ -1063,7 +1066,7 @@ impl Tlb for MipsTlb {
         if index < self.num_entries {
             let mask = entry.page_mask | 0x1FFF;
             entry.selector_bit_shift = (mask.trailing_ones() - 1) as u8;
-            entry.vcmp32   = !mask & 0x0000_0000_FFFF_E000;
+            entry.vcmp32   = !mask & 0xC000_00FF_FFFF_E000;
             entry.vpn_hi32 = entry.entry_hi & entry.vcmp32;
             entry.vcmp64   = !mask & 0xC000_00FF_FFFF_E000;
             entry.vpn_hi64 = entry.entry_hi & entry.vcmp64;
@@ -1092,15 +1095,12 @@ impl Tlb for MipsTlb {
         for (i, s) in self.shadow.iter().enumerate() {
             // 1. Check VPN match first (per MIPS R4000 manual flowchart)
             // Apply same masking logic as translate()
-            // Per MIPS R4000 manual:
-            // - 32-bit mode: Compare highest 7-19 bits (depending on page size) of VA to TLB VPN
-            // - 64-bit mode: Compare highest 15-27 bits (depending on page size) of VA to TLB VPN
-            //   plus R field in bits 63:62
+            // TLBP compares the full EntryHi tag, independent of KX.
+            // Both cached masks retain Region and VPN[39:32], just as on
+            // translation; the mode only chooses the refill exception path.
             let (vcmp, vpn_hi) = if is_64bit {
-                // In 64-bit mode, include R field (bits 63:62) and VPN (bits 39:13)
                 (s.vcmp64, s.vpn_hi64)
             } else {
-                // In 32-bit mode, only compare VPN in bits 31:13 (and below based on page size)
                 (s.vcmp32, s.vpn_hi32)
             };
             if (virt_addr & vcmp) != vpn_hi {
@@ -1236,7 +1236,7 @@ impl Tlb for MipsTlb {
                 let page_mask = words[0];
                 let entry_hi  = words[1];
                 let mask = page_mask | 0x1FFF;
-                let vcmp32 = !mask & 0x0000_0000_FFFF_E000;
+                let vcmp32 = !mask & 0xC000_00FF_FFFF_E000;
                 let vcmp64 = !mask & 0xC000_00FF_FFFF_E000;
                 let shift = (mask.trailing_ones() - 1) as u8;
                 let offset_mask = (1u64 << shift) - 1;

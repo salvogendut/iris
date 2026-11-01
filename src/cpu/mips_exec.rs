@@ -4584,15 +4584,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                             // vector from the *mode*, not the address shape.
                             // cpucritique.md T1.
                             //
-                            // The compare width has to follow for the same
-                            // reason: `vcmp64` keeps the Region field, which is
-                            // `11` for these sign-extended addresses. Dropping
-                            // it (`vcmp32`) let a cksseg VA alias an xuseg entry
-                            // whose VPN2[31:13] happened to collide. This is
-                            // only consistent because EntryHi is now committed
-                            // through the unified `EH_VPN_MASK`, so a refill
-                            // handler's TLBWI writes R=11 and bits[39:32]=0xFF
-                            // — exactly what `vcmp64` will compare against.
+                            // TLB matching retains Region and VPN[39:32]
+                            // in either mode. XTLB here selects the refill
+                            // vector; it must still follow KX, even for a
+                            // sign-extended compatibility address.
                             _ => return self.tlb_translate_impl::<DEBUG, 1>(virt_addr, access_type),
                         }
                     }
