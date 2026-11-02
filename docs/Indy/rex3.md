@@ -301,15 +301,16 @@ altering what a guest sees.
 
 ### NetBSD Xorg acceleration
 
-NetBSD 11.0's Newport Xorg driver can display a software-rendered desktop with
-`Option "NoAccel" "true"` in its Device section. Its accelerated XAA solid
-fills currently produce incorrect colors in IRIS, while image uploads render
-correctly. Screen-to-screen copies preserve the incorrect fill colors.
-The driver's fast-clear path writes a different COLORVRAM packing from the
-BGR pixel representation used by IRIS. Hardware comparison is still needed
-to resolve the register/plane mapping; acceleration is not qualified for this
-guest. Disabling acceleration avoids that path and does not establish graphics
-performance or compatibility with IRIX desktop clients.
+NetBSD 11.0's Newport Xorg driver encodes fast-clear COLORVRAM and WRMASK
+in physical plane order. REX3 table 22 and RB2 sections 4.2/4.4 document that
+order: B0 R0 G0 through B7 R7 G7. IRIS decodes these values into its packed BGR
+framebuffer for RGB24 draws, retaining raw register readback. The generic and
+Cranelift paths have expected-value tests for all color bits and partial masks;
+see [the diagnosis](../../clanker/rex3/netbsd-xaa-fastclear-colors.md).
+Earlier builds produced incorrect accelerated fills and copies; image uploads
+were correct. `Option "NoAccel" "true"` remains the software comparison path.
+Other pixel-depth/plane layouts and physical hardware need separate validation;
+this correction alone does not establish graphics performance.
 
 ### RGB mode is a separate field from plane selection
 
