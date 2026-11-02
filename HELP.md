@@ -68,8 +68,10 @@ source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
 100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
 needs it), so the figure reads 1000 while the fast clock runs. IRIX on the
 Octane runs both clocks on CP0 Compare, which fires for whichever is due
-next, so there the figure reads about 1100: every Compare match is one
-interrupt, and the two clocks cannot be told apart from outside the guest.
+next, so there the figure counts every Compare match as one interrupt and the
+two clocks cannot be told apart from outside the guest. At an idle desktop it
+reads about 107 (the 100 Hz tick plus a few extra Compare writes); during boot
+it reads about 1000 while IRIX calibrates the clock.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
@@ -636,7 +638,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
 # keyboard = "ansi"             # host keyboard shape: "ansi", "iso" or "jis" (see Keyboard)
 # ci = false                    # CI control socket (see README)
-# ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
+# ci_socket = "/tmp/iris.sock"  # default: iris.sock in $TMPDIR, else /tmp; Windows: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
 
@@ -654,7 +656,7 @@ cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
-board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"
+board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
@@ -676,6 +678,8 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 path    = "scsi1.raw"       # raw or .chd image
 cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
+# write_cache = true        # the disk's write cache (default true). true: a write completes once the host has it and a sync follows within ~5 s, so a host crash or
+                            # power cut can lose the last ~5 s of writes. false: every write is stored on the host's disk before it completes, as on SGI's drives (slower). See STORAGE.md.
 # controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
 # A CD-ROM. path may be empty to start with an empty tray.
@@ -790,7 +794,7 @@ Configuration
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
-  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact
+  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
   --cpu <MODEL>               r4400 (default), r5000, or r10000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
@@ -799,6 +803,7 @@ Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
   --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
+  --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio
@@ -818,7 +823,8 @@ Networking
 
 Automation and debugging
   --ci                        Enable the CI socket; hide the window unless --ci-display
-  --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
+  --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
+                              iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
@@ -979,6 +985,13 @@ A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
 See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
+
+The Indy, Indigo2, O2 and Octane have snapshots. An Octane snapshot is
+refused with two processors or with an IMPACT or VPro board fitted: the stop
+does not yet bring both processors to one recorded instruction boundary, and
+neither board saves its state. Loading an Octane snapshot writes its boot flash and
+NVRAM over the configured flash and NVRAM files, so a PROM flashed since the
+save is replaced by the one the snapshot holds.
 
 ## PROM boot and console presets for embedded frontends
 

@@ -67,6 +67,18 @@ pub struct ScsiDeviceConfig {
     /// Gateway gets host .1, the guest gets host .2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subnet: Option<String>,
+    /// Hard disks only: the disk's write cache, as the caching mode page's WCE
+    /// bit. `true` (the default) reports it on: a plain write is complete once
+    /// the host has it, SYNCHRONIZE CACHE and FUA store what came before them,
+    /// and a background sync follows about 5 s after a write. A host crash or
+    /// power loss can lose that much, and a killed iris can lose it too when
+    /// the disk is a CHD. IRIX never sends SYNCHRONIZE CACHE or FUA, so it
+    /// cannot force a write out. `false` reports it off and stores every write
+    /// on the host's disk before the command completes, like the drives SGI
+    /// shipped; it is slower. A guest can change the bit with MODE SELECT.
+    /// STORAGE.md says what each setting loses.
+    #[serde(default = "default_write_cache")]
+    pub write_cache: bool,
     /// Enable copy-on-write overlay. Base image is never modified; writes go to
     /// `{path}.overlay`. Delete the overlay file to reset to clean state.
     #[serde(default)]
@@ -105,6 +117,11 @@ pub fn scsi_label(controller: u8, id: u8) -> String {
     if controller == 0 { format!("SCSI ID {id}") } else { format!("SCSI {controller}:{id}") }
 }
 
+/// A disk's write cache is on unless the configuration says otherwise.
+fn default_write_cache() -> bool {
+    true
+}
+
 impl Default for ScsiDeviceConfig {
     fn default() -> Self {
         Self {
@@ -114,6 +131,7 @@ impl Default for ScsiDeviceConfig {
             kind_field: ScsiKind::Disk,
             mac: None,
             subnet: None,
+            write_cache: true,
             overlay: false,
             scratch: false,
             size_mb: None,
@@ -331,6 +349,10 @@ pub enum NetMode {
     /// only (`MachineConfig::validate`); the Indy and Indigo2 always have a
     /// network.
     Off,
+    /// A private segment carried over a stream socket in QEMU's `-netdev
+    /// stream` framing, to a peer that serves it (`[network] stream`). iris
+    /// provides no gateway services on it.
+    Stream,
 }
 
 impl Default for NetMode {
@@ -362,6 +384,10 @@ pub struct NetworkConfig {
     /// Directory served read-only by the gateway's built-in rsh server (TCP
     /// 514). None (the default) disables it.
     pub rsh_dir: Option<std::path::PathBuf>,
+    /// Hold frames for the guest while its receive ring is about to end (Indy).
+    pub rx_hold: bool,
+    /// The peer for `NetMode::Stream`, as `tcp:IP:PORT` or `unix:PATH`.
+    pub stream: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -375,6 +401,8 @@ impl Default for NetworkConfig {
             nfs_pcap_ip: None,
             tftp_dir: None,
             rsh_dir: None,
+            rx_hold: true,
+            stream: None,
             mac: DEFAULT_MAC,
         }
     }
@@ -418,6 +446,16 @@ pub struct NetworkSection {
     /// executed on the host. Unset disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rsh_dir: Option<String>,
+    /// Indy: hold frames for the guest in the emulator while the next one
+    /// would end its receive ring before the driver has reaped the filled
+    /// descriptors, instead of letting the channel stop in the middle of the
+    /// driver's interrupt pass. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_hold: Option<bool>,
+    /// With `mode = "stream"`: the server of the private segment, as
+    /// `tcp:IP:PORT` or `unix:PATH` (QEMU `-netdev stream` framing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -609,6 +647,22 @@ pub enum GraphicsBoard {
     /// Maximum IMPACT (2 GE11, 2 RE4).
     #[clap(name = "maximpact", alias = "impact:max", alias = "max_impact")]
     MaxImpact,
+    /// VPro V6: BUZZ A, 32 MB. Octane only (`src/dev/odyssey`).
+    #[clap(name = "v6", alias = "vpro:v6", alias = "vpro_v6")]
+    V6,
+    /// VPro V8: BUZZ A, 128 MB. Octane only.
+    #[clap(name = "v8", alias = "vpro:v8", alias = "vpro_v8")]
+    V8,
+    /// VPro V10: BUZZ B, 32 MB. Octane only. It shipped only in the Octane2
+    /// and needs Crossbow 1.4, so the machine takes the Octane2's Crossbow and
+    /// Bridge revisions.
+    #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
+    V10,
+    /// VPro V12: BUZZ B, 128 MB. Octane only. It shipped only in the Octane2
+    /// and needs Crossbow 1.4, so the machine takes the Octane2's Crossbow and
+    /// Bridge revisions.
+    #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
+    V12,
     /// No graphics board: the machine runs on its serial console. Octane
     /// only.
     #[clap(name = "none")]
@@ -633,6 +687,10 @@ impl GraphicsBoard {
             Self::SolidImpact => "IMPACT Solid",
             Self::HighImpact => "IMPACT High",
             Self::MaxImpact => "IMPACT Maximum",
+            Self::V6 => "VPro V6",
+            Self::V8 => "VPro V8",
+            Self::V10 => "VPro V10",
+            Self::V12 => "VPro V12",
             Self::None => "None",
         }
     }
@@ -645,6 +703,10 @@ impl GraphicsBoard {
             Self::SolidImpact => "solidimpact",
             Self::HighImpact => "highimpact",
             Self::MaxImpact => "maximpact",
+            Self::V6 => "v6",
+            Self::V8 => "v8",
+            Self::V10 => "v10",
+            Self::V12 => "v12",
             Self::None => "none",
         }
     }
@@ -653,14 +715,19 @@ impl GraphicsBoard {
         matches!(self, Self::SolidImpact | Self::HighImpact | Self::MaxImpact)
     }
 
+    /// The VPro boards (`src/dev/odyssey`).
+    pub fn is_vpro(self) -> bool {
+        matches!(self, Self::V6 | Self::V8 | Self::V10 | Self::V12)
+    }
+
     /// Whether `validate()` accepts this board on `profile`. The Octane
     /// models only IMPACT (High as the SI with texture option, Maximum as
     /// the MXI) or no board.
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
-            MachineProfile::OctaneIp30 => self.is_impact() || self == Self::None,
-            MachineProfile::Indigo2Ip22 => self != Self::None,
-            _ => !matches!(self, Self::Extreme | Self::None),
+            MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
+            MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
+            _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
         }
     }
 
@@ -685,9 +752,13 @@ impl std::str::FromStr for GraphicsBoard {
             "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
             "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
             "maximpact" | "impact:max" | "max_impact" | "max-impact" | "maximumimpact" | "maximum_impact" | "maximum-impact" | "max" => Ok(Self::MaxImpact),
+            "v6" | "vpro:v6" | "vpro_v6" | "vpro-v6" => Ok(Self::V6),
+            "v8" | "vpro:v8" | "vpro_v8" | "vpro-v8" => Ok(Self::V8),
+            "v10" | "vpro:v10" | "vpro_v10" | "vpro-v10" => Ok(Self::V10),
+            "v12" | "vpro:v12" | "vpro_v12" | "vpro-v12" => Ok(Self::V12),
             "none" => Ok(Self::None),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, none)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, none)"
             )),
         }
     }
@@ -1663,12 +1734,34 @@ pub struct MachineConfig {
 
 fn default_scsi_deferred_int() -> bool { true }
 
-#[cfg(unix)]
-fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+/// The CI control socket when none is configured, for iris and iris-ci
+/// alike: `iris.sock` in the host's temporary directory (`$TMPDIR`, or
+/// `/tmp` when it is unset). On Windows, which takes a TCP address here,
+/// a loopback port.
+#[cfg(not(windows))]
+pub fn default_ci_socket() -> String {
+    ci_socket_in(&std::env::temp_dir())
+}
 #[cfg(windows)]
-fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
-#[cfg(not(any(unix, windows)))]
-fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+pub fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
+
+/// The default socket for the temporary directory `dir`.
+#[cfg(not(windows))]
+fn ci_socket_in(dir: &std::path::Path) -> String {
+    // `ci_socket` is a String, so a TMPDIR that is not UTF-8 gives a path
+    // with replacement characters; iris and iris-ci still agree on it.
+    dir.join("iris.sock").to_string_lossy().into_owned()
+}
+
+/// What to add when a connect to `path` fails: when `path` is the default
+/// Unix socket, that the default follows `TMPDIR`, so an iris started with
+/// another `TMPDIR` listens somewhere else. Nothing for a TCP address (the
+/// Windows default) or a path someone named.
+pub fn default_ci_socket_hint(path: &str) -> Option<&'static str> {
+    (path == default_ci_socket() && !ci_socket_is_tcp(path)).then_some(
+        "that is the default socket, in $TMPDIR (else /tmp); iris must run with the same \
+         TMPDIR, or give both the path (--ci-socket to iris, --socket or $IRIS_SOCKET here)")
+}
 
 /// True when `ci_socket` is a TCP `host:port` address (Windows CI default).
 pub fn ci_socket_is_tcp(path: &str) -> bool {
@@ -1997,7 +2090,7 @@ impl MachineConfig {
             }
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
-                    format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)")
+                    format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
                 } else {
                     format!("graphics.board \"{name}\" is only valid on the Octane")
                 });
@@ -2042,6 +2135,11 @@ impl MachineConfig {
             if dev.is_daynaport() && self.machine.profile == MachineProfile::O2Ip32 {
                 return Err(format!(
                     "scsi.{}: kind = \"daynaport\" is not available on the O2 (its Ethernet is built in)", key
+                ));
+            }
+            if dev.is_daynaport() && self.network.mode == NetMode::Stream {
+                return Err(format!(
+                    "scsi.{}: kind = \"daynaport\" cannot join a stream segment: [network] stream names the onboard Ethernet's peer", key
                 ));
             }
         }
@@ -2118,6 +2216,11 @@ impl MachineConfig {
         match (self.network.mode, self.machine.profile) {
             (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 => {
                 return Err("network.mode = \"off\" is only available on the O2 and the Octane for now; the Indy and Indigo2 always have their Ethernet".into());
+            }
+            (NetMode::Stream, _) => {
+                let ep = self.network.stream.as_deref()
+                    .ok_or_else(|| "network.mode = \"stream\" needs [network] stream = \"tcp:IP:PORT\" or \"unix:PATH\"".to_string())?;
+                crate::net::stream::StreamEndpoint::parse(ep).map_err(|e| format!("network.stream: {e}"))?;
             }
             _ => {}
         }
@@ -2222,6 +2325,8 @@ impl MachineConfig {
             mac,
             tftp_dir:     self.network.tftp_dir.as_ref().map(std::path::PathBuf::from),
             rsh_dir:      self.network.rsh_dir.as_ref().map(std::path::PathBuf::from),
+            rx_hold:      self.network.rx_hold.unwrap_or(true),
+            stream:       self.network.stream.clone(),
         }
     }
 
@@ -2311,6 +2416,14 @@ pub struct Cli {
     /// SCSI ID 7 image path (HDD)
     #[arg(long)]
     pub scsi7: Option<String>,
+
+    /// Report every hard disk's write cache off (`write_cache = false` in each
+    /// `[scsi.N]`): every write is stored on the host's disk before the guest
+    /// is told it is done, as on the drives SGI shipped. Slower. The default
+    /// is a write cache, which can lose about 5 s of writes in a host crash
+    /// (see STORAGE.md)
+    #[arg(long, default_value_t = false)]
+    pub no_write_cache: bool,
 
     /// Additional ISO images for CD-ROM ID 4 (can be specified multiple times)
     #[arg(long = "cdrom4-extra", value_name = "ISO")]
@@ -2475,7 +2588,7 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub ci: bool,
 
-    /// Override the default control-socket path (/tmp/iris.sock).
+    /// Override the default control-socket path (iris.sock in $TMPDIR, else /tmp).
     #[arg(long = "ci-socket", value_name = "PATH")]
     pub ci_socket: Option<String>,
 
@@ -2544,6 +2657,12 @@ impl Cli {
         if let Some(p) = self.cdrom5.clone() { apply_scsi(&mut cfg.scsi, 5, p, true, self.cdrom5_extra.clone()); }
         if let Some(p) = self.cdrom6.clone() { apply_scsi(&mut cfg.scsi, 6, p, true, self.cdrom6_extra.clone()); }
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
+
+        if self.no_write_cache {
+            for dev in cfg.scsi.values_mut().filter(|d| !d.cdrom && d.kind() == ScsiKind::Disk) {
+                dev.write_cache = false;
+            }
+        }
 
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
@@ -2726,7 +2845,9 @@ mod export_tests {
         assert_eq!(cfg.graphics_board(), GraphicsBoard::SolidImpact);
         cfg.validate().expect("default Octane");
         for (t, b) in [("none", GraphicsBoard::None), ("impact:solid", GraphicsBoard::SolidImpact),
-                       ("maximpact", GraphicsBoard::MaxImpact), ("highimpact", GraphicsBoard::HighImpact)] {
+                       ("maximpact", GraphicsBoard::MaxImpact), ("highimpact", GraphicsBoard::HighImpact),
+                       ("v6", GraphicsBoard::V6), ("vpro:v8", GraphicsBoard::V8), ("v10", GraphicsBoard::V10),
+                       ("v12", GraphicsBoard::V12), ("vpro:v12", GraphicsBoard::V12)] {
             let cfg = octane(&format!("[graphics]\nboard = \"{t}\""));
             assert_eq!(cfg.graphics_board(), b, "{t}");
             cfg.validate().expect(t);
@@ -2740,6 +2861,8 @@ mod export_tests {
         let cfg: MachineConfig = toml::from_str("").expect("parse");
         assert_eq!(cfg.graphics_board(), GraphicsBoard::Newport);
         assert!(!GraphicsBoard::None.supports(MachineProfile::IndyIp24));
+        assert!(!GraphicsBoard::V12.supports(MachineProfile::IndyIp24));
+        assert!(!GraphicsBoard::V12.supports(MachineProfile::Indigo2Ip22));
     }
 
     #[test]
@@ -2756,6 +2879,37 @@ mod export_tests {
         let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
         assert_eq!(back.audio.host, AudioHost::Pulseaudio);
         assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
+    }
+
+    #[test]
+    fn write_cache_defaults_on_and_round_trips() {
+        let cfg: MachineConfig = toml::from_str(r#"
+            [scsi.1]
+            path = "a.raw"
+            [scsi.2]
+            path = "b.raw"
+            write_cache = false
+        "#).expect("parse");
+        assert!(cfg.scsi[&1].write_cache, "the default");
+        assert!(!cfg.scsi[&2].write_cache);
+        assert!(ScsiDeviceConfig::default().write_cache, "the default in code");
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert!(back.scsi[&1].write_cache && !back.scsi[&2].write_cache, "survives export:\n{s}");
+        assert!(toml::from_str::<MachineConfig>("[scsi.1]\nwrite_cache = \"fast\"\n").is_err());
+    }
+
+    /// `--no-write-cache` turns the cache off for every disk, whatever the file says.
+    #[test]
+    fn no_write_cache_flag_turns_the_cache_off_for_every_disk() {
+        use clap::Parser;
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.insert(1, ScsiDeviceConfig { path: "a.raw".into(), ..Default::default() });
+        cfg.scsi.insert(2, ScsiDeviceConfig { path: "b.raw".into(), write_cache: true, ..Default::default() });
+        let on = Cli::parse_from(["iris"]).apply(cfg.clone());
+        assert!(on.scsi[&1].write_cache && on.scsi[&2].write_cache, "no flag, no change");
+        let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
+        assert!(!off.scsi[&1].write_cache && !off.scsi[&2].write_cache);
     }
 
     #[test]
@@ -2898,6 +3052,28 @@ mod export_tests {
         cfg.machine.cpu = CpuModel::R10000;
         cfg.scsi.insert(3, ScsiDeviceConfig { kind_field: ScsiKind::Daynaport, ..Default::default() });
         assert!(cfg.validate().unwrap_err().contains("daynaport"));
+    }
+
+    /// `mode = "stream"` needs a parseable `stream` peer, on every machine.
+    #[test]
+    fn stream_mode_needs_a_peer() {
+        for profile in [MachineProfile::default(), MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+            let mut cfg = MachineConfig::default();
+            cfg.machine.profile = profile;
+            if profile != MachineProfile::default() { cfg.machine.cpu = CpuModel::R10000; }
+            cfg.network.mode = NetMode::Stream;
+            assert!(cfg.validate().unwrap_err().contains("needs [network] stream"), "{profile:?}");
+            cfg.network.stream = Some("tcp:nope".into());
+            assert!(cfg.validate().unwrap_err().contains("network.stream"), "{profile:?}");
+            cfg.network.stream = Some("udp:127.0.0.1:7000".into());
+            assert!(cfg.validate().unwrap_err().contains("network.stream"), "{profile:?}");
+            cfg.network.stream = Some("tcp:127.0.0.1:7000".into());
+            cfg.validate().unwrap_or_else(|e| panic!("{profile:?}: {e}"));
+        }
+        let mut cfg: MachineConfig = toml::from_str("[network]\nmode = \"stream\"\nstream = \"unix:/run/x\"\n[scsi.4]\nkind = \"daynaport\"").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("cannot join a stream segment"));
+        cfg.scsi.clear();
+        assert_eq!(cfg.network().stream.as_deref(), Some("unix:/run/x"));
     }
 
     /// `banks` reads one to eight entries and pads; it writes four or more
@@ -3182,6 +3358,70 @@ mod rtc_offset_tests {
         cfg.rtc_offset = RtcOffset { years: -3, seconds: 27, ..Default::default() };
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert_eq!(toml::from_str::<MachineConfig>(&text).unwrap().rtc_offset, cfg.rtc_offset);
+    }
+}
+
+#[cfg(test)]
+mod ci_socket_tests {
+    use super::*;
+
+    /// The default socket is `iris.sock` in the temporary directory, and a
+    /// configuration that names none gets it. iris-ci takes its default from
+    /// the same function, so the two meet whenever they share `TMPDIR`.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_default_socket_is_in_the_temporary_directory() {
+        let want = std::env::temp_dir().join("iris.sock");
+        assert_eq!(std::path::Path::new(&default_ci_socket()), want);
+        assert_eq!(MachineConfig::default().ci_socket, default_ci_socket());
+        let parsed: MachineConfig = toml::from_str("").expect("parse");
+        assert_eq!(parsed.ci_socket, default_ci_socket());
+        assert!(!ci_socket_is_tcp(&default_ci_socket()));
+    }
+
+    /// Another temporary directory moves the socket into it.
+    #[cfg(not(windows))]
+    #[test]
+    fn another_temporary_directory_moves_the_socket() {
+        let dir = std::path::Path::new("/run/user/1000/iris-tmp");
+        assert_eq!(ci_socket_in(dir), "/run/user/1000/iris-tmp/iris.sock");
+        assert!(!ci_socket_is_tcp(&ci_socket_in(dir)));
+    }
+
+    /// A `TMPDIR` in the environment moves the default iris and iris-ci both
+    /// use. `TMPDIR` is process-wide, so this test runs itself again as a
+    /// child with it set, and the child prints what it resolves.
+    #[cfg(unix)]
+    #[test]
+    fn a_tmpdir_in_the_environment_moves_the_default_socket() {
+        const NAME: &str = "config::ci_socket_tests::a_tmpdir_in_the_environment_moves_the_default_socket";
+        if std::env::var_os("IRIS_TEST_PRINT_CI_SOCKET").is_some() {
+            println!("SOCKET={}", default_ci_socket());
+            return;
+        }
+        let dir = "/run/iris-test-tmpdir";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env("TMPDIR", dir)
+            .env("IRIS_TEST_PRINT_CI_SOCKET", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // The test harness prints its own words on the same line.
+        let got = stdout.split("SOCKET=").nth(1).and_then(|r| r.split_whitespace().next())
+            .unwrap_or_else(|| panic!("child said {stdout}"));
+        assert_eq!(got, "/run/iris-test-tmpdir/iris.sock");
+    }
+
+    /// The TMPDIR hint follows a failed connect to the default Unix socket
+    /// only: not a path someone named, and not a TCP address such as the
+    /// Windows default.
+    #[test]
+    fn the_tmpdir_hint_is_only_for_the_default_unix_socket() {
+        let default = default_ci_socket();
+        assert_eq!(default_ci_socket_hint(&default).is_some(), !ci_socket_is_tcp(&default));
+        assert_eq!(default_ci_socket_hint("/elsewhere/iris.sock"), None);
+        assert_eq!(default_ci_socket_hint("127.0.0.1:19851"), None);
     }
 }
 

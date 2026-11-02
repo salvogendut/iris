@@ -2373,6 +2373,15 @@ pub struct CodeSizeBucket {
     pub max_bytes: u32,
 }
 
+/// The workers read `pages` through raw pointers, and the fields drop in
+/// declaration order, so `pages` would be freed ahead of `compile_queue`'s
+/// own drop. Stop and join the workers first.
+impl Drop for Jitv2 {
+    fn drop(&mut self) {
+        self.compile_queue.stop();
+    }
+}
+
 impl Jitv2 {
     /// Allocate the full page pool up front, `capacity` slots, every one
     /// starting unclaimed (`PhysicalCodePage::new(UNCLAIMED_PFN, null)`) —
@@ -2852,6 +2861,14 @@ pub struct CompileQueue {
     quiesce_in_progress: Arc<AtomicBool>,
 }
 
+/// A queue dropped on its own (not inside a `Jitv2`) still must not leave
+/// its workers running: they hold the bus they compile from.
+impl Drop for CompileQueue {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl CompileQueue {
     /// Construct the queue without starting any worker threads. Call
     /// [`Self::start`] to spawn the pool.
@@ -3179,10 +3196,11 @@ impl CompileQueue {
     /// `set_queue_fill` again once no worker is running.
     pub fn stop(&mut self) -> Vec<crate::cpu::jitv2::codegen::Codegen> {
         self.running.store(false, Ordering::SeqCst);
-        let result: Vec<_> = self.threads.drain(..).enumerate().filter_map(|(i, h)| {
-            let r = h.join();
-            r.ok()
-        }).collect();
+        // A worker can hold the last reference for a moment (a flush upgrades
+        // its weak handles) and so run this from `Drop`; it is already on
+        // its way out and cannot join itself.
+        let me = std::thread::current().id();
+        let result: Vec<_> = self.threads.drain(..).filter(|h| h.thread().id() != me).filter_map(|h| h.join().ok()).collect();
         self.drain_pending_queue();
         crate::cpu::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
         result
@@ -5267,6 +5285,19 @@ mod tests {
         q.stop();
     }
 
+    /// Dropping a `Jitv2` joins its workers before the page array goes: they
+    /// read it, and hold the bus they compile from.
+    #[test]
+    fn dropping_a_jitv2_joins_its_workers() {
+        let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+        let mut jit = Jitv2::new(4);
+        let stats = jit.stats.clone();
+        jit.compile_queue.start(dev.clone(), stats);
+        assert!(Arc::strong_count(&dev) > 1, "the workers hold the bus");
+        drop(jit);
+        assert_eq!(Arc::strong_count(&dev), 1, "a worker outlived its Jitv2");
+    }
+
     /// Minimal `Device` (not `BusDevice`) stand-in for `CompileQueue::set_cpu` —
     /// tests that need `run_leader_flush`'s real flush path (not its
     /// no-cpu-wired recovery path) to actually run just need something a
@@ -5349,6 +5380,7 @@ mod tests {
         // real risk of firing under heavy system load, which isolated/
         // single-test runs never reproduce — hence why this wasn't caught
         // immediately).
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.start(dev, std::sync::Arc::new(JitStats::default()));
@@ -5409,6 +5441,7 @@ mod tests {
         // production) so this reasoning stays true regardless of future
         // default changes.
         let _max_instrs_guard = MaxInstrsGuard::set(usize::MAX);
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.start(dev, std::sync::Arc::new(JitStats::default()));
@@ -5471,6 +5504,7 @@ mod tests {
         // real leader-election/barrier contention among genuinely live
         // worker threads, not the single-worker degenerate case every other
         // test in this file exercises.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.set_thread_count(4);
