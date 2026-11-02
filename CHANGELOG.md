@@ -21,6 +21,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### JIT restart in embedded frontends
+
+- Keep priority compilation requests within their owning JIT pool. Restarting
+  a machine in the same frontend process no longer lets an old machine's
+  compiler consume the replacement's requests using the wrong memory contents.
+  This fixes the Indy PROM panic after changing serial routing and restarting.
+
 ### SGIEmu-inspired emulation optimizations
 
 - Keep guest GPR values in compiler SSA variables across native integer JIT

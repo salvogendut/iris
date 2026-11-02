@@ -210,16 +210,10 @@ pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 /// waits seconds behind that compile's backlog, measured with jitcov on IP28).
 pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
 
-/// The hot lane: a small second queue workers drain before the FIFO. One per
-/// process, like the JIT itself. Requests hold raw page pointers, so
-/// `CompileQueue::drain_pending` empties it too before any flush.
-pub static HOT_QUEUE: std::sync::LazyLock<crossbeam_queue::ArrayQueue<CompileRequest>> =
-    std::sync::LazyLock::new(|| crossbeam_queue::ArrayQueue::new(256));
-
 /// Put a copy of a request on the hot lane. A full lane just drops it: the
 /// page's FIFO request is still queued, so nothing is lost but the head start.
-pub fn push_hot_request(req: CompileRequest) {
-    let _ = HOT_QUEUE.push(req);
+pub fn push_hot_request(queue: &crossbeam_queue::ArrayQueue<CompileRequest>, req: CompileRequest) {
+    let _ = queue.push(req);
 }
 
 
@@ -2791,6 +2785,10 @@ pub struct CompileQueue {
     /// `push` returning `Err` on full rather than blocking — preserves
     /// §6.4's "drop on full, hot pages re-trigger" semantics exactly.
     queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+    /// Priority requests belong to this pool, just like the FIFO. A global
+    /// hot lane lets another machine's workers compile our raw page pointers
+    /// against their bus and publish code for the wrong memory contents.
+    hot_queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
     running: Arc<AtomicBool>,
     /// One `JoinHandle` per worker thread — empty when not running. Each
     /// thread hands back its own `Codegen` on exit (see `worker_loop`'s
@@ -2876,6 +2874,7 @@ impl CompileQueue {
         Self {
             mips4: crate::cpu::jitv2::isa::mips4_enabled(),
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
+            hot_queue: Arc::new(crossbeam_queue::ArrayQueue::new(256)),
             running: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             cpu: Mutex::new(None),
@@ -2977,6 +2976,11 @@ impl CompileQueue {
         self.queue.clone()
     }
 
+    /// Lock-free priority-lane handle for CPUs sharing this JIT pool.
+    pub fn hot_queue_handle(&self) -> Arc<crossbeam_queue::ArrayQueue<CompileRequest>> {
+        self.hot_queue.clone()
+    }
+
     /// Inject the CPU device handle — see the `cpu` field's doc comment for
     /// why this is a separate setter rather than a constructor parameter.
     /// Safe to call at any time (even while the worker is running); takes
@@ -3051,11 +3055,14 @@ impl CompileQueue {
     /// after. `req.page` is still safely dereferenceable here — the pool
     /// hasn't been cleared yet at either call site (see this function's own
     /// doc comment above for exactly why that ordering is guaranteed).
-    fn drain_pending(queue: &crossbeam_queue::ArrayQueue<CompileRequest>) {
+    fn drain_pending(
+        queue: &crossbeam_queue::ArrayQueue<CompileRequest>,
+        hot_queue: &crossbeam_queue::ArrayQueue<CompileRequest>,
+    ) {
         while let Some(req) = queue.pop() {
             unsafe { (*req.page).clear_scheduled(); }
         }
-        while let Some(req) = HOT_QUEUE.pop() {
+        while let Some(req) = hot_queue.pop() {
             unsafe { (*req.page).clear_scheduled(); }
         }
     }
@@ -3065,7 +3072,7 @@ impl CompileQueue {
     /// `drain_pending`'s own doc comment for why this must run and when
     /// it's safe to call (no worker concurrently popping).
     pub fn drain_pending_queue(&mut self) {
-        Self::drain_pending(&self.queue);
+        Self::drain_pending(&self.queue, &self.hot_queue);
     }
 
     /// Spawn the compile-thread pool with one freshly-reserved shared arena
@@ -3156,6 +3163,7 @@ impl CompileQueue {
         for i in 0..self.thread_count {
             let codegen = crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
             let queue = self.queue.clone();
+            let hot_queue = self.hot_queue.clone();
             let running = self.running.clone();
             let bus = bus.clone();
             let cpu = self.cpu.lock().clone();
@@ -3169,7 +3177,7 @@ impl CompileQueue {
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
+                    .spawn(move || Self::worker_loop(queue, hot_queue, running, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3342,6 +3350,7 @@ impl CompileQueue {
     /// worker up front and simply left running/idle after they all exit).
     fn worker_loop(
         queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+        hot_queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
         running: Arc<AtomicBool>,
         bus: Arc<dyn BusDevice>,
         mut codegen: crate::cpu::jitv2::codegen::Codegen,
@@ -3523,7 +3532,7 @@ impl CompileQueue {
                 // crash this was confirmed to cause). Safe to drain once
                 // here even though the queue is shared with every other
                 // (already-parked, not popping) worker.
-                Self::drain_pending(&queue);
+                Self::drain_pending(&queue, &hot_queue);
                 unsafe { jit.lock().flush_from_jit_thread(codegen.function_count()); }
                 // Build ONE fresh shared arena and rebuild this (leader's
                 // own) Codegen on top of it — every other, parked worker
@@ -3652,8 +3661,8 @@ impl CompileQueue {
                 continue;
             }
             // The hot lane first: pages being executed right now that are
-            // still waiting (see `HOT_QUEUE`).
-            match HOT_QUEUE.pop().or_else(|| queue.pop()) {
+            // still waiting in this pool's FIFO.
+            match hot_queue.pop().or_else(|| queue.pop()) {
                 Some(req) => {
                     // Always the deferred/non-forced path — never
                     // handle_request's forced-seal one. Forced sealing
@@ -5604,6 +5613,83 @@ mod tests {
         assert!(!page.is_scheduled(),
             "drain_pending must clear_scheduled() every request it discards, or the page is stuck \
              thinking a compile is still in flight for it forever");
+    }
+
+    #[test]
+    fn stopping_one_pool_preserves_another_pools_hot_requests() {
+        // A stopped frontend machine can coexist with its replacement.
+        // Draining either pool must only touch its own raw page pointers.
+        let mut first_page = PhysicalCodePage::new(0, std::ptr::null());
+        let mut second_page = PhysicalCodePage::new(0, std::ptr::null());
+        let mut first = CompileQueue::new();
+        let mut second = CompileQueue::new();
+        assert!(first_page.try_schedule_page());
+        assert!(second_page.try_schedule_page());
+        push_hot_request(&first.hot_queue_handle(), CompileRequest {
+            page: &mut first_page,
+            compiled_for_fr1: true,
+        });
+        push_hot_request(&second.hot_queue_handle(), CompileRequest {
+            page: &mut second_page,
+            compiled_for_fr1: true,
+        });
+
+        first.stop();
+        assert!(!first_page.is_scheduled());
+        assert!(second_page.is_scheduled());
+        assert_eq!(second.hot_queue.len(), 1);
+        second.stop();
+        assert!(!second_page.is_scheduled());
+        assert!(second.hot_queue.is_empty());
+    }
+
+    #[test]
+    fn compile_worker_cannot_take_another_pools_hot_request() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let old_bus: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+        let new_bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
+        let mut old_page = PhysicalCodePage::new(0, old_bus.gen_ptr(0));
+        let mut new_page = PhysicalCodePage::new(0, new_bus.gen_ptr(0));
+        let mut old = CompileQueue::new();
+        let mut new = CompileQueue::new();
+        old_page.mark_requested(0);
+        new_page.mark_requested(0);
+        assert!(old_page.try_schedule_page());
+        assert!(new_page.try_schedule_page());
+        push_hot_request(&new.hot_queue_handle(), CompileRequest {
+            page: &mut new_page,
+            compiled_for_fr1: true,
+        });
+        assert!(old.send(CompileRequest {
+            page: &mut old_page,
+            compiled_for_fr1: true,
+        }, &JitStats::default()));
+        old.start(old_bus.clone(), Arc::new(JitStats::default()));
+
+        // The worker checks its hot lane before the FIFO. Seeing the FIFO
+        // request finish proves it has already had a chance to steal the
+        // replacement's priority request; no timing-dependent sleep needed.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while old_page.is_scheduled() {
+                assert!(std::time::Instant::now() < deadline, "old worker did not process its FIFO");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(new_page.is_scheduled(), "old worker consumed the new machine's request");
+            assert_eq!(new.hot_queue.len(), 1);
+            old.stop();
+            assert!(new_page.is_scheduled(), "old pool's shutdown drained the new machine's request");
+
+            new.start(new_bus.clone(), Arc::new(JitStats::default()));
+            while !new_page.is_runnable(0) {
+                assert!(std::time::Instant::now() < deadline, "new worker never published its hot request");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }));
+        // Join workers before pages and buses drop, even if an assertion fails.
+        old.stop();
+        new.stop();
+        result.unwrap();
     }
 
     #[test]

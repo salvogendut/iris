@@ -65,6 +65,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
 | [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
+| [compile-queues-belong-to-the-pool.md](jitv2/compile-queues-belong-to-the-pool.md) | rule | Both compilation queues belong to their JIT pool; old machine workers must never consume the replacement's requests |
 | [compile-churn-avoidance-snapshot.md](jitv2/compile-churn-avoidance-snapshot.md) | design | Compile churn avoidance: skip a recompile whose inputs did not change |
 | [cop0-does-not-have-to-end-a-region.md](jitv2/cop0-does-not-have-to-end-a-region.md) | design | CP0 does not have to end a region |
 | [corpus-capture-from-the-pcp-cache.md](jitv2/corpus-capture-from-the-pcp-cache.md) | howto | Corpus capture: `j2 corpus`, and the two bitmaps that look interchangeable |

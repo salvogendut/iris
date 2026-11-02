@@ -16,7 +16,7 @@ a held slave for reconnects, and a bounded 64 KiB output queue with loss counts.
 Both endpoints must open before either is installed. Preserve drafts: allocate
 only on the machine worker after Save, never while editing or validating.
 
-## Performance-build restart limitation (2026-11-02)
+## Performance-build restart panic (fixed 2026-11-02)
 
 Diskless Indy with 128 MB and `console=d`: boot to System Maintenance Menu on
 PTY B, save a switch to a fixed TCP port, confirm restart, then Ctrl+P. The
@@ -24,9 +24,15 @@ PTY B, save a switch to a fixed TCP port, confirm restart, then Ctrl+P. The
 endpoint but PROM panics with a UTLB miss near PC `a8747cd8`. Reproduced with both
 Keep-existing and NetBSD boot preferences. The default-feature interpreter
 passes the same UI script. Quitting and launching the performance binary with
-the same saved NVRAM and TCP configuration reaches the PROM menu. The cause is
-not yet isolated; do not infer that TCP binding or PTY teardown failed.
+the same saved NVRAM and TCP configuration reaches the PROM menu.
 
-All five profiles pass fresh performance-build PTY boots, console input, pause,
-reconnect and quit/hangup checks. Configure routes before initial boot or
-relaunch the frontend after changing an already-booted machine.
+The process-global JIT priority queue allowed surviving compiler workers from
+the old device graph to consume the new machine's requests against the old bus.
+Making that queue local to its owning JIT pool fixes the diskless Indy restart
+with both Keep-existing and NetBSD presets. The tests also check cancellation,
+old PTY hangup, initial pause, the new TCP PROM menu, and port release on quit.
+See [the queue ownership rule](../jitv2/compile-queues-belong-to-the-pool.md).
+
+All five profiles previously passed fresh performance-build PTY boots, console
+input, pause, reconnect and quit/hangup checks. The restart fix was verified on
+Indy; it is not a claim that every profile's restart has been retested.

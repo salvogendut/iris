@@ -685,6 +685,11 @@ code into host code with Cranelift. The concepts:
   pfn map publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
   all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
+- **Compilation queues belong to the pool.** Both the ordinary FIFO and the
+  priority queue are shared only by that pool's CPUs and workers. Requests carry
+  raw page pointers and must be compiled against the owning machine's bus.
+  Replacing an embedded machine can leave its old device graph alive; its
+  workers and shutdown must never consume or drain the replacement's requests.
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 
