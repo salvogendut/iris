@@ -138,17 +138,22 @@ and clear their host queues when a machine stops or changes. The default
 factory is `None`, preserving standalone CPAL playback. The field is skipped
 by serde; it is an embedding API, not a TOML setting.
 
-Library frontends can apply saved PROM boot presets with
-`prom_env::prepare_boot_environment(&config, loader, filename, options)` before
-`workstation::build`. The caller must hold its machine-state lease and have no
-loaded workstation using those files. Run this on the worker: it reads and
-atomically replaces firmware state. It updates only OSLoader, OSLoadFilename
-and OSLoadOptions, preserving boot partitions, AutoLoad and other settings.
+Library frontends can apply saved PROM settings with
+`prom_env::prepare_environment(&config, boot, console)` before
+`workstation::build`. `boot` is an optional array of OSLoader, OSLoadFilename
+and OSLoadOptions; `console` optionally selects `Console::Graphics` (`g`) or
+`Console::Serial` (`d`). Each `None` independently preserves existing settings.
+The boot-only `prepare_boot_environment` wrapper remains available.
+The caller must hold its machine-state lease and have no loaded workstation
+using those files. Run this on the worker: it reads and replaces firmware state.
+Boot partitions, AutoLoad and unrelated settings remain unchanged.
 Indy/Indigo2 use fixed NVRAM/EEPROM fields, O2 uses its checksummed flash
-environment segment, and Octane uses persistent flash records. New Indy/Indigo2
-state receives firmware defaults; existing unrecognized or corrupt formats are
-errors. O2/Octane use the selected PROM to seed missing flash files. Omitting the
-call preserves the existing environment, including previously applied presets.
+environment segment, and Octane stores boot variables in flash but console in
+DS1685 NVRAM. New NVRAM receives defaults; existing unrecognized or corrupt
+formats are errors. O2/Octane use the selected PROM to seed missing flash files.
+All affected images are validated before writing. Each file replacement is
+atomic; a later write failure attempts to restore earlier files and reports any
+restoration failure. Octane's two-file update is not crash-atomic.
 
 ## 2. Data path and endianness
 

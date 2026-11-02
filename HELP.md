@@ -980,10 +980,10 @@ A snapshot refuses to load onto a different CPU model or host architecture. See
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
 See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
 
-## PROM boot presets for embedded frontends
+## PROM boot and console presets for embedded frontends
 
 A frontend may offer per-machine presets through
-`prom_env::prepare_boot_environment`. For example, Prismatic's General menu
+`prom_env::prepare_environment`. For example, Prismatic's General menu
 selects IRIX (`OSLoader=sash`, `OSLoadFilename=/unix`, `OSLoadOptions=auto`),
 NetBSD (`boot`, `netbsd.boot`, `auto`), or Keep existing. This is an embedding API,
 not a new Iris command-line option. The values take effect on the next cold
@@ -992,6 +992,14 @@ and kernels must already be installed on the selected disk.
 
 The helper supports the bundled PROM storage formats for Indy, both Indigo2
 profiles, O2 and Octane. Invalid checksums, unknown layouts, full environment
-storage and file errors fail without replacing the old state. A frontend should
+storage fail before replacing state. File replacements are atomic; if a later
+file fails, the helper attempts to restore earlier files. A frontend should
 show that error and allow Keep existing so the PROM can initialize its own
 state normally. Firmware-format support does not establish guest OS support.
+
+The console choice is independent: Graphics sets `console=g`, Serial sets
+`console=d`, and Keep existing leaves it alone. Connect a TCP terminal to
+`serial_port_b` on Indy/Indigo2 or `serial_port_a` on O2/Octane for the first
+guest serial console. Selecting serial does not change the configured TCP ports
+or create a terminal in the frontend window. The graphics display may be blank
+while firmware uses serial. Existing baud rates and OS boot settings survive.

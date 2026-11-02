@@ -350,6 +350,11 @@ is the internal bus, 1 the external) and `[graphics] board`. See [the Octane gui
 |---|---|---|
 | `octane.flash` | unset | Boot flash file, keeping the PROM's records between runs. Created from `prom` when missing and then used as it is, so delete it after changing `prom`; a file of another size is refused. Unset, the flash is in memory and every start is from `prom`. |
 
+Embedded frontends may use `prom_env::prepare_environment` to select boot
+variables and graphics/serial PROM console independently, before constructing a
+workstation. This library API adds no Iris TOML key or command-line flag; see
+[PROM presets](HELP.md#prom-boot-and-console-presets-for-embedded-frontends).
+
 ### Hardware constraints and precedence
 
 On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only
