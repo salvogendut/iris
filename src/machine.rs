@@ -416,7 +416,7 @@ impl Machine {
         let [port_a, port_b] = cfg.serial_ports();
         let ci_serial = ci_enabled.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
         let label = format!("{tag} serial channel B");
-        let (console, _) = crate::dev::serial_host::serial_line(
+        let (console, _) = crate::dev::serial_host::serial_line_with_override(
             &crate::dev::serial_host::SerialLine {
                 label: &label,
                 tcp_port: Some(port_b),
@@ -426,12 +426,13 @@ impl Machine {
             },
             serial_log.clone(),
             ci_serial.as_ref(),
+            cfg.serial_backends.b.as_ref(),
         );
         ioc.scc().set_backend_b(console);
         let label = format!("{tag} serial channel A");
         let log_a = crate::dev::serial_host::open_log_at(
             &cfg, cfg.serial_log_a.as_deref(), &label, crate::dev::serial_host::LogMode::Append);
-        let (channel_a, _) = crate::dev::serial_host::serial_line(
+        let (channel_a, _) = crate::dev::serial_host::serial_line_with_override(
             &crate::dev::serial_host::SerialLine {
                 label: &label,
                 tcp_port: (!ci_enabled).then_some(port_a),
@@ -441,6 +442,7 @@ impl Machine {
             },
             log_a,
             None,
+            cfg.serial_backends.a.as_ref(),
         );
         ioc.scc().set_backend_a(channel_a);
         let timer_manager = Arc::new(TimerManager::new());

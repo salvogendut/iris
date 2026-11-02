@@ -1477,6 +1477,11 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_port_b: Option<u16>,
 
+    /// Frontend-owned transports, replacing TCP/Unix endpoints per channel.
+    /// Runtime-only; absent entries retain normal Iris serial configuration.
+    #[serde(skip)]
+    pub serial_backends: crate::dev::serial_host::HostBackends,
+
     /// Unix socket paths that serve serial channels A and B as well as their
     /// TCP ports: raw bytes, one client at a time. Where the machine has a CI
     /// socket, a console on a socket is also still readable through
@@ -1793,6 +1798,7 @@ impl Default for MachineConfig {
             monitor_port: None,
             serial_port_a: None,
             serial_port_b: None,
+            serial_backends: Default::default(),
             serial_socket_a: None,
             serial_socket_b: None,
             keyboard: KeyboardLayout::default(),

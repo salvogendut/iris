@@ -229,6 +229,16 @@ console, or a log tee. A UART's transmit is instant and its receive side
 pulls from the backend with back-pressure (`pump`), so nothing in the model
 needs a thread of its own beyond the service loop's call.
 
+Embedded frontends can supply `MachineConfig.serial_backends.a`/`.b` as
+`Arc<dyn SerialBackend>` transports before constructing any supported machine.
+These runtime-only fields are skipped by serde. An override replaces that
+channel's TCP/Unix endpoints; log tees and CI fanout remain active. `None`
+preserves standalone behavior. Both callbacks run on device threads and must
+be nonblocking. The first guest console is B on Indy/Indigo2, A on O2/Octane.
+Frontends should revoke/close host resources explicitly on unload: device graph
+references can outlive the Workstation. Prismatic uses revocable handles for its
+TCP and Unix PTY routes so a stopped label cannot retain a socket or terminal.
+
 ### The physical address map
 
 `Physical` (`src/physical.rs`) is the physical bus, and it belongs to no

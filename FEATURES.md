@@ -355,6 +355,11 @@ variables and graphics/serial PROM console independently, before constructing a
 workstation. This library API adds no Iris TOML key or command-line flag; see
 [PROM presets](HELP.md#prom-boot-and-console-presets-for-embedded-frontends).
 
+Library users may supply `MachineConfig.serial_backends.a`/`.b` to replace a
+channel's host transport while retaining logs and CI fanout. These handles are
+not serialized; standalone serial settings keep their existing behavior. See
+[embedded serial transports](HELP.md#embedded-serial-transports).
+
 ### Hardware constraints and precedence
 
 On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only

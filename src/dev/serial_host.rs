@@ -26,6 +26,23 @@ pub trait SerialBackend: Send + Sync {
     fn recv_byte(&self) -> io::Result<u8>;
 }
 
+/// Optional runtime transports supplied by an embedding frontend.
+/// Implementations must use nonblocking I/O; UART threads call them directly.
+#[derive(Clone, Default)]
+pub struct HostBackends {
+    pub a: Option<Arc<dyn SerialBackend>>,
+    pub b: Option<Arc<dyn SerialBackend>>,
+}
+
+impl std::fmt::Debug for HostBackends {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostBackends")
+            .field("a", &self.a.is_some())
+            .field("b", &self.b.is_some())
+            .finish()
+    }
+}
+
 /// Drops TX bytes and never yields RX. Used as a placeholder when a channel
 /// isn't wired to a host I/O source (e.g. CI mode unused channel).
 pub(crate) struct NullBackend;
@@ -552,6 +569,25 @@ pub fn serial_line(
     }
 }
 
+/// Use a frontend transport instead of opening TCP/Unix endpoints, retaining
+/// log tees and CI fanout. No override preserves the standalone behavior.
+pub fn serial_line_with_override(
+    line: &SerialLine,
+    log: Option<Arc<SerialLog>>,
+    ci: Option<&Arc<CiSerialBackend>>,
+    host: Option<&Arc<dyn SerialBackend>>,
+) -> (Arc<dyn SerialBackend>, bool) {
+    let Some(host) = host else { return serial_line(line, log, ci); };
+    if let Some(ci) = ci {
+        if let Some(log) = log { ci.set_log(log); }
+        return (Arc::new(FanoutBackend(vec![ci.clone(), host.clone()])), true);
+    }
+    match log {
+        Some(log) => (Arc::new(TeeBackend::new(host.clone(), log)), true),
+        None => (host.clone(), true),
+    }
+}
+
 /// The host ends of a machine's two serial ports: `(console, second)`.
 ///
 /// The console is the CI backend in CI mode, otherwise TCP on
@@ -568,7 +604,7 @@ pub fn console_backends(
     let [port_a, port_b] = cfg.serial_ports();
     let log = open_log(cfg, tag, LogMode::Fresh);
     let label = format!("{tag} serial port 1");
-    let (console, _) = serial_line(
+    let (console, _) = serial_line_with_override(
         &SerialLine {
             label: &label,
             tcp_port: Some(port_a),
@@ -578,10 +614,11 @@ pub fn console_backends(
         },
         log,
         ci,
+        cfg.serial_backends.a.as_ref(),
     );
     let label = format!("{tag} serial port 2");
     let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label, LogMode::Fresh);
-    let (second, served) = serial_line(
+    let (second, served) = serial_line_with_override(
         &SerialLine {
             label: &label,
             tcp_port: Some(port_b),
@@ -591,6 +628,7 @@ pub fn console_backends(
         },
         log,
         None,
+        cfg.serial_backends.b.as_ref(),
     );
     (console, served.then_some(second))
 }
@@ -598,6 +636,59 @@ pub fn console_backends(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontend_transports_replace_listeners_and_preserve_logging_and_ci() {
+        let dir = std::env::temp_dir().join(format!("iris-host-override-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("serial.log");
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let host = Arc::new(CiSerialBackend::new());
+        let backend: Arc<dyn SerialBackend> = host.clone();
+        let ci = Arc::new(CiSerialBackend::new());
+        let line = SerialLine {
+            label: "Embedded", tcp_port: Some(port), tcp_setting: "port",
+            socket: Some("/no/such/parent/must-not-be-opened.sock"), socket_setting: "socket",
+        };
+        let log = SerialLog::create(&path, Default::default()).unwrap();
+        let (wired, served) = serial_line_with_override(&line, Some(log), Some(&ci), Some(&backend));
+        assert!(served);
+        wired.send_byte(b'x');
+        assert_eq!(host.drain_guest(), b"x");
+        assert_eq!(ci.drain_guest(), b"x");
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        host.push_host(b"h");
+        assert_eq!(wired.recv_byte().unwrap(), b'h');
+        ci.push_host(b"c");
+        assert_eq!(wired.recv_byte().unwrap(), b'c');
+        let log = SerialLog::create(&path, Default::default()).unwrap();
+        let (wired, _) = serial_line_with_override(&line, Some(log), None, Some(&backend));
+        wired.send_byte(b'y');
+        assert_eq!(host.drain_guest(), b"y");
+        assert_eq!(std::fs::read(&path).unwrap(), b"y");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn embedded_channels_are_independent_and_never_serialize_host_handles() {
+        let a = Arc::new(CiSerialBackend::new());
+        let b = Arc::new(CiSerialBackend::new());
+        let mut cfg = MachineConfig::default();
+        cfg.serial_backends.a = Some(a.clone());
+        cfg.serial_backends.b = Some(b.clone());
+        let (first, second) = console_backends(&cfg, "Embedded", None);
+        first.send_byte(b'a');
+        second.unwrap().send_byte(b'b');
+        assert_eq!(a.drain_guest(), b"a");
+        assert_eq!(b.drain_guest(), b"b");
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("serial_backends"));
+        let loaded: MachineConfig = toml::from_str(&text).unwrap();
+        assert!(loaded.serial_backends.a.is_none());
+        assert!(loaded.serial_backends.b.is_none());
+    }
+
 
     /// The console is the CI backend in CI mode and TCP otherwise, either
     /// teed to the same fresh log, and the second port comes up on its own.

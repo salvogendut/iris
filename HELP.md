@@ -1003,3 +1003,16 @@ The console choice is independent: Graphics sets `console=g`, Serial sets
 guest serial console. Selecting serial does not change the configured TCP ports
 or create a terminal in the frontend window. The graphics display may be blank
 while firmware uses serial. Existing baud rates and OS boot settings survive.
+
+## Embedded serial transports
+
+Prismatic's Advanced > Connections selects TCP, Pseudoterminal (Unix), or Off
+independently for each serial channel. It exposes the active TCP address or PTY
+path in Connection status. A terminal such as minicom can attach to the PTY;
+no external bridge is required. Routing and TCP port preferences are saved per
+label, with changes applied on the next boot/restart. PROM `console=d` selects
+the first guest serial console; it does not select the host transport.
+
+This uses Iris's runtime-only `MachineConfig.serial_backends` API. It does not
+add standalone TOML/CLI settings or change existing TCP/Unix socket defaults.
+Serial logging and CI access continue to work with supplied host transports.
