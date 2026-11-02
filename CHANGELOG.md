@@ -78,6 +78,33 @@ hashes are given where a change is easiest to understand by reading the commit.
   Selecting embedded Indy firmware with an empty PROM path reports an
   informational message instead of a missing-file warning.
 
+### O2 graphics tracing
+
+- `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,
+  or `IRIS_O2_TRACE` from power-on; `gputrace` builds) writes one annotated
+  trace for the rendering engine, GBE and CRIME, in the format of the other
+  boards, each primitive decoded with the registers it runs with.
+- `re rec FILE` records the engine's writes for the offline replay test.
+- Perfetto shows engine busy, interface buffer level and stalls, primitives,
+  GBE timing interrupts and shadow latches.
+
+### O2 dithering
+
+- GL lines, points and rectangles into 16-bit double-buffered windows now
+  dither as triangles do. `re dither on|off` compares renderings.
+
+## October 2026
+
+### Octane snapshots
+
+- **The Octane saves and restores snapshots**: the monitor's `save` and `load`,
+  and iris-ci's `save`, `restore` and `rollback`. A snapshot holds the CPU, every
+  device, all RAM, the boot flash and each SCSI controller's copy-on-write
+  overlays, in the O2's format. Restoring also rewrites the configured flash and
+  NVRAM files, and the guest's clocks resume from the time they showed at the save.
+- A two-processor Octane, or one with an IMPACT or VPro board, refuses a save or
+  load and says why.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
@@ -328,6 +355,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest screen from the display caches when no renderer is present. With
   a GUI renderer attached it still returns the readback that renderer
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
+- **The default CI socket is `iris.sock` in the host's temporary directory**,
+  `$TMPDIR` when it is set and `/tmp` otherwise, for both `iris` and `iris-ci`.
+  With `TMPDIR` unset nothing moves. macOS sets `TMPDIR` for every login, so
+  there the default is now under `/var/folders/.../T/`. The two meet through
+  the default only when both run with the same `TMPDIR` (the old literal met
+  whatever the environment); otherwise pass the path to both, `--ci-socket`
+  and `--socket`. A failed connect to the default now says so. A script that
+  names `/tmp/iris.sock` itself should pass `--ci-socket` to iris as well.
+  `tools/iris-test` takes the same default, and puts its default screenshot in
+  the same directory. Windows keeps `127.0.0.1:19851`.
+- **The monitor's `dt file` without a path** writes `iris_trace.txt` in the
+  same temporary directory, instead of always `/tmp/iris_trace.txt`.
 ### SGI Octane (IP30)
 
 - **Octane compile workers start after the memory windows are published.** A
@@ -369,6 +408,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   flags, window-ID modes and VC3 tables, the draw bank, the interrupt lines
   and, on the Octane, the HEART packets and acknowledgements
   (docs/perfetto.md).
+- **The Octane takes the VPro boards**: `[graphics] board = "v6"`,
+  `"v8"`, `"v10"` or `"v12"` puts a port of QEMU's VPro (Odyssey) model
+  on the graphics port; IRIX needs an install with the VPro driver, and
+  the V10 and V12 bring the Octane2's Crossbow 1.4 with them. The board's front end and raster unit each
+  run on a thread of their own and the display on a third, so long GL
+  streams no longer hold up the processor.
+  (`src/dev/odyssey`)
 - **The Octane takes the textured IMPACT boards.** `[graphics] board =
   "highimpact"` is the SI with texture option and `"maximpact"` the MXI
   (two GEs, two REs), with the board version bytes the IP30 kernel decodes;
@@ -838,6 +884,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   named `seeq-net`, `daynaN-net`, `ip32-mec-net` and `ip30-eth-net`.
 - `mode = "pcap"` is allowed on the O2 and the Octane, untested on a real
   interface.
+- `[network] mode = "stream"` connects an Ethernet to a program speaking
+  QEMU's `-netdev stream` framing (not a DaynaPort).
 
 ### UI / input
 

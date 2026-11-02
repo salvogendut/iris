@@ -638,7 +638,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
 # keyboard = "ansi"             # host keyboard shape: "ansi", "iso" or "jis" (see Keyboard)
 # ci = false                    # CI control socket (see README)
-# ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
+# ci_socket = "/tmp/iris.sock"  # default: iris.sock in $TMPDIR, else /tmp; Windows: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
 
@@ -656,7 +656,7 @@ cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
-board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"
+board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
@@ -792,7 +792,7 @@ Configuration
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
-  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact
+  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
   --cpu <MODEL>               r4400 (default), r5000, or r10000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
@@ -820,7 +820,8 @@ Networking
 
 Automation and debugging
   --ci                        Enable the CI socket; hide the window unless --ci-display
-  --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
+  --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
+                              iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
@@ -981,3 +982,10 @@ A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
 See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
+
+The Indy, Indigo2, O2 and Octane have snapshots. An Octane snapshot is
+refused with two processors or with an IMPACT or VPro board fitted: the stop
+does not yet bring both processors to one recorded instruction boundary, and
+neither board saves its state. Loading an Octane snapshot writes its boot flash and
+NVRAM over the configured flash and NVRAM files, so a PROM flashed since the
+save is replaced by the one the snapshot holds.

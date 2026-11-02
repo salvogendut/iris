@@ -97,6 +97,11 @@ are not checkpointed. CHD diff overlays and the second Newport head's framebuffe
 also lack complete snapshot coverage; do not treat these snapshots as full VM
 backups.
 
+The O2 and the Octane save in this format too. An Octane snapshot covers one
+processor and no graphics board: with two processors or an IMPACT or VPro board
+fitted, a save or load is refused with the reason. Neither board's state is
+saved.
+
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```
 save base/desktop          # writes saves/base/desktop/
@@ -133,9 +138,13 @@ for the format and its gotchas.
 
 `--ci` enables a control socket for headless automation, plus a
 small in-process serial backend so the harness can drive the IRIX console
-directly. The default is the Unix socket `/tmp/iris.sock`; on Windows it is TCP
-`127.0.0.1:19851`. `--ci` hides the host window unless you add `--ci-display`,
-while keeping offscreen graphics alive for screenshots. Explicit `--headless`
+directly. The default is the Unix socket `iris.sock` in the temporary
+directory (`$TMPDIR`, else `/tmp`); on Windows it is TCP `127.0.0.1:19851`.
+`iris` and `iris-ci` (and `tools/iris-test`) find each other through the
+default only when they run with the same `TMPDIR`; otherwise give both the
+path, `--ci-socket` to iris and `--socket` or `$IRIS_SOCKET` to iris-ci.
+`--ci` hides the host window unless you add `--ci-display`, while keeping
+offscreen graphics alive for screenshots. Explicit `--headless`
 disables Newport graphics. Use `--serial-log FILE` to keep a transcript of the
 IRIX console.
 
