@@ -979,3 +979,19 @@ A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
 See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
+
+## PROM boot presets for embedded frontends
+
+A frontend may offer per-machine presets through
+`prom_env::prepare_boot_environment`. For example, Prismatic's General menu
+selects IRIX (`OSLoader=sash`, `OSLoadFilename=/unix`, `OSLoadOptions=auto`),
+NetBSD (`boot`, `netbsd.boot`, `auto`), or Keep existing. This is an embedding API,
+not a new Iris command-line option. The values take effect on the next cold
+boot; disk/partition choices and AutoLoad remain unchanged. Matching loaders
+and kernels must already be installed on the selected disk.
+
+The helper supports the bundled PROM storage formats for Indy, both Indigo2
+profiles, O2 and Octane. Invalid checksums, unknown layouts, full environment
+storage and file errors fail without replacing the old state. A frontend should
+show that error and allow Keep existing so the PROM can initialize its own
+state normally. Firmware-format support does not establish guest OS support.

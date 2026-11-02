@@ -138,6 +138,18 @@ and clear their host queues when a machine stops or changes. The default
 factory is `None`, preserving standalone CPAL playback. The field is skipped
 by serde; it is an embedding API, not a TOML setting.
 
+Library frontends can apply saved PROM boot presets with
+`prom_env::prepare_boot_environment(&config, loader, filename, options)` before
+`workstation::build`. The caller must hold its machine-state lease and have no
+loaded workstation using those files. Run this on the worker: it reads and
+atomically replaces firmware state. It updates only OSLoader, OSLoadFilename
+and OSLoadOptions, preserving boot partitions, AutoLoad and other settings.
+Indy/Indigo2 use fixed NVRAM/EEPROM fields, O2 uses its checksummed flash
+environment segment, and Octane uses persistent flash records. New Indy/Indigo2
+state receives firmware defaults; existing unrecognized or corrupt formats are
+errors. O2/Octane use the selected PROM to seed missing flash files. Omitting the
+call preserves the existing environment, including previously applied presets.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit

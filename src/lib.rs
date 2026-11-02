@@ -234,6 +234,7 @@ pub mod video_source;
 pub mod ultra_proto;
 pub mod crash_diag;
 mod nv_storage;
+pub mod prom_env;
 pub mod hwwatch;
 #[macro_use]
 mod perfetto_macros;
