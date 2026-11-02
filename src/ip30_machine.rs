@@ -453,6 +453,7 @@ impl OctaneMachine {
             xbow: xbow.clone(),
             bridge: bridge.clone(),
             gfx: gfx.clone(),
+            vpro: vpro.clone(),
         }));
         for c in &scsi {
             monitor.register_device(c.clone());
@@ -1121,6 +1122,7 @@ struct Ip30Monitor {
     xbow: Arc<Xbow>,
     bridge: Arc<Bridge>,
     gfx: Option<Arc<ImpactXio>>,
+    vpro: Option<Arc<Odyssey>>,
 }
 
 const IP30_SUBCOMMANDS: &str = "ip30 unmapped | memcfg | bridge | gfx | xbow";
@@ -1166,13 +1168,18 @@ impl Ip30Monitor {
                 }
                 s
             }
-            "gfx" => match &self.gfx {
-                Some(g) => format!(
+            "gfx" => match (&self.vpro, &self.gfx) {
+                (Some(v), _) => format!(
+                    "Odyssey/VPro on widget {WIDGET_GFX}: link {}, identification {:#010x}\n",
+                    if self.xbow.carries(WIDGET_GFX) { "up" } else { "down" },
+                    v.read32(widget_small_base(WIDGET_GFX) + 4).data
+                ),
+                (_, Some(g)) => format!(
                     "IMPACT on widget {WIDGET_GFX}: link {}, identification {:#010x}\n",
                     if self.xbow.carries(WIDGET_GFX) { "up" } else { "down" },
                     g.read32(widget_small_base(WIDGET_GFX) + 4).data
                 ),
-                None => "no graphics board\n".into(),
+                _ => "no graphics board\n".into(),
             },
             "xbow" => self
                 .xbow
@@ -1222,6 +1229,35 @@ mod tests {
         assert_eq!(prom_revision(b"no banner here"), None);
         assert!((4, 3) < vpro_prom_needed(crate::config::GraphicsBoard::V12));
         assert!((4, 3) >= vpro_prom_needed(crate::config::GraphicsBoard::V6));
+    }
+
+    /// Diagnostics identify the fitted Odyssey through its widget, and
+    /// retaining it for diagnostics must not keep a dropped machine alive.
+    #[test]
+    fn the_graphics_monitor_reports_each_odyssey_board() {
+        use crate::config::{GraphicsBoard, MachineProfile};
+        use crate::display_stop_tests::{big_stack, config, scratch};
+        let dir = scratch("octane-vpro-monitor");
+        for (board, identity) in [
+            (GraphicsBoard::V6, "0x2c013047"),
+            (GraphicsBoard::V10, "0xac013047"),
+            (GraphicsBoard::V12, "0xac013047"),
+        ] {
+            let cfg = config(&dir, MachineProfile::OctaneIp30, board);
+            let machine = big_stack(move || OctaneMachine::new(&cfg).expect("Octane"));
+            let monitor = Ip30Monitor {
+                phys: machine.phys.clone(), ram: machine.ram.clone(),
+                xbow: machine.xbow.clone(), bridge: machine.bridge.clone(),
+                gfx: machine.gfx.clone(), vpro: machine.vpro.clone(),
+            };
+            let report = monitor.text("gfx").unwrap();
+            assert!(report.contains("Odyssey/VPro") && report.contains("link up") && report.contains(identity), "{board:?}: {report}");
+            drop(monitor);
+            let phys = Arc::downgrade(&machine.phys.phys);
+            drop(machine);
+            assert_eq!(phys.strong_count(), 0, "{board:?}: graphics diagnostics retained the bus");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A dropped Octane frees its bus and with it the decode table: a

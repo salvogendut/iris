@@ -670,6 +670,18 @@ pub enum GraphicsBoard {
 }
 
 impl GraphicsBoard {
+    /// Boards with a graphical display on IP30, shared by frontend pickers.
+    /// The serial-only `None` choice is offered separately where supported.
+    pub const OCTANE: [Self; 7] = [
+        Self::SolidImpact,
+        Self::HighImpact,
+        Self::MaxImpact,
+        Self::V6,
+        Self::V8,
+        Self::V10,
+        Self::V12,
+    ];
+
     pub const ALL: [Self; 6] = [
         Self::Newport,
         Self::Xz,
@@ -721,8 +733,7 @@ impl GraphicsBoard {
     }
 
     /// Whether `validate()` accepts this board on `profile`. The Octane
-    /// models only IMPACT (High as the SI with texture option, Maximum as
-    /// the MXI) or no board.
+    /// models IMPACT, Odyssey/VPro, or no board.
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,

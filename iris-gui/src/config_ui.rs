@@ -633,9 +633,8 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     }
 }
 
-/// The Octane's graphics port holds an IMPACT board (Solid, High as the SI
-/// with texture option, Maximum as the MXI) or nothing (`[graphics] board
-/// = "none"`); the other boards are not modelled there.
+/// The Octane's graphics port holds an IMPACT or Odyssey/VPro board,
+/// or nothing (`[graphics] board = "none"`) for a serial console.
 fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     let fitted = cfg.graphics_board();
     let mut choice = fitted;
@@ -646,7 +645,7 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
             ComboBox::from_id_salt("octane_graphics")
                 .selected_text(name(choice))
                 .show_ui(ui, |ui| {
-                    for b in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
+                    for b in GraphicsBoard::OCTANE {
                         ui.selectable_value(&mut choice, b, b.label());
                     }
                     ui.selectable_value(&mut choice, GraphicsBoard::None, t!("config-octane-graphics-none"));
