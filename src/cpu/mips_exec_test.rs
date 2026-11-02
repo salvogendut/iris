@@ -245,6 +245,33 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
     }
 
+    #[test]
+    fn octane_cpu_models_identify_and_execute_mips_iv_after_reset() {
+        use crate::cpu::mips_cache_shadow::{R10000OctaneShadowCache, R12000ShadowCache, R14000ShadowCache};
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(prid: u32, fir: u32, l2: usize) {
+            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            for reset in [false, true] {
+                if reset { exec.core.reset(false); }
+                assert_eq!(exec.core.read_cp0(15), prid as u64);
+                assert_eq!(exec.core.fpu_fir, fir);
+                let config = exec.core.read_cp0(16);
+                assert_eq!(0x80000usize << ((config >> 16) & 7), l2);
+                assert_eq!(64 << ((config >> 13) & 1), C::L2_LINE);
+                assert_eq!(exec.core.tlb_entries, 64);
+                assert_eq!((C::VA_BITS, C::PA_BITS), (44, 40));
+                // MOVN is MIPS IV: execute it, rather than only testing a flag.
+                exec.core.write_gpr(1, 0x1234);
+                exec.core.write_gpr(2, 1);
+                assert_eq!(exec.exec(make_r(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVN)), EXEC_COMPLETE);
+                assert_eq!(exec.core.read_gpr(3), 0x1234);
+            }
+        }
+        check::<R10000OctaneShadowCache>(0x0927, 0x0900, 1 << 20);
+        check::<R12000ShadowCache>(0x0e23, 0x0e00, 2 << 20);
+        check::<R14000ShadowCache>(0x0f24, 0x0f00, 2 << 20);
+    }
+
     // Instruction builders
     fn make_r(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | ((rs & 0x1F) << 21) | ((rt & 0x1F) << 16) | ((rd & 0x1F) << 11) | ((sa & 0x1F) << 6) | (funct & 0x3F)

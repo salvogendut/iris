@@ -51,7 +51,7 @@ config-cpu-subtitle =
 config-r10000-subtitle =
 config-cache-model = Cache model
 config-cache-model-tip = Full is fastest with the interpreter, Shadow with the JIT.
-config-cache-shadow-only = Shadow (the only R10000 option)
+config-cache-shadow-only = Shadow (the only R10000-family option)
 config-cache-auto-shadow = Auto (shadow)
 config-cache-auto-full = Auto (full)
 config-cache-full = Full
@@ -417,7 +417,7 @@ config-ci-test-subtitle =
 
 ## Octane
 
-config-octane-subtitle = An R10000 at 195 MHz. Needs the IP30 PROM image; there is no built-in PROM.
+config-octane-subtitle = An R10000 at 195 MHz, R12000 at 300 MHz or R14000 at 600 MHz. Uses the bundled IP30 PROM unless you choose another image.
 config-octane-flash = Flash file
 config-octane-flash-tip = Keeps the PROM's saved records between runs. Created from the PROM image when missing.
 config-octane-graphics-none = None

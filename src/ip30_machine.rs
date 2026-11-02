@@ -1,4 +1,4 @@
-//! The Octane (IP30) as a machine: an R10000 on HEART, the Crossbow, and
+//! The Octane (IP30) as a machine: an R10000-family CPU on HEART, the Crossbow, and
 //! the widgets behind it, with iris's CPU thread, monitor and front ends.
 //!
 //! Selected with `[machine] profile = "octane_ip30"`; the shared keys
@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::{CpuModel, MachineConfig};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_shadow::{R10000OctaneShadowCache, R12000ShadowCache, R14000ShadowCache};
+use crate::cpu::mips_cache_v2::CpuModel as CacheCpuModel;
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
@@ -156,8 +157,8 @@ pub struct OctaneMachine {
 
 impl OctaneMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        if cfg.machine.cpu != CpuModel::R10000 {
-            return Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into());
+        if !CpuModel::OCTANE.contains(&cfg.machine.cpu) {
+            return Err("an Octane requires cpu = r10000, r12000 or r14000".into());
         }
         let prom = crate::firmware::load_flash_prom(
             &cfg.prom,
@@ -200,7 +201,8 @@ impl OctaneMachine {
         // (007-4210-003) requires Crossbow 1.4 for them. Choosing one gives
         // the machine the Octane2's Crossbow (revision 5) and Bridge
         // (revision 4); there is no separate option for the machine.
-        let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12);
+        let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12)
+            || cfg.machine.cpu == CpuModel::R14000;
         let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
         let timer_manager = Arc::new(TimerManager::new());
@@ -213,7 +215,14 @@ impl OctaneMachine {
         // The PROM's diagnostics hold it to the processors HEART reports: a
         // PM10 has one and a PM20 two.
         let module = if cpu_count > 1 { "PM20" } else { "PM10" };
-        heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
+        let part = match (cfg.machine.cpu, cpu_count) {
+            (CpuModel::R12000, 1) => "030-1355-001",
+            (CpuModel::R12000, _) => "030-1356-001",
+            (CpuModel::R14000, 1) => "030-1776-001",
+            (CpuModel::R14000, _) => "030-1778-001",
+            _ => "030-0888-004",
+        };
+        heart.set_microlan(record_bus("EMUU00", part, "B", module, 0x5145_4d55_5500));
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
         let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
@@ -346,7 +355,7 @@ impl OctaneMachine {
             if has_vpro { kind.label() } else { board.map_or("no graphics", |b| b.label()) }
         );
 
-        let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
+        let count_hz = cfg.clock.fixed_mhz.map_or(cfg.machine.cpu.octane_count_hz().expect("validated Octane CPU"), |mhz| (mhz * 1_000_000.0) as u64);
         let flash_lines: Vec<_> = (0..cpu_count)
             .map(|_| {
                 let bus: Arc<dyn BusDevice> = phys.phys.clone();
@@ -358,7 +367,19 @@ impl OctaneMachine {
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
         let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| {
+                macro_rules! build {
+                    ($cache:ty) => {
+                        Self::build_cpu::<$cache>(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone())
+                    };
+                }
+                match cfg.machine.cpu {
+                    CpuModel::R10000 => build!(R10000OctaneShadowCache),
+                    CpuModel::R12000 => build!(R12000ShadowCache),
+                    CpuModel::R14000 => build!(R14000ShadowCache),
+                    _ => unreachable!("validated Octane CPU"),
+                }
+            })
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -569,7 +590,7 @@ impl OctaneMachine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_cpu(
+    fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>> + 'static>(
         id: u8,
         cpu_count: u8,
         memory: Arc<crate::memory_map::MemoryMap>,
@@ -579,16 +600,14 @@ impl OctaneMachine {
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
     ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
+        let cfg = MipsCpuConfig::for_model::<C>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
-        exec.cache = R10000ShadowCache::from(cached as Arc<dyn BusDevice>);
+        exec.cache = C::from(cached as Arc<dyn BusDevice>);
         exec.core.set_timer_manager(tm.clone());
         exec.core.set_count_hz(count_hz);
         exec.core.fasttick_count = fasttick;
-        exec.core.reset_prid = OCTANE_PRID;
-        exec.core.cp0_prid = OCTANE_PRID;
         // IRIX zeroes Count and arms Compare a few instructions later; see
         // `MipsCore::count_write_samples`.
         exec.core.count_write_samples = true;
@@ -597,7 +616,7 @@ impl OctaneMachine {
         exec.phys_mask = (1 << 40) - 1;
         exec.core.cpu_id = id;
         exec.core.smp = cpu_count > 1;
-        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
+        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             LAST_PC[id as usize].store(exec.core.pc, Ordering::Relaxed);
         }));
         Arc::new(MipsCpu::new(exec))
@@ -1257,6 +1276,44 @@ mod tests {
             drop(machine);
             assert_eq!(phys.strong_count(), 0, "{board:?}: graphics diagnostics retained the bus");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn octane_cpu_selection_reaches_each_processor_and_survives_power_on() {
+        use crate::config::{GraphicsBoard, MachineProfile};
+        use crate::display_stop_tests::{big_stack, config, scratch};
+        let dir = scratch("octane-cpu-models");
+        for (model, prid, fir, hz, ss) in [
+            (CpuModel::R10000, OCTANE_PRID as u64, 0x0900, OCTANE_COUNT_HZ, 1),
+            (CpuModel::R12000, 0x0e23, 0x0e00, 150_000_000, 2),
+            (CpuModel::R14000, 0x0f24, 0x0f00, 300_000_000, 2),
+        ] {
+            for count in [1, 2] {
+                let mut cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::None);
+                cfg.machine.cpu = model;
+                cfg.machine.cpus = count;
+                let m = big_stack(move || OctaneMachine::new(&cfg).unwrap());
+                for reset in [false, true] {
+                    if reset { m.power_on_all(); }
+                    assert_eq!(m.cpus.len(), count as usize);
+                    for cpu in &m.cpus {
+                        let state = cpu.save_state();
+                        let cp0 = &state["cp0"];
+                        assert_eq!(crate::snapshot::field_u64(cp0, "cp0_prid").unwrap(), prid);
+                        assert_eq!(crate::snapshot::field_u64(cp0, "count_hz").unwrap(), hz);
+                        assert_eq!((crate::snapshot::field_u64(cp0, "cp0_config").unwrap() >> 16) & 7, ss);
+                        assert_eq!(crate::snapshot::field_u64(&state["fpu"], "fpu_fir").unwrap(), fir);
+                    }
+                }
+            }
+        }
+        let mut cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::None);
+        cfg.machine.cpu = CpuModel::R14000;
+        cfg.clock.fixed_mhz = Some(123.0);
+        let m = big_stack(move || OctaneMachine::new(&cfg).unwrap());
+        assert_eq!(crate::snapshot::field_u64(&m.cpus[0].save_state()["cp0"], "count_hz").unwrap(), 123_000_000);
+        drop(m);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

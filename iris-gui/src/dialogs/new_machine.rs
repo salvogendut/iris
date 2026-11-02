@@ -167,9 +167,7 @@ impl NewMachineDialog {
                     let octane = self.profile == MachineProfile::OctaneIp30;
                     let o2 = self.profile == MachineProfile::O2Ip32;
                     ui.label(t!("dialog-new-machine-cpu"));
-                    // Only the CPUs this machine can be built with. The Octane
-                    // has one (the 195 MHz R10000), so its row is not a choice
-                    // at all; an O2 refuses an R4400.
+                    // Only the CPUs implemented for this machine.
                     let cpus = self.profile.cpus();
                     ui.add_enabled_ui(cpus.len() > 1, |ui| {
                         ComboBox::from_id_salt("nm_cpu")
@@ -180,9 +178,6 @@ impl NewMachineDialog {
                                 }
                             });
                     });
-                    if octane {
-                        ui.label(RichText::new(cpus[0].label()).weak());
-                    }
                     ui.end_row();
 
                     if !octane {

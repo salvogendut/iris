@@ -243,7 +243,7 @@ impl O2Machine {
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
             CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
             CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
+            _ => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
         // ppmem: the CPU's cache and the JIT reach RAM through the memory's

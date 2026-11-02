@@ -2283,15 +2283,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             c |= log2(32768) << 26;          // 32 KB L1D
             c |= 1 << 15;                    // big endian
             if C::L2_LINE == 128 { c |= 1 << 13; }
-            // Secondary cache size. The encoding is not in anything to hand,
-            // so it was swept against the PROM rather than guessed.
-            //
-            // 1 is the value to keep: IRIX reports "Secondary unified
-            // instruction/data cache size: 1 Mbyte", which agrees with this
-            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
-            // and IRIX boots with it. 4 also passes POST but has IRIX report
-            // 8 MB, contradicting the model.
-            c |= 1 << 16;
+            // R10K-family SS encodes 512 KB << SS (Linux c-r4k.c,
+            // setup_scache). Derive it from the actual cache arrays so
+            // PROM diagnostics and the guest's cache flush loops agree.
+            c |= (C::L2_SIZE / (512 * 1024)).trailing_zeros() << 16;
             c |= 2;                          // K0 = uncached at reset
             config = c;
         }

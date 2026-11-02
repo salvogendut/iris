@@ -531,7 +531,7 @@ pub enum MachineProfile {
     /// `src/ip32_machine.rs`.
     O2Ip32,
     /// SGI Octane IP30: HEART, the Crossbow and the onboard Bridge, with an
-    /// R10000. Configured by the shared keys and the `[octane]` section; see
+    /// R10000, R12000 or R14000. Configured by the shared keys and the `[octane]` section; see
     /// `src/ip30_machine.rs` and `docs/Octane/ip30-address-map.md`.
     OctaneIp30,
 }
@@ -604,17 +604,16 @@ impl MachineProfile {
     }
 
     /// The CPU models this machine can be built with. The O2 has an R5000 or
-    /// an R10000 (an R4400 is refused when the machine is built, not by
-    /// `validate()`); the Octane shipped only with the 195 MHz R10000; the
-    /// Indy and the Indigo2 take any of the three.
+    /// an R10000; the Octane also offers R12000 and R14000. The shared
+    /// Indy/Indigo2 implementation retains its existing three CPU choices.
     ///
     /// Single source of truth for the front-ends' Processor pickers, so they
     /// cannot offer a CPU the machine will refuse.
     pub fn cpus(self) -> &'static [CpuModel] {
         match self {
-            Self::OctaneIp30 => &[CpuModel::R10000],
+            Self::OctaneIp30 => &CpuModel::OCTANE,
             Self::O2Ip32 => &[CpuModel::R5000, CpuModel::R10000],
-            _ => &CpuModel::ALL,
+            _ => &[CpuModel::R4400, CpuModel::R5000, CpuModel::R10000],
         }
     }
 
@@ -890,16 +889,38 @@ pub enum CpuModel {
     /// the Indigo2 IMPACT (IP28). The machine uses shadow cache arrays;
     /// see `docs/indigo2-ip28.md` and `src/cpu/mips_cache_shadow.rs`.
     R10000,
+    /// Octane R12000, 300 MHz, 2 MB secondary cache, MIPS IV.
+    R12000,
+    /// Octane R14000A, 600 MHz, 2 MB secondary cache, MIPS IV.
+    R14000,
 }
 
 impl CpuModel {
-    pub const ALL: [Self; 3] = [Self::R4400, Self::R5000, Self::R10000];
+    pub const ALL: [Self; 5] = [Self::R4400, Self::R5000, Self::R10000, Self::R12000, Self::R14000];
+    pub const OCTANE: [Self; 3] = [Self::R10000, Self::R12000, Self::R14000];
+
+    pub fn is_r10k_family(self) -> bool {
+        matches!(self, Self::R10000 | Self::R12000 | Self::R14000)
+    }
+
+    /// Default CP0 Count rate on IP30, half the nominal processor clock.
+    /// These are guest timer rates, not host execution-speed targets.
+    pub fn octane_count_hz(self) -> Option<u64> {
+        match self {
+            Self::R10000 => Some(97_500_000),
+            Self::R12000 => Some(150_000_000),
+            Self::R14000 => Some(300_000_000),
+            _ => None,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::R4400 => "MIPS R4400",
             Self::R5000 => "MIPS R5000",
             Self::R10000 => "MIPS R10000",
+            Self::R12000 => "MIPS R12000",
+            Self::R14000 => "MIPS R14000",
         }
     }
 }
@@ -915,7 +936,7 @@ impl CpuModel {
 ///   need no tag check against it.
 /// - `auto`: `shadow` in a `jitv2` build, `full` otherwise.
 ///
-/// The R10000 (IP28) only has the shadow model.
+/// The R10000 family only has the shadow model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "lower")]
@@ -930,7 +951,7 @@ impl CacheModel {
     /// Whether `cpu` runs the shadow cache under this setting.
     pub fn is_shadow(self, cpu: CpuModel) -> bool {
         match (cpu, self) {
-            (CpuModel::R10000, _) => true,
+            (cpu, _) if cpu.is_r10k_family() => true,
             (_, Self::Full) => false,
             (_, Self::Shadow) => true,
             (_, Self::Auto) => cfg!(feature = "jitv2"),
@@ -2082,6 +2103,11 @@ impl MachineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if matches!(self.machine.cpu, CpuModel::R12000 | CpuModel::R14000)
+            && self.machine.profile != MachineProfile::OctaneIp30
+        {
+            return Err("R12000 and R14000 are currently modelled only on Octane".into());
+        }
         if self.machine.cpus != 1 && self.machine.profile != MachineProfile::OctaneIp30 {
             return Err(format!("[machine] cpus = {}: only the Octane has more than one processor", self.machine.cpus));
         }
@@ -2501,7 +2527,7 @@ pub struct Cli {
     pub cpu: Option<CpuModel>,
 
     /// Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`),
-    /// `full` or `shadow`. Overrides `[machine] cache`. The R10000 is always
+    /// `full` or `shadow`. Overrides `[machine] cache`. The R10000 family is always
     /// `shadow`.
     #[arg(long = "cache", value_name = "MODEL")]
     pub cache: Option<CacheModel>,
@@ -2806,6 +2832,27 @@ pub fn parse_nat_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, std::net::Ipv
 #[cfg(test)]
 mod export_tests {
     use super::*;
+
+    #[test]
+    fn octane_new_cpus_roundtrip_and_are_rejected_on_other_profiles() {
+        for cpu in [CpuModel::R12000, CpuModel::R14000] {
+            let mut cfg = MachineConfig::default();
+            cfg.machine.profile = MachineProfile::OctaneIp30;
+            cfg.machine.cpu = cpu;
+            cfg.banks = banks_from4([128, 0, 0, 0]);
+            cfg.validate().unwrap();
+            let text = toml::to_string(&cfg).unwrap();
+            let loaded: MachineConfig = toml::from_str(&text).unwrap();
+            assert_eq!(loaded.machine.cpu, cpu);
+            for profile in MachineProfile::ALL {
+                if profile == MachineProfile::OctaneIp30 { continue; }
+                cfg.machine.profile = profile;
+                assert!(!profile.cpus().contains(&cpu));
+                assert!(cfg.validate().unwrap_err().contains("only on Octane"));
+            }
+            assert!(CacheModel::Full.is_shadow(cpu));
+        }
+    }
 
     #[test]
     fn toml_export_roundtrips() {

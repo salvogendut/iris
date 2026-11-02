@@ -4,8 +4,9 @@ The Octane is SGI's 1997 workstation: one or two R10000s on HEART (the memory
 controller and interrupt hub), a Crossbow switch joining the widgets, the
 onboard Bridge (XIO to PCI) carrying two QLogic ISP1040 SCSI controllers, the
 IOC3 I/O chip (serial ports, keyboard and mouse, the clock, Ethernet) and RAD
-audio, and a graphics board on one of the XIO ports. IRIS emulates a
-single-processor Octane with a 195 MHz R10000.
+audio, and a graphics board on one of the XIO ports. IRIS offers one or two
+R10000, R12000 or R14000 processors; the default remains a 195 MHz R10000.
+The IRIX boot results below were obtained with the R10000.
 
 With the stock IP30 PROM (the 879,312-byte image, SHA-256 `ee4722ca6f9b821f…`)
 and an installed IRIX 6.5.30 disk, the machine boots to a serial login.
@@ -20,9 +21,9 @@ example `playaiff`) comes out of the host's audio device; `no_audio` turns it
 off. `reboot` comes back to the login prompt. jitv2 builds run it too.
 
 iris-gui runs the Octane as well: choose "SGI Octane (IP30)" as the platform.
-The editor fixes the CPU at the R10000, offers the three IMPACT boards or no
-graphics board, limits banks to 64 to 512 MB filled from bank 0, and asks for the IP30
-PROM image and an optional flash file. The Indy and Indigo2 NVRAM seeding and
+The editor offers R10000/R12000/R14000 CPUs, three IMPACT boards, four VPro
+boards or no graphics board. It accepts an optional IP30 PROM image and
+flash file; otherwise the bundled PROM is used. The Indy and Indigo2 NVRAM seeding and
 Ethernet-address row do not apply and are skipped.
 
 ## Configure the machine
@@ -59,9 +60,54 @@ overlay = true
 ```
 
 Paths are relative to the directory iris runs in. Every key is listed in
-[FEATURES.md](../FEATURES.md). `machine.cpu` must be `r10000`. `[clock]
-fixed_mhz` sets CP0 Count; unset it is 97.5 MHz, half of the R10000's
-195 MHz pipeline clock.
+[FEATURES.md](../FEATURES.md). Octane accepts these `machine.cpu` values:
+
+| CPU | Nominal clock | CP0 Count | PRId / FIR | Secondary cache |
+| --- | --- | --- | --- | --- |
+| `r10000` (default) | 195 MHz | 97.5 MHz | `0x0927` / `0x0900` | 1 MB |
+| `r12000` | 300 MHz | 150 MHz | `0x0e23` / `0x0e00` | 2 MB |
+| `r14000` (R14000A) | 600 MHz | 300 MHz | `0x0f24` / `0x0f00` | 2 MB |
+
+`machine.cpus = 2` fits two identical processors. `[clock] fixed_mhz`
+overrides **Count**, which ticks at half the processor clock on these CPUs.
+It does not set the host's emulation throughput. Selecting R14000 also
+selects the Octane2 Crossbow/Bridge revisions, independently of graphics.
+
+All three use the existing MIPS IV executor, 64-entry TLB, 44-bit virtual
+and 40-bit physical addresses, 32 KB two-way instruction/data caches, and
+the R10000 family's CACHE operations. The secondary cache uses two ways
+and 128-byte lines. The larger shadow arrays and CP0 Config size agree;
+PRId and FIR survive reset, and snapshots distinguish the newer models.
+R12000/R14000 are currently accepted only for Octane, not O2 or IP28.
+
+This is functional emulation: it does not simulate out-of-order execution,
+branch prediction, speculative cache fills, silicon errata, or model-specific
+performance-counter events and pipeline timing. The existing shadow-cache
+limitations still apply. New CPU validation covers register/cache behavior
+and bundled-PROM startup; it does not establish a NetBSD or IRIX boot.
+The bundled 4.9 PROM displays the V12 console with both new CPUs. Serial
+`hinv -v` also reports two 300 MHz R12000s or two 600 MHz R14000s, with 2 MB
+secondary cache each and ODYSSEY graphics. Reproduce without host sockets:
+
+```sh
+cargo run --example odyssey-prom-smoke --features pcap,idle-pause,perfetto,jitv2 -- \
+  v12 /tmp/new-r14000-probe 60 r14000 2 serial
+```
+
+Use a new output directory; `serial-a.log` records the inventory. Without
+any disks the PROM reports SCSI diagnostics, which the probe acknowledges
+before entering the command monitor.
+
+Hardware references: [SGI Octane2 datasheet](https://ftp.jurassic.nl/pub/irix/press/2679.pdf)
+(R14000A clocks and 2 MB cache),
+[SGI desktop periodic table](https://nekofiles.irixnet.org/Documents/Periodic_Tables/SGIPeriodTabJun2001.pdf)
+(Octane R12000 modules),
+[NetBSD CP0 definitions](https://github.com/NetBSD/src/blob/trunk/sys/arch/mips/include/cpuregs.h)
+(processor implementation codes), and
+[Linux cache probing](https://github.com/torvalds/linux/blob/master/arch/mips/mm/c-r4k.c)
+(`setup_scache`: 512 KB shifted by Config.SS, two ways, 64/128-byte lines).
+The minor PRId revisions are representative profile choices, not a claim
+that every Octane module uses the same silicon revision.
 
 ## PROM and flash
 

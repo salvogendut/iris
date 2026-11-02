@@ -281,8 +281,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
         // way its RAM does.
-        // Only the CPUs this machine can be built with: the Octane has one,
-        // the 195 MHz R10000, and an O2 refuses an R4400.
+        // Offer only CPUs implemented for this machine.
         ui.add_enabled_ui(!mem_ctx.running, |ui| {
             ComboBox::from_id_salt("cpu_model")
                 .selected_text(cfg.machine.cpu.label())
@@ -297,7 +296,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // `[machine] cache`. The R10000 only has the shadow model, so the
         // choice is fixed there.
         ui.label(t!("config-cache-model"));
-        let r10k = cfg.machine.cpu == CpuModel::R10000;
+        let r10k = cfg.machine.cpu.is_r10k_family();
         ui.add_enabled_ui(!mem_ctx.running && !r10k, |ui| {
             let shown = if r10k { t!("config-cache-shadow-only") } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
             ComboBox::from_id_salt("cache_model")
@@ -314,10 +313,11 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         ui.label(t!("config-clock"));
         ui.horizontal(|ui| {
-            // CP0 Count: half the CPU clock on the R10000 machines (the Octane's
-            // is 195 MHz) and on the O2 (90 MHz); a third of it on the Indy and
-            // the Indigo2 (33 MHz).
-            let auto_default = if cfg.machine.profile.ip28() || octane {
+            // CP0 Count is half the selected Octane CPU clock; the O2 defaults
+            // to 90 MHz, IP28 to 97.5 MHz and the Indy/IP22 to 33 MHz.
+            let auto_default = if octane {
+                cfg.machine.cpu.octane_count_hz().unwrap_or(97_500_000) as f64 / 1_000_000.0
+            } else if cfg.machine.profile.ip28() {
                 97.5
             } else if o2 {
                 90.0

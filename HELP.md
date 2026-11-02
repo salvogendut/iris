@@ -652,7 +652,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 
 [machine]
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
-cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
+cpu     = "r4400"           # "r5000" or "r10000" (--cpu); Octane also accepts "r12000" and "r14000"; use R10000 on IP28
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
@@ -661,7 +661,7 @@ heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 [clock]
-# fixed_mhz = 33            # Count MHz: default 33 on IP22/IP24, 97.5 on IP28
+# fixed_mhz = 33            # Count MHz: IP22/IP24 33, IP28 97.5; Octane R10K 97.5, R12K 150, R14K 300
 
 # [rtc_offset]              # guest clock start, relative to host time (all signed)
 # years   = -18             # years/months step the calendar (Mar 31 -1 month = Feb 28/29)
@@ -795,7 +795,7 @@ Configuration
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
   --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
-  --cpu <MODEL>               r4400 (default), r5000, or r10000
+  --cpu <MODEL>               r4400 (default), r5000, r10000; Octane also r12000, r14000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
 

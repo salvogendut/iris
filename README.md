@@ -64,7 +64,7 @@ boots to a usable system: shell, networking, X11, the works.
   (IntelliMouse wheel included), HAL2 audio, and IndyCam video-in through VINO
 - **Indigo2 IP22:** Newport, GR2 XZ/Extreme, and IMPACT graphics; two SCSI controllers
 - **Indigo2 IP28:** R10000, IMPACT graphics, and up to 1 GB with two 512 MB banks
-- R4400, R5000, or R10000 CPU, selected per machine at runtime
+- R4400, R5000, or R10000 CPU, selected per machine at runtime; Octane also offers R12000 and R14000
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental),
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
   optional REX3 shader JIT (`rex-jit`), an IMPACT raster pipeline JIT

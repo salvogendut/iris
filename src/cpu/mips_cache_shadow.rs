@@ -344,7 +344,11 @@ impl<
     const NAME: &'static str = match MODEL {
         model::R4400 => "R4400",
         model::R5000 => "R5000",
-        _ => "shadow",
+        _ => match (PRID >> 8) & 0xff {
+            0x0e => "R12000",
+            0x0f => "R14000",
+            _ => "shadow",
+        },
     };
     const CACHE_KIND: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
@@ -733,6 +737,18 @@ impl<
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
+/// IP30's R10000 revision 2.7; retain the historical "shadow" snapshot name.
+pub type R10000OctaneShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0927, 0x0000_0900, 64, { model::R10000 }>;
+
+/// Octane R12000 rev 2.3 and R14000A rev 2.4, with 2 MB secondary caches.
+/// Both retain the R10000 family's ISA, TLB, address widths and CACHE opcodes.
+/// Pipeline scheduling/speculation and cache latency are not simulated.
+pub type R12000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0e23, 0x0000_0e00, 64, { model::R10000 }>;
+pub type R14000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0f24, 0x0000_0f00, 64, { model::R10000 }>;
+
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
 ///
 /// The O2 PROM (4.18 and earlier) handles only that line size. With Config's
@@ -958,6 +974,27 @@ mod tests {
         same::<R4400ShadowCache, R4400Cache>();
         same::<R5000ShadowCache, R5000Cache>();
         assert_eq!(<R10000ShadowCache as CpuModel>::NAME, "shadow", "existing IP28 snapshots");
+    }
+
+    #[test]
+    fn octane_larger_secondary_cache_keeps_both_megabytes_and_ways_separate() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let c = C::from(Arc::new(Memory::new(1)) as Arc<dyn BusDevice>);
+            // The old 1 MB cache aliases these indices within each way.
+            let indices = [0, 1, 0x80000, 0x80001, 0xfff80, 0xfff81];
+            for (i, &index) in indices.iter().enumerate() {
+                c.cache_op(C_IST | CACH_SD, index, 0x1000 + i as u64);
+                c.cache_op(C_R10K_ISD | CACH_SD, index, 0x1122_3344_0000 + i as u64);
+            }
+            for (i, &index) in indices.iter().enumerate() {
+                assert_eq!(c.cache_op(C_ILT | CACH_SD, index, 0), 0x1000 + i as u64);
+                assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, index, 0), 0x1122_3344_0000 + i as u64);
+            }
+        }
+        check::<R12000ShadowCache>();
+        check::<R14000ShadowCache>();
+        assert_ne!(R12000ShadowCache::NAME, R14000ShadowCache::NAME, "snapshots must reject another CPU model");
+        assert_ne!(R12000ShadowCache::NAME, R10000OctaneShadowCache::NAME);
     }
 
     /// The O2 R10000 differs from the IP28's only in its secondary line size.
