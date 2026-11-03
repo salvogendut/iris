@@ -521,6 +521,34 @@ fn emit_calculate_fb_address(
     (px_ptr, x_curr, y_curr)
 }
 
+/// Same physical RGB24 plane decoding as rex3_generic::rgb24_planes_to_bgr.
+/// Emit this in the prologue, once per draw rather than once per pixel.
+fn rgb24_planes_to_bgr_ir(b: &mut FunctionBuilder, v: Value) -> Value {
+    fn component(b: &mut FunctionBuilder, v: Value) -> Value {
+        let mut c = b.ins().band_imm_s(v, 0x249249);
+        for (shift, mask) in [(2, 0x0c30c3), (4, 0x00f00f), (8, 0x0000ff)] {
+            let shifted = b.ins().ushr_imm_s(c, shift);
+            let joined = b.ins().bor(c, shifted);
+            c = b.ins().band_imm_s(joined, mask);
+        }
+        let reversed = b.ins().bitrev(c);
+        b.ins().ushr_imm_s(reversed, 24)
+    }
+    let rv = b.ins().ushr_imm_s(v, 1);
+    let bv = b.ins().ushr_imm_s(v, 2);
+    let r = component(b, rv);
+    let g = component(b, v);
+    let blue = component(b, bv);
+    let g = b.ins().ishl_imm_s(g, 8);
+    let blue = b.ins().ishl_imm_s(blue, 16);
+    let rg = b.ins().bor(r, g);
+    b.ins().bor(rg, blue)
+}
+
+fn uses_rgb24_planes(dm1: &Dm1) -> bool {
+    dm1.planes() == DRAWMODE1_PLANES_RGB && dm1.rgbmode() && dm1.drawdepth() == 3
+}
+
 /// Mirrors the inner body of Rex3::process_pixel_draw / process_pixel_fastclear
 /// after `calculate_fb_address` succeeds.
 /// `src_color`: already-resolved source (colorback substitution applied by caller).
@@ -717,6 +745,7 @@ fn emit_shader(
     let yend_v    = ld32!(ctx_off!(yend));
     let xywin_v   = ld32!(ctx_off!(xywin));
     let wrmask_v  = ld32!(ctx_off!(wrmask));
+    let wrmask_v = if uses_rgb24_planes(dm1) { rgb24_planes_to_bgr_ir(&mut b, wrmask_v) } else { wrmask_v };
 
     // Conditional ctx loads: the JIT key already proves whether these are used,
     // so loading them unconditionally put dead loads in every shader prologue.
@@ -730,6 +759,9 @@ fn emit_shader(
     let colorvram_v = if dm1.fastclear() {
         ld32!(ctx_off!(colorvram))
     } else { c0_early };
+    let colorvram_v = if dm1.fastclear() && uses_rgb24_planes(dm1) {
+        rgb24_planes_to_bgr_ir(&mut b, colorvram_v)
+    } else { colorvram_v };
     // colorback feeds backblend and the opaque-pattern (zpopaque/lsopaque) select.
     let colorback_v = if dm1.backblend() || dm0.zpopaque() || dm0.lsopaque() {
         ld32!(ctx_off!(colorback))
@@ -1816,6 +1848,7 @@ fn emit_draw_iline(
     let yend_v    = ld32!(ctx_off!(yend));
     let xywin_v   = ld32!(ctx_off!(xywin));
     let wrmask_v  = ld32!(ctx_off!(wrmask));
+    let wrmask_v = if uses_rgb24_planes(dm1) { rgb24_planes_to_bgr_ir(&mut b, wrmask_v) } else { wrmask_v };
 
     // Conditional ctx loads: the JIT key already proves whether these are used,
     // so loading them unconditionally put dead loads in every shader prologue.
@@ -1829,6 +1862,9 @@ fn emit_draw_iline(
     let colorvram_v = if dm1.fastclear() {
         ld32!(ctx_off!(colorvram))
     } else { c0_early };
+    let colorvram_v = if dm1.fastclear() && uses_rgb24_planes(dm1) {
+        rgb24_planes_to_bgr_ir(&mut b, colorvram_v)
+    } else { colorvram_v };
     // colorback feeds backblend and the opaque-pattern (zpopaque/lsopaque) select.
     let colorback_v = if dm1.backblend() || dm0.zpopaque() || dm0.lsopaque() {
         ld32!(ctx_off!(colorback))

@@ -782,6 +782,73 @@ fn test_block_fill_single_pixel() {
     assert_eq!(read_pixel(&rex, 10, 20) & 0xFF, 0xAB);
 }
 
+// REX3 table 22 / RB2 table 4.4: physical bits 0..23 map to these
+// packed BGR bits. This table is independent of the renderer conversion.
+fn check_rgb24_physical_planes(rex: &Rex3, compiled: bool) {
+    const BGR_BITS: [u32; 24] = [15, 7, 23, 14, 6, 22, 13, 5, 21, 12, 4, 20,
+        11, 3, 19, 10, 2, 18, 9, 1, 17, 8, 0, 16];
+    rex3init(rex);
+    let mut colors = vec![(0, 0), (0xffffff, 0xffffff),
+        (0x092492, 0x0000fe), (0x049249, 0x00fe00), (0x124924, 0xfe0000)];
+    colors.extend(BGR_BITS.iter().enumerate().map(|(i, &b)| (1 << i, 1 << b)));
+    let masks = [(0xffffff, 0xffffff), (0, 0), (0x492492, 0x0000ff),
+        (0x249249, 0x00ff00), (0x924924, 0xff0000), (0x000002, 0x000080)];
+    let line = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
+    #[cfg(feature = "rex-jit")]
+    let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+    let mut draws = 0;
+    for (dm0, fast, xor) in [(DM0_DRAW_BLOCK, true, false), (DM0_DRAW_SPAN, true, false),
+        (DM0_DRAW_BLOCK, false, false), (line, false, false),
+        (DM0_DRAW_BLOCK, false, true), (DM0_SCR2SCR, false, false)] {
+        let dm1 = (DM1_RGB24_SRC & !(15 << 28))
+            | if xor { DRAWMODE1_LOGICOP_XOR_SH } else { DRAWMODE1_LOGICOP_SRC_SH }
+            | if fast { 1 << 17 } else { 0 };
+        #[cfg(feature = "rex-jit")]
+        if compiled {
+            let jit = rex.rex_jit.as_ref().unwrap();
+            jit.request_compile(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+            assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT));
+        }
+        for &(physical, bgr) in &colors {
+            for &(physical_mask, bgr_mask) in &masks {
+                wait(rex);
+                unsafe {
+                    (*rex.fb_rgb.get())[10 * 2048 + 10] = bgr;
+                    (*rex.fb_rgb.get())[20 * 2048 + 10] = 0x123456;
+                    (*rex.fb_aux.get())[20 * 2048 + 10] = 0xabcdef;
+                }
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_COLORVRAM, physical);
+                reg(rex, REX3_COLORI, bgr);
+                reg(rex, REX3_WRMASK, physical_mask);
+                let copying = dm0 == DM0_SCR2SCR;
+                reg(rex, REX3_XYMOVE, if copying { 10 } else { 0 });
+                reg(rex, REX3_XYSTARTI, xy(10, if copying { 10 } else { 20 }));
+                reg(rex, REX3_XYENDI, xy(10, if copying { 10 } else { 20 }));
+                reg_go(rex, REX3_DRAWMODE0, dm0);
+                let value = if xor { bgr ^ 0x123456 } else { bgr };
+                let expected = (0x123456 & !bgr_mask) | (value & bgr_mask);
+                assert_eq!(read_pixel(rex, 10, 20), expected,
+                    "dm0={dm0:x} fast={fast} xor={xor} color={physical:06x} mask={physical_mask:06x}");
+                assert_eq!(read_reg(rex, REX3_COLORVRAM), physical);
+                assert_eq!(read_reg(rex, REX3_WRMASK), physical_mask);
+                assert_eq!(unsafe { (*rex.fb_aux.get())[20 * 2048 + 10] }, 0xabcdef);
+                draws += 1;
+            }
+        }
+    }
+    #[cfg(feature = "rex-jit")]
+    assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) - before,
+        if compiled { draws } else { 0 });
+    #[cfg(not(feature = "rex-jit"))]
+    { assert!(!compiled); assert_eq!(draws, 1044); }
+}
+
+#[test]
+fn rgb24_physical_planes_interpreter() {
+    check_rgb24_physical_planes(&make_rex3(), false);
+}
+
 /// WRMASK=0 must block all writes.
 #[test]
 fn test_wrmask_zero_blocks_write() {
@@ -2508,6 +2575,11 @@ fn test_iline_line_loop_rect() {
 mod jit_tests {
     use super::*;
     use crate::dev::ng1::rex3_jit::RexJit;
+
+    #[test]
+    fn rgb24_physical_planes_jit() {
+        check_rgb24_physical_planes(&make_rex3_jit(), true);
+    }
 
     #[test]
     fn cid_write_masks_jit() {

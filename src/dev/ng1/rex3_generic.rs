@@ -631,6 +631,29 @@ fn read_plane<M: Mode>(fb: &Framebuffers, m: &M, addr: u32) -> u32 {
     (raw >> shift) & mask
 }
 
+/// Decode physical RGB24 VRAM planes into our packed 0xBBGGRR framebuffer.
+/// REX3 table 22 / RB2 table 4.4 lay out bits 23..0 as B0 R0 G0 ... B7 R7 G7.
+/// COLORVRAM fast clears bypass RB2's normal write formatter; WRMASK is also
+/// already in physical-plane order. Register storage/readback stays unchanged.
+#[inline(always)]
+pub fn rgb24_planes_to_bgr(v: u32) -> u32 {
+    #[inline(always)]
+    fn component(mut v: u32) -> u32 {
+        v &= 0x249249;
+        v = (v | (v >> 2)) & 0x0c30c3;
+        v = (v | (v >> 4)) & 0x00f00f;
+        v = (v | (v >> 8)) & 0x0000ff;
+        v.reverse_bits() >> 24
+    }
+    component(v >> 1) | (component(v) << 8) | (component(v >> 2) << 16)
+}
+
+#[inline(always)]
+fn uses_rgb24_planes<M: Mode>(m: &M) -> bool {
+    m.planes() == DRAWMODE1_PLANES_RGB && m.rgbmode() != 0
+        && m.drawdepth() == DRAWMODE1_DRAWDEPTH_24
+}
+
 /// Masked write to the plane this mode selects.
 #[inline(always)]
 fn write_plane<M: Mode>(fb: &Framebuffers, m: &M, ctx: &Rex3Context, addr: u32, val: u32) {
@@ -639,7 +662,7 @@ fn write_plane<M: Mode>(fb: &Framebuffers, m: &M, ctx: &Rex3Context, addr: u32, 
     }
     let plane = if plane_is_aux(m) { fb.aux } else { fb.rgb };
     let slot = unsafe { &mut *plane.add(addr as usize) };
-    let mask = ctx.wrmask;
+    let mask = if uses_rgb24_planes(m) { rgb24_planes_to_bgr(ctx.wrmask) } else { ctx.wrmask };
     *slot = (*slot & !mask) | (val & mask);
 }
 
@@ -1290,6 +1313,9 @@ fn combine_host_dda<M: Mode>(ctx: &Rex3Context, m: &M, host_pixel: u32) -> u32 {
 #[inline(always)]
 pub fn fastclear_color<M: Mode>(ctx: &Rex3Context, m: &M) -> u32 {
     let v = ctx.colorvram;
+    if uses_rgb24_planes(m) {
+        return rgb24_planes_to_bgr(v);
+    }
     match m.drawdepth() {
         DRAWMODE1_DRAWDEPTH_4 => {
             let c = v & 0xf;
