@@ -25,7 +25,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - Publish raw disk overlay records with a write-through rename on Windows.
   Guest writes and clean flushes no longer fail with Access Denied while
-  attempting to open the containing directory as a regular file.
+  attempting to open the containing directory as a regular file. Close the
+  background record handle before replacement as well, and skip file flushes
+  for read-only raw media, which have no pending writes.
 
 ### JIT restart in embedded frontends
 

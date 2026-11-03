@@ -13,3 +13,11 @@ sidecar publication errors; guest acknowledgement depends on this record.
 
 Regression: cow_disk::tests::sidecar_publication_creates_replaces_and_reports_failure,
 plus Prismatic's raw disk write/flush/reopen test on its native Windows runner.
+
+A second Windows failure occurred during full flush after the first guest write
+succeeded. CowNode dropped its append handle before replacement, but Background
+still held a clone. Clear the background record too, and keep ordinary file
+syncs under Background.files so no in-flight sync retains another clone after
+set_record(None) returns. Custom Durable callbacks remain outside that mutex.
+Read-only RawNode flushes are no-ops: Windows will not FlushFileBuffers on a
+read-only handle, and such a node has no pending writes.

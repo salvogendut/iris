@@ -267,18 +267,17 @@ impl Background {
         if !self.pending.swap(false, Ordering::Relaxed) {
             return Ok(false);
         }
-        let (data, record, durable) = {
+        let (synced, durable) = {
             let f = self.files.lock().unwrap();
-            (
-                f.data.as_ref().and_then(|f| f.try_clone().ok()),
-                f.record.as_ref().and_then(|f| f.try_clone().ok()),
-                f.durable.clone(),
-            )
+            // Keep ordinary handles under the file lock while syncing. A
+            // record replacement must be able to close *all* handles before
+            // renaming on Windows, including an in-flight background sync.
+            let synced = f.data.as_ref().map_or(Ok(()), |f| f.sync_all())
+                .and(f.record.as_ref().map_or(Ok(()), |f| f.sync_all()));
+            (synced, f.durable.clone())
         };
-        let synced = data
-            .map_or(Ok(()), |f| f.sync_all())
-            .and(record.map_or(Ok(()), |f| f.sync_all()))
-            .and(durable.map_or(Ok(()), |d| d.sync_data()));
+        // A custom backend may take its own locks: never hold files here.
+        let synced = synced.and(durable.map_or(Ok(()), |d| d.sync_data()));
         if synced.is_err() {
             self.pending.store(true, Ordering::Relaxed);
         }
@@ -536,7 +535,7 @@ impl BlockNode for RawNode {
     fn flush(&mut self) -> io::Result<()> {
         match &self.bg {
             Some(bg) => bg.syncing(|| self.file.sync_all()),
-            None => self.file.sync_all(),
+            None => Ok(()), // a read-only node has no writes to flush
         }
     }
 
@@ -544,7 +543,7 @@ impl BlockNode for RawNode {
         match &self.bg {
             // The write's data is all the thread would sync for a raw image.
             Some(bg) => bg.syncing(|| self.file.sync_data()),
-            None => self.file.sync_data(),
+            None => Ok(()),
         }
     }
 
@@ -691,6 +690,7 @@ impl CowNode {
         // new sector starts with a full rewrite rather than an append onto a
         // file that may end in a torn entry.
         self.record = None;
+        self.bg.set_record(None); // also waits for any background file sync
         let path = self.sidecar_path();
         crate::cow_disk::save_dirty_sidecar(&path, &self.dirty)?;
         let record = OpenOptions::new().append(true).open(&path)?;
@@ -2822,6 +2822,19 @@ mod tests {
         });
         assert!(bg.is_pending());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_readonly_node_has_nothing_to_flush() {
+        let path = tmp_path("readonly-flush");
+        std::fs::write(&path, vec![0x5a; 512]).unwrap();
+        let mut node = RawNode::open_readonly(&path).unwrap();
+        assert!(node.background().is_none());
+        node.flush_data().unwrap();
+        node.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0x5a; 512]);
+        drop(node);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A node's own flush leaves nothing for the thread to do.
