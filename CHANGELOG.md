@@ -154,6 +154,26 @@ hashes are given where a change is easiest to understand by reading the commit.
   completes, also with `write_cache = true`, so killing iris loses nothing
   on a CHD either.
 
+### virtio-serial guest device
+
+- New `[virtio_serial]` section: a virtio 1.x console / virtio-serial device
+  with named multiport channels, host ends on raw TCP or Unix sockets. It is a
+  transport-neutral core (`src/dev/virtio/`) with two transports: virtio-mmio
+  in a GIO expansion slot for the Indy, Indigo2 (IP22) and Indigo2 IMPACT
+  (IP28), which have no PCI bus, and virtio-pci for the Octane's Bridge. The
+  O2 has the transport but no interrupt route yet, and refuses the section.
+  It needs a guest driver and is off by default. See
+  [docs/virtio-serial.md](docs/virtio-serial.md).
+- `PciConfig` can carry a read-only capability list (`with_capabilities`).
+
+### CHD disks
+
+- Zeroes written to a CHD's `.diff.chd` now read back as zeroes. MAME skips
+  storing a hunk that is all zero and not yet in the diff, so such a hunk
+  went on reading the base CHD's old data: a guest that zeroed fresh blocks
+  (`mkfs`, `dd if=/dev/zero`) got the old contents back. A discard on a CHD,
+  which writes zeroes, had the same fault.
+
 ## October 2026
 
 ### Octane snapshots
@@ -205,6 +225,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **HEART's software reset** (`MODE` bit 22) now resets the machine.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
+
+### Choosing the machine on the command line
+
+- **`iris --machine NAME`** picks the machine to emulate by its `[machine] profile`
+  name and overrides the config file; `--machine help` lists the names and what
+  each is. `--ip22` is now another way to write `--machine indigo2_ip22`.
+  `--validate` judges the machine chosen.
+
+### Checking a configuration
+
+- **`iris --validate --config FILE`** parses and validates a configuration and
+  checks that its PROM, disk and CD images, directories and serial socket and log
+  directories exist and that its TCP ports differ, then exits 0 or 1 without
+  starting the machine or opening graphics or audio. See
+  [HELP.md](HELP.md#checking-a-configuration).
 
 ### Serial consoles on Unix sockets
 
@@ -420,6 +455,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **A `--ci` run's disk overlays go to the host's temporary directory**,
+  `$TMPDIR` when it is set and `/tmp` otherwise, instead of always `/tmp`. With
+  `TMPDIR` unset nothing moves; macOS always sets it, so there the overlays
+  move under `/var/folders`. Pointing `TMPDIR` at the filesystem that holds
+  `saves/` lets a snapshot reflink an overlay instead of copying it. An attach
+  that cannot create its overlay now names the file.
+- **Each `--ci` run's overlays are named for the run**, as
+  `iris-ci-<pid>-<start>-scsi<id>.overlay`, where `<start>` is when the run
+  began. A run that got an earlier run's process ID used to open that run's
+  overlay and its dirty-sector record and boot on its writes; every run in a
+  container has the same process ID.
 - **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
   instance installs no front-end renderer, so nothing filled the readback
   buffer and every screenshot came out black. The command now waits for the

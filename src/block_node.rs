@@ -463,6 +463,18 @@ fn sectors_for(offset: u64, len: u64) -> (u64, u64) {
     (first, last)
 }
 
+/// Capacity of an open file or block device. A regular file reports it through
+/// its metadata; a Linux block device reports 0 there, so seek to the end.
+pub fn file_capacity(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    if len != 0 {
+        return Ok(len);
+    }
+    let end = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(end)
+}
+
 /// A plain raw image file: every byte is real data held by this layer.
 pub struct RawNode {
     file: File,
@@ -474,8 +486,8 @@ pub struct RawNode {
 impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file_capacity(&mut file)?;
         Ok(Self::from_file(file, size))
     }
 
@@ -483,8 +495,8 @@ impl RawNode {
     /// and for a copy-on-write base, whose contents the overlay never mutates
     /// through this node.
     pub fn open_readonly(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let size = file_capacity(&mut file)?;
         Ok(Self { file, size, bg: None })
     }
 
@@ -1122,6 +1134,8 @@ impl BlockNode for ChdNode {
         self.bg.syncing(|| file.sync(false))
     }
 
+    /// A CHD presents the merged view itself, with no backing node, so a
+    /// discarded range reads as zeroes, as it does on a raw image.
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
         check_range(self.bytes, offset, len)?;
         let zeros = vec![0u8; len as usize];
@@ -1564,14 +1578,19 @@ mod tests {
     /// Build a 256 KiB compressed hard-disk CHD full of `byte`, and return its
     /// path. MAME's v5 compression map asserts below one hunk, so keep it large.
     fn compressed_chd(byte: u8) -> PathBuf {
+        compressed_chd_of(vec![byte; 256 * 1024])
+    }
+
+    /// Build a compressed hard-disk CHD with 4 KiB hunks holding `data`.
+    fn compressed_chd_of(data: Vec<u8>) -> PathBuf {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
         use std::io::Cursor;
 
         let base = tmp_path("chd").with_extension("chd");
-        let logical = 256 * 1024u64;
+        let logical = data.len() as u64;
         create_from_reader(
-            Cursor::new(vec![byte; logical as usize]),
+            Cursor::new(data),
             &base,
             HdCreateOptions {
                 logical_size: logical,
@@ -1660,6 +1679,57 @@ mod tests {
         remove_chd(&base);
     }
 
+    /// The background thread alone, with no explicit flush, makes writes
+    /// durable, map entries included: a copy of the files as the host has
+    /// them, taken while the node is still open and never closed, stands in
+    /// for a SIGKILL. Reads and writes go on meanwhile, as a busy guest's
+    /// do. The node's thread runs on a short interval so the test waits for
+    /// the sync, not for the production five seconds.
+    #[test]
+    fn chd_background_sync_covers_a_busy_disk_at_a_kill() {
+        let base = compressed_chd(0xAB);
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        let fast = Background::idle(Duration::from_millis(100));
+        let file: Arc<dyn Durable> = node.hd().file();
+        fast.set_durable(Some(file));
+        node.bg = fast.clone();
+        fast.spawn().unwrap();
+        let hunks = 60u64;
+        for round in 0..3u8 {
+            for h in 0..hunks {
+                let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                node.write(at, &[0x10 + round; SECTOR_BYTES]).unwrap();
+                let mut got = [0u8; SECTOR_BYTES];
+                node.read(at, &mut got).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Whether every write is on the host's disk yet: reopen a copy of
+        // the files and read them all back.
+        let copy = tmp_path("chd-kill").with_extension("chd");
+        let durable = || {
+            let ok = std::fs::copy(&base, &copy).is_ok()
+                && std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).is_ok()
+                && match ChdNode::open(copy.to_str().unwrap(), false) {
+                    Ok(mut again) => (0..3u8).all(|round| {
+                        (0..hunks).all(|h| {
+                            let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                            let mut got = [0u8; SECTOR_BYTES];
+                            again.read(at, &mut got).is_ok() && got == [0x10 + round; SECTOR_BYTES]
+                        })
+                    }),
+                    Err(_) => false,
+                };
+            remove_chd(&copy);
+            ok
+        };
+        assert!(wait_for(durable), "the background sync alone made the writes durable");
+        fast.finish();
+        drop(node);
+        remove_chd(&base);
+    }
+
     /// A kill leaves the CHD as the host's files have it. Whatever it loses,
     /// it must not keep a write and lose one the guest made before it: a
     /// filesystem's log recovery assumes it sees a prefix of its writes. A
@@ -1694,6 +1764,62 @@ mod tests {
         );
         drop(node);
         remove_chd(&base);
+    }
+
+    /// Zeroes written over a hunk a diff does not hold yet read back as
+    /// zeroes, not as the base: a whole hunk, a sector of a hunk whose other
+    /// sectors are zero in the base, and a discard, which reads as zeroes on
+    /// a CHD as on a raw image. Checked before and after a reopen, since
+    /// MAME's one-hunk cache can show a write that never reached the file.
+    #[test]
+    fn chd_zeroes_over_an_untouched_hunk_read_back_as_zeroes() {
+        const HUNK: usize = 4096;
+        // 0xAB everywhere except hunk 5, which is zero but for its sector 3.
+        let mut data = vec![0xABu8; 256 * 1024];
+        data[5 * HUNK..6 * HUNK].fill(0);
+        data[5 * HUNK + 3 * SECTOR_BYTES..][..SECTOR_BYTES].fill(0xAB);
+        let cases: [(&str, u64, usize); 4] = [
+            ("whole-hunk write", 2 * HUNK as u64, HUNK),
+            ("one-sector write", 5 * HUNK as u64 + 3 * SECTOR_SIZE, SECTOR_BYTES),
+            ("whole-hunk discard", 7 * HUNK as u64, HUNK),
+            ("one-sector discard", 9 * HUNK as u64 + SECTOR_SIZE, SECTOR_BYTES),
+        ];
+        for cow in [false, true] {
+            let base = compressed_chd_of(data.clone());
+            let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+            for (what, offset, len) in cases {
+                if what.ends_with("discard") {
+                    node.discard(offset, len as u64).unwrap();
+                } else {
+                    node.write(offset, &vec![0; len]).unwrap();
+                }
+            }
+            node.flush().unwrap();
+            for reopened in [false, true] {
+                if reopened {
+                    drop(node);
+                    node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                }
+                for (what, offset, len) in cases {
+                    // Read a different hunk first, so MAME's cache does not
+                    // hold the one under test.
+                    let mut other = vec![0u8; HUNK];
+                    node.read(0, &mut other).unwrap();
+                    let mut got = vec![0xEEu8; len];
+                    node.read(offset, &mut got).unwrap();
+                    assert!(got.iter().all(|&b| b == 0), "{what}, cow={cow}, reopened={reopened}");
+                    // The rest of the hunk keeps the base's bytes.
+                    let start = offset as usize / HUNK * HUNK;
+                    let mut hunk = vec![0u8; HUNK];
+                    node.read(start as u64, &mut hunk).unwrap();
+                    let mut want = data[start..start + HUNK].to_vec();
+                    want[offset as usize - start..][..len].fill(0);
+                    assert!(hunk == want, "{what}: rest of the hunk, cow={cow}, reopened={reopened}");
+                }
+            }
+            drop(node);
+            remove_chd(&base);
+        }
     }
 
     /// A CHD node whose base has been moved away and whose commit has failed

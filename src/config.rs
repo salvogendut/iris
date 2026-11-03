@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
@@ -183,11 +183,35 @@ impl ScsiDeviceConfig {
     }
 
     /// Where a `--ci` run keeps the copy-on-write overlay of the disk at
-    /// `id`: under /tmp and named for the process, so an interactive iris
-    /// holding `PATH.overlay` can coexist with any number of CI runs. The
-    /// files are kept for post-mortem inspection.
+    /// `id`: in the host's temporary directory (`$TMPDIR`, or `/tmp` when it
+    /// is unset), as an absolute path, so a later change of directory still
+    /// finds it.
+    ///
+    /// The name carries [`ci_run_tag`](Self::ci_run_tag), so an interactive
+    /// iris holding `PATH.overlay`, any number of CI runs, and a later run
+    /// that gets the same process ID never open each other's overlay. A
+    /// machine rebuilt in the same process reopens its own. The files are
+    /// kept after the run for inspection.
     pub fn ci_overlay_path(id: u8) -> String {
-        format!("/tmp/iris-ci-{}-scsi{}.overlay", std::process::id(), id)
+        static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let run = RUN.get_or_init(|| {
+            let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_err(|before| before.duration());
+            Self::ci_run_tag(std::process::id(), started)
+        });
+        let path = std::env::temp_dir().join(format!("iris-ci-{run}-scsi{id}.overlay"));
+        std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned()
+    }
+
+    /// One run's part of its overlay names: the process ID and the time the
+    /// run first named an overlay, in nanoseconds since the epoch, or with a
+    /// `b` before it when the host clock is set before the epoch, so such a
+    /// clock still gives each run its own name.
+    fn ci_run_tag(pid: u32, started: Result<std::time::Duration, std::time::Duration>) -> String {
+        match started {
+            Ok(after) => format!("{pid}-{:x}", after.as_nanos()),
+            Err(before) => format!("{pid}-b{:x}", before.as_nanos()),
+        }
     }
 
     /// For `scratch = true`: make sure the volume exists, creating it with a
@@ -505,6 +529,60 @@ pub struct Ultra64Config {
     pub enabled: bool,
 }
 
+/// Which GIO expansion slot a virtio device sits in (machines without PCI).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtioGioSlot {
+    /// 0x1F400000; shared with `--test-device` and the Ultra64 board.
+    Exp0,
+    /// 0x1F600000; shared with the second Newport head (`graphics.heads = 2`).
+    #[default]
+    Exp1,
+}
+
+/// One virtio-serial port and the host end it is connected to.
+///
+/// With neither `tcp_port` nor `socket` the port is wired to nothing: output
+/// is dropped and no input arrives.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VirtioSerialPort {
+    /// Name the guest sees (`/dev/virtio-ports/<name>` on Linux). Unnamed
+    /// ports are found by number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The guest should treat this port as its console.
+    #[serde(default)]
+    pub console: bool,
+    /// Serve the port as a raw (not telnet) TCP socket on 127.0.0.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_port: Option<u16>,
+    /// Serve the port on a raw Unix socket at this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+}
+
+/// virtio-serial (virtio-console) device for the guest, `[virtio_serial]`.
+/// See `src/dev/virtio` and `docs/virtio-serial.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VirtioSerialConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// GIO expansion slot, on the Indy and Indigo2 (IP24/IP22/IP28). The
+    /// machines with PCI (O2, Octane) put it on the PCI bus and ignore this.
+    #[serde(default)]
+    pub slot: VirtioGioSlot,
+    /// The ports, in order; port 0 is the first. Empty means one console
+    /// port on TCP 127.0.0.1:8890.
+    #[serde(default, rename = "port", skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<VirtioSerialPort>,
+}
+
+impl VirtioSerialConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Emulated SGI machine profile (hardware layout scaffold).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -540,8 +618,7 @@ impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
     ///
-    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
-    /// the Octane does, and iris-gui says so in the New-machine dialog.
+    /// All five profiles have embedded firmware in this fork.
     pub const ALL: [Self; 5] = [
         Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
     ];
@@ -557,6 +634,90 @@ impl MachineProfile {
             Self::O2Ip32 => &[0, 32, 64, 128, 256],
             Self::Indigo2Ip28 => MC_BANK_SIZES,
             _ => &[0, 8, 16, 32, 64, 128],
+        }
+    }
+
+    /// Whether this fork bundles firmware for the machine. O2/Octane still
+    /// reject unreadable explicit overrides; only their default can fall back.
+    pub fn has_embedded_prom(self) -> bool {
+        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22 | Self::Indigo2Ip28 | Self::O2Ip32 | Self::OctaneIp30)
+    }
+
+    /// Preferred external PROM candidate. O2/Octane can use embedded bytes
+    /// when the defaults are absent or `prom` is empty; their runtime loader
+    /// also preserves errors on explicit overrides (see `firmware`).
+    pub fn prom_path(self, prom: &str) -> String {
+        match self {
+            Self::OctaneIp30 => prom_file(prom, crate::ip30_machine::OCTANE_PROM_FILE),
+            Self::O2Ip32 => prom_file(prom, crate::ip32_machine::O2_PROM_FILE),
+            _ => prom.to_string(),
+        }
+    }
+
+    /// Every profile, in the order `workstation::build` lists them. `ALL` is
+    /// only the ones the GUI offers.
+    pub const EVERY: [Self; 5] = [
+        Self::IndyIp24,
+        Self::Indigo2Ip22,
+        Self::Indigo2Ip28,
+        Self::O2Ip32,
+        Self::OctaneIp30,
+    ];
+
+    /// The name `[machine] profile` and `--machine` give this profile.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IndyIp24 => "indy_ip24",
+            Self::Indigo2Ip22 => "indigo2_ip22",
+            Self::Indigo2Ip28 => "indigo2_ip28",
+            Self::O2Ip32 => "o2_ip32",
+            Self::OctaneIp30 => "octane_ip30",
+        }
+    }
+
+    /// The profile `name` names, or an error that lists the valid names.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        Self::EVERY.into_iter().find(|p| p.name() == name).ok_or_else(|| {
+            let valid: Vec<_> = Self::EVERY.iter().map(|p| p.name()).collect();
+            format!("unknown machine \"{name}\" (valid: {})", valid.join(", "))
+        })
+    }
+
+    /// What `--machine help` prints: a line per profile, its name and what it is.
+    pub fn list() -> String {
+        Self::EVERY.iter().map(|p| format!("{:<14}{}\n", p.name(), p.label())).collect()
+    }
+
+    /// The processors fitted at most: two on the Octane, one elsewhere.
+    pub fn max_cpus(self) -> u8 {
+        if self == Self::OctaneIp30 { 2 } else { 1 }
+    }
+
+    /// Whether this profile can have `cpus` processors, and why not if it
+    /// cannot.
+    pub fn accepts_cpus(self, cpus: u8) -> Result<(), String> {
+        if cpus != 1 && self.max_cpus() == 1 {
+            Err(format!("[machine] cpus = {cpus}: only the Octane has more than one processor"))
+        } else if !(1..=self.max_cpus()).contains(&cpus) {
+            Err(format!("[machine] cpus = {cpus}: IRIX runs an Octane with 1 or 2"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether this profile can have `cpu`, and why not if it cannot. The
+    /// Octane supports the R10000 family; R12000/R14000 are modelled only
+    /// there. The O2 constructor still checks its own choices after validation.
+    pub fn accepts_cpu(self, cpu: CpuModel) -> Result<(), String> {
+        match self {
+            Self::OctaneIp30 if !CpuModel::OCTANE.contains(&cpu) => {
+                Err("an Octane requires cpu = r10000, r12000 or r14000".into())
+            }
+            Self::OctaneIp30 => Ok(()),
+            _ if matches!(cpu, CpuModel::R12000 | CpuModel::R14000) => {
+                Err("R12000 and R14000 are currently modelled only on Octane".into())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1762,6 +1923,10 @@ pub struct MachineConfig {
     /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
     #[serde(default)]
     pub ultra64: Ultra64Config,
+
+    /// virtio-serial guest device (`[virtio_serial]`, `[[virtio_serial.port]]`).
+    #[serde(default, skip_serializing_if = "VirtioSerialConfig::is_default")]
+    pub virtio_serial: VirtioSerialConfig,
 }
 
 fn default_scsi_deferred_int() -> bool { true }
@@ -1829,6 +1994,22 @@ pub const DEFAULT_PROM: &str = "prom.bin";
 /// `nvram` when a config does not set it: the DS1386's file on the Indy, the
 /// PROM's flash on the O2, the DS1685's RAM on the Octane.
 pub const DEFAULT_NVRAM: &str = "nvram.bin";
+
+/// The PROM image a machine without an embedded one reads: `prom`, or the
+/// name its releases shipped under (`release_file`) when `prom` is left at
+/// the default and that file is not there.
+pub fn prom_file(prom: &str, release_file: &str) -> String {
+    prom_file_if(prom, release_file, |p| std::path::Path::new(p).exists())
+}
+
+/// [`prom_file`] with the test for a file's presence passed in.
+fn prom_file_if(prom: &str, release_file: &str, exists: impl Fn(&str) -> bool) -> String {
+    if prom != DEFAULT_PROM || exists(prom) {
+        prom.to_string()
+    } else {
+        release_file.to_string()
+    }
+}
 
 fn default_prom() -> String {
     DEFAULT_PROM.to_string()
@@ -1959,6 +2140,7 @@ impl Default for MachineConfig {
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
             ultra64: Ultra64Config::default(),
+            virtio_serial: VirtioSerialConfig::default(),
         }
     }
 }
@@ -1967,6 +2149,50 @@ impl Default for MachineConfig {
 fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
+    /// `[virtio_serial]`: the ports it lists, and whether this machine has
+    /// somewhere to put it.
+    fn validate_virtio_serial(&self) -> Result<(), String> {
+        let v = &self.virtio_serial;
+        if !v.enabled {
+            return Ok(());
+        }
+        // Two queues per port and the control pair, in a 64-bit notify mask.
+        if v.ports.len() > 31 {
+            return Err(format!("[virtio_serial] has {} ports (at most 31)", v.ports.len()));
+        }
+        for (i, p) in v.ports.iter().enumerate() {
+            if p.tcp_port.is_some() && p.socket.is_some() {
+                return Err(format!("[virtio_serial] port {i}: tcp_port and socket are exclusive"));
+            }
+            if p.name.as_deref().is_some_and(|n| n.is_empty() || n.len() > 200) {
+                return Err(format!("[virtio_serial] port {i}: name must be 1 to 200 bytes"));
+            }
+            if v.ports[..i].iter().any(|q| q.name.is_some() && q.name == p.name) {
+                return Err(format!("[virtio_serial] port {i}: name {:?} is used twice", p.name.as_deref().unwrap_or("")));
+            }
+        }
+        match self.machine.profile {
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
+                match v.slot {
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
+                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
+                    ),
+                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
+                        "[virtio_serial] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    ),
+                    _ => Ok(()),
+                }
+            }
+            // The Octane has a PCI bridge with a free slot.
+            MachineProfile::OctaneIp30 => Ok(()),
+            MachineProfile::O2Ip32 => Err(
+                "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
+                 MACE PCI bridge has no interrupt route for a third slot (see docs/virtio-serial.md)"
+                    .into(),
+            ),
+        }
+    }
+
     /// The serial channels' TCP ports (A, B), defaults filled in.
     pub fn serial_ports(&self) -> [u16; 2] {
         let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
@@ -1982,28 +2208,39 @@ impl MachineConfig {
     /// emulator would quietly auto-pick a different interface and run with NAT
     /// instead of the settings the user wrote.
     pub fn load_toml(path: &str) -> Self {
+        Self::try_load(path).unwrap_or_else(|e| {
+            eprintln!("Configuration error: {e}");
+            std::process::exit(1);
+        })
+    }
+
+    /// [`MachineConfig::load_toml`] returning the parse error instead of
+    /// exiting. A file that is not there is the defaults; a caller that was
+    /// given the path on the command line checks that it exists first, as
+    /// `load_config` does.
+    pub fn try_load(path: &str) -> Result<Self, String> {
         let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+            return Ok(Self::default());
         };
         match toml::from_str::<Self>(&text) {
             Ok(mut cfg) => {
                 cfg.fold_deprecated();
-                cfg
+                Ok(cfg)
             }
             Err(e) => {
-                eprintln!("Configuration error: failed to parse {}:\n{}", path, e);
+                let mut msg = format!("failed to parse {path}:\n{e}");
                 // Common footgun: backslashes in a double-quoted string (Windows
                 // pcap device names look like \Device\NPF_{GUID}).
                 if text.contains("\\Device\\NPF") || e.to_string().contains("escape") {
-                    eprintln!(
-                        "\nhint: backslashes are escape characters inside a \"double-quoted\" TOML string.\n\
+                    msg.push_str(
+                        "\n\nhint: backslashes are escape characters inside a \"double-quoted\" TOML string.\n\
                          For a Windows pcap interface, either use the numeric index from\n\
                          `iris --list-net-interfaces` (e.g. pcap_interface = \"1\") or a TOML\n\
                          'single-quoted' literal string:\n\
-                         \n    pcap_interface = '\\Device\\NPF_{{...}}'\n"
+                         \n    pcap_interface = '\\Device\\NPF_{...}'\n"
                     );
                 }
-                std::process::exit(1);
+                Err(msg)
             }
         }
     }
@@ -2103,14 +2340,9 @@ impl MachineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if matches!(self.machine.cpu, CpuModel::R12000 | CpuModel::R14000)
-            && self.machine.profile != MachineProfile::OctaneIp30
-        {
-            return Err("R12000 and R14000 are currently modelled only on Octane".into());
-        }
-        if self.machine.cpus != 1 && self.machine.profile != MachineProfile::OctaneIp30 {
-            return Err(format!("[machine] cpus = {}: only the Octane has more than one processor", self.machine.cpus));
-        }
+        self.validate_virtio_serial()?;
+        self.machine.profile.accepts_cpu(self.machine.cpu)?;
+        self.machine.profile.accepts_cpus(self.machine.cpus)?;
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
                 "graphics.heads {} is invalid (valid: 1, 2)",
@@ -2383,7 +2615,7 @@ impl MachineConfig {
 pub const DEFAULT_CONFIG: &str = "iris.toml";
 
 #[derive(Parser, Debug)]
-#[command(name = "iris", about = "SGI Indy (MIPS R4400) emulator")]
+#[command(name = "iris")]
 pub struct Cli {
     /// Path to iris.toml config file [default: iris.toml]
     #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -2393,9 +2625,13 @@ pub struct Cli {
     #[arg(long)]
     pub prom: Option<String>,
 
-    /// Emulate an SGI Indigo2 (IP22) instead of the default Indy (IP24).
-    /// Overrides `[machine].profile` in the config file.
-    #[arg(long, default_value_t = false)]
+    /// The machine to emulate: a `[machine] profile` name such as
+    /// `octane_ip30`. Overrides the config file. `--machine help` lists them.
+    #[arg(long, value_name = "NAME")]
+    pub machine: Option<String>,
+
+    /// Same as `--machine indigo2_ip22`.
+    #[arg(long, default_value_t = false, hide = true, conflicts_with = "machine")]
     pub ip22: bool,
 
     /// Path to NVRAM file (default: nvram.bin in cwd)
@@ -2508,6 +2744,13 @@ pub struct Cli {
     /// Implies --net-mode pcap. List candidates with --list-net-interfaces.
     #[arg(long = "pcap-interface", value_name = "IFACE")]
     pub pcap_interface: Option<String>,
+
+    /// Check the configuration (`--config`, with any other options applied)
+    /// without starting the machine: that it parses, that its settings agree,
+    /// that its files and directories exist and its ports differ. Exits 0 if
+    /// it would run, 1 with each problem on stderr if not.
+    #[arg(long = "validate", default_value_t = false)]
+    pub validate: bool,
 
     /// Print the host network interfaces libpcap can bridge onto, then exit.
     /// Requires a build with --features pcap.
@@ -2663,8 +2906,15 @@ pub struct Cli {
 impl Cli {
     /// Merge CLI overrides into a base `MachineConfig`.
     pub fn apply(&self, mut cfg: MachineConfig) -> MachineConfig {
-        if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
+        // First, so the options after it and `--validate` see the machine chosen.
+        if let Some(name) = &self.machine {
+            cfg.machine.profile = MachineProfile::from_name(name).unwrap_or_else(|e| {
+                eprintln!("iris: --machine: {e}");
+                std::process::exit(1);
+            });
+        }
         if self.ip22 { cfg.machine.profile = MachineProfile::Indigo2Ip22; }
+        if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
         if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(p) = &self.nveeprom { cfg.nveeprom = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }
@@ -2763,10 +3013,19 @@ impl Cli {
     }
 }
 
+/// What `Cli::parse()` does, with `--help` headed by the emulator's name, the
+/// way the banner, the monitor and the window title are. The name is not known
+/// to clap's derive, which wants a constant, so it is set on the command here.
+/// No machine is configured yet, so only the model-neutral words can appear.
+fn parse_cli() -> Cli {
+    let mut matches = Cli::command().about(crate::machine::emulator_name()).get_matches();
+    Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|e| e.format(&mut Cli::command()).exit())
+}
+
 /// Parse CLI, load TOML, merge, and validate. Exits on error.
 /// Returns (machine_config, window_scale) where window_scale is 1 or 2.
 pub fn load_config() -> (MachineConfig, u32) {
-    let cli = Cli::parse();
+    let cli = parse_cli();
 
     // --list-net-interfaces: print candidate PCAP interfaces and exit. Handled
     // here (before machine construction) since it only needs the parsed CLI.
@@ -2792,6 +3051,20 @@ pub fn load_config() -> (MachineConfig, u32) {
     if cli.config != DEFAULT_CONFIG && !std::path::Path::new(&cli.config).exists() {
         eprintln!("Configuration error: --config {} does not exist", cli.config);
         std::process::exit(1);
+    }
+
+    if cli.machine.as_deref() == Some("help") {
+        print!("{}", MachineProfile::list());
+        std::process::exit(0);
+    }
+
+    if cli.validate {
+        let toml_cfg = MachineConfig::try_load(&cli.config).unwrap_or_else(|e| {
+            eprintln!("Configuration error: {e}");
+            std::process::exit(1);
+        });
+        let cfg = cli.apply(toml_cfg);
+        std::process::exit(crate::validate_config::report(&cli.config, &cfg));
     }
 
     let toml_cfg = MachineConfig::load_toml(&cli.config);
@@ -3172,6 +3445,125 @@ mod export_tests {
         assert!(indy.validate().unwrap_err().contains("only available on the O2"));
     }
 
+    /// `try_load` returns a parse error, with the Windows backslash hint where
+    /// it applies, instead of exiting; a file that is not there is the
+    /// defaults.
+    #[test]
+    fn try_load_reports_parse_errors_and_tolerates_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("iris-try-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "pcap_interface = \"\\Device\\NPF_{X}\"\n").unwrap();
+        let e = MachineConfig::try_load(path.to_str().unwrap()).unwrap_err();
+        assert!(e.starts_with("failed to parse ") && e.contains("hint: backslashes"), "{e}");
+        std::fs::write(&path, "scale =\n").unwrap();
+        assert!(!MachineConfig::try_load(path.to_str().unwrap()).unwrap_err().contains("hint"));
+        std::fs::write(&path, "scale = 2\n").unwrap();
+        assert_eq!(MachineConfig::try_load(path.to_str().unwrap()).unwrap().scale, 2);
+        assert_eq!(MachineConfig::try_load(dir.join("absent.toml").to_str().unwrap()).unwrap().scale, MachineConfig::default().scale);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The PROM name falls back to the release file only when `prom` is the
+    /// default and missing.
+    #[test]
+    fn the_prom_falls_back_to_the_release_file_only_by_default() {
+        assert_eq!(prom_file_if(DEFAULT_PROM, "rel.bin", |_| false), "rel.bin");
+        assert_eq!(prom_file_if(DEFAULT_PROM, "rel.bin", |_| true), DEFAULT_PROM);
+        assert_eq!(prom_file_if("custom.bin", "rel.bin", |_| false), "custom.bin");
+        assert_eq!(MachineProfile::OctaneIp30.prom_path("custom.bin"), "custom.bin");
+        assert_eq!(MachineProfile::IndyIp24.prom_path(DEFAULT_PROM), DEFAULT_PROM);
+    }
+
+    /// `--machine` picks the profile, ahead of the config file's and of the
+    /// options after it; `--ip22` is the same as `--machine indigo2_ip22`; a
+    /// name that is not a profile lists the valid ones; `help` lists them with
+    /// what each is.
+    #[test]
+    fn machine_picks_the_profile() {
+        let apply = |args: &[&str]| {
+            let mut a = vec!["iris"];
+            a.extend_from_slice(args);
+            Cli::parse_from(a).apply(toml::from_str("[machine]\nprofile = \"o2_ip32\"\ncpu = \"r10000\"").unwrap())
+        };
+        assert_eq!(apply(&[]).machine.profile, MachineProfile::O2Ip32);
+        assert_eq!(apply(&["--machine", "octane_ip30"]).machine.profile, MachineProfile::OctaneIp30);
+        assert_eq!(apply(&["--ip22"]).machine.profile, MachineProfile::Indigo2Ip22);
+        assert!(Cli::try_parse_from(["iris", "--ip22", "--machine", "o2_ip32"]).is_err());
+        let e = MachineProfile::from_name("vax").unwrap_err();
+        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30)");
+        let list = MachineProfile::list();
+        assert_eq!(list.lines().count(), MachineProfile::EVERY.len());
+        assert!(list.starts_with("indy_ip24     SGI Indy (IP24)\n"), "{list}");
+        // Every name is what a config file calls the profile, and every
+        // variant is listed (a new one breaks the match).
+        for p in MachineProfile::EVERY {
+            match p {
+                MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28
+                | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 => {}
+            }
+            let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{}\"", p.name())).unwrap();
+            assert_eq!(cfg.machine.profile, p);
+            assert_eq!(MachineProfile::from_name(p.name()), Ok(p));
+        }
+    }
+
+    /// A profile says which processors and counts it accepts, and `validate()`
+    /// and the Octane constructor refuse a bad processor with the same words.
+    #[test]
+    fn a_profile_says_which_processors_it_accepts() {
+        let accepted = |p: MachineProfile| CpuModel::ALL.into_iter().filter(|&c| p.accepts_cpu(c).is_ok()).collect::<Vec<_>>();
+        assert_eq!(accepted(MachineProfile::OctaneIp30), CpuModel::OCTANE);
+        assert_eq!(accepted(MachineProfile::IndyIp24), [CpuModel::R4400, CpuModel::R5000, CpuModel::R10000]);
+
+        // The counts are what the checks in validate() and the Octane
+        // constructor allowed before they moved here: one on every machine
+        // but the Octane, one or two on the Octane.
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+            for cpus in 0..=4u8 {
+                let old_ok = if p == MachineProfile::OctaneIp30 { (1..=2).contains(&cpus) } else { cpus == 1 };
+                assert_eq!(p.accepts_cpus(cpus).is_ok(), old_ok, "{p:?} with {cpus}");
+            }
+            if p != MachineProfile::OctaneIp30 {
+                assert_eq!(
+                    p.accepts_cpus(2).unwrap_err(),
+                    "[machine] cpus = 2: only the Octane has more than one processor"
+                );
+            }
+        }
+
+        let mut octane = MachineConfig::default();
+        octane.machine.profile = MachineProfile::OctaneIp30;
+        octane.machine.cpu = CpuModel::R10000;
+        octane.banks = banks_from4([128, 0, 0, 0]);
+        octane.machine.cpus = 2;
+        octane.validate().expect("two processors");
+        octane.machine.cpus = 3;
+        assert!(octane.validate().unwrap_err().contains("1 or 2"));
+        octane.machine.cpus = 1;
+        octane.machine.cpu = CpuModel::R4400;
+        assert!(octane.validate().unwrap_err().contains("an Octane requires cpu = r10000, r12000 or r14000"));
+
+        // The constructor refuses a processor with the words validate() does.
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::OctaneIp30;
+        cfg.machine.cpu = CpuModel::R4400;
+        let from_validate = cfg.validate().unwrap_err();
+        assert_eq!(crate::ip30_machine::OctaneMachine::new(&cfg).err(), Some(from_validate));
+    }
+
+    /// `--help` is headed by an expansion of IRIS, as the banner is, and not
+    /// by a fixed description of one machine.
+    #[test]
+    fn help_is_headed_by_the_emulators_name() {
+        let help = Cli::command().about(crate::machine::emulator_name()).render_help().to_string();
+        let words: Vec<&str> = help.lines().next().unwrap().split_whitespace().collect();
+        assert_eq!(words.len(), 4, "{help}");
+        assert!(words[0].starts_with('I') && words[2].starts_with('I') && words[3].starts_with('S'), "{words:?}");
+        assert_eq!(words[1], "Rust");
+        assert!(!help.contains("SGI Indy"));
+    }
+
     /// The serial sockets come from the file and the command line, must
     /// differ, and a log key for the console line is refused.
     #[test]
@@ -3515,5 +3907,43 @@ mod apply_env_tests {
         std::env::remove_var(OURS);
         set_or_remove_env(OURS, "");
         assert!(std::env::var_os(OURS).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ci_overlay_tests {
+    use super::ScsiDeviceConfig;
+    use std::time::Duration;
+
+    /// Process IDs come round again, and a container gives iris the same one
+    /// every time, so a later run must not take an earlier run's name and
+    /// adopt its overlay.
+    #[test]
+    fn a_later_run_with_the_same_process_id_gets_its_own_overlay() {
+        let first = ScsiDeviceConfig::ci_run_tag(2, Ok(Duration::from_nanos(1_000)));
+        let later = ScsiDeviceConfig::ci_run_tag(2, Ok(Duration::from_nanos(2_000)));
+        assert_ne!(first, later);
+    }
+
+    /// A host clock set before the epoch still names each run apart, and
+    /// never as a run the same distance after it.
+    #[test]
+    fn a_clock_before_the_epoch_still_names_runs_apart() {
+        let tag = |t| ScsiDeviceConfig::ci_run_tag(2, t);
+        let (a, b) = (tag(Err(Duration::from_nanos(5_000))), tag(Err(Duration::from_nanos(4_000))));
+        assert_ne!(a, b);
+        assert_ne!(a, tag(Ok(Duration::from_nanos(5_000))));
+        assert_ne!(tag(Err(Duration::ZERO)), tag(Ok(Duration::ZERO)));
+    }
+
+    #[test]
+    fn one_run_keeps_one_name_per_disk_in_the_temporary_directory() {
+        let a = ScsiDeviceConfig::ci_overlay_path(1);
+        let path = std::path::Path::new(&a);
+        assert!(path.is_absolute(), "{a}");
+        assert_eq!(path.parent(), std::path::absolute(std::env::temp_dir()).ok().as_deref());
+        assert_eq!(a, ScsiDeviceConfig::ci_overlay_path(1));
+        assert_ne!(a, ScsiDeviceConfig::ci_overlay_path(2));
+        assert!(a.contains(&format!("iris-ci-{}-", std::process::id())), "{a}");
     }
 }

@@ -110,12 +110,20 @@ fn run() -> Result<(), String> {
                         CpuModel::R14000 => (600, 2),
                         _ => unreachable!(),
                     };
-                    let expected = format!(
-                        "Processor: {mhz} Mhz {}, {cache_mb}M secondary cache",
+                    let expected_cpu = format!(
+                        "{mhz} Mhz {},",
                         cfg.machine.cpu.label().trim_start_matches("MIPS ")
                     );
-                    inventory_complete =
-                        reply.matches(&expected).count() == cfg.machine.cpus as usize;
+                    // PROM hinv prints the cache on its own line; it does
+                    // not use IRIX's combined processor/cache inventory line.
+                    let processors = reply.lines().filter(|line| {
+                        line.split_once(':').is_some_and(|(name, value)| {
+                            name.trim().starts_with("Processor")
+                                && value.trim().starts_with(&expected_cpu)
+                        })
+                    }).count();
+                    inventory_complete = processors == cfg.machine.cpus as usize
+                        && reply.contains(&format!("Secondary cache size: {cache_mb} Mbytes"));
                     break;
                 }
             }

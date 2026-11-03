@@ -104,6 +104,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 |---|---|---|
 | [frontend-pcm-output.md](devices/frontend-pcm-output.md) | design | Per-machine PCM factory for SDL hosts, bounded stereo ring, no CPAL fallback and pause/stop ownership |
 | [embedded-flash-prom-selection.md](devices/embedded-flash-prom-selection.md) | rule | Fork O2/Octane firmware: empty path selects embedded bytes, defaults probe local files, explicit override errors never fall back |
+| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30); threading, byte order and open items |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [audio-test-suite.md](devices/audio-test-suite.md) | howto | The audio test suite (`test/audiotest`): rates x channels x widths through the audio library, playaiff and sfplay, checked against the Octane's capture |
 | [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |
@@ -330,7 +331,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 
 | Note | Kind | Title |
 |---|---|---|
-| [ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md](snapshot/ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md) | howto | CI mode overlay path is /tmp/iris-ci-PID-scsiID.overlay |
+| [ci-mode-overlay-is-in-the-temporary-directory.md](snapshot/ci-mode-overlay-is-in-the-temporary-directory.md) | howto | CI mode overlay path is $TMPDIR/iris-ci-PID-START-scsiID.overlay |
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
@@ -402,6 +403,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | [irix-install.md](irix/irix-install.md) | howto | Installing IRIX on iris (from scratch) |
 | [keyboard-issues.md](irix/keyboard-issues.md) | open | IRIX Keyboard Issues |
 | [networking.md](irix/networking.md) | howto | IRIX 6.5 Networking Configuration |
+| [octane-halt-request-outlives-a-quit.md](irix/octane-halt-request-outlives-a-quit.md) | rule | Octane: quitting during the PROM's halt leaves the next boot at "Okay to power off" |
 
 ## build/
 
