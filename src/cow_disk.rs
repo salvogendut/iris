@@ -215,9 +215,43 @@ pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Resul
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    // The rename is not on the host's disk until its directory is.
-    crate::chd_disk::fsync_dir(path.parent())
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&tmp, path)?;
+        // The rename is not on the host's disk until its directory is.
+        crate::chd_disk::fsync_dir(path.parent())
+    }
+    #[cfg(windows)]
+    {
+        // Windows cannot open/fsync a directory as a normal File. Request
+        // write-through publication after flushing the sidecar's contents.
+        replace_sidecar_windows(&tmp, path)
+    }
+}
+
+#[cfg(windows)]
+fn replace_sidecar_windows(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if value.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in sidecar path"));
+        }
+        value.push(0);
+        Ok(value)
+    }
+    let from = wide(from)?;
+    let to = wide(to)?;
+    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
+    // No COPY_ALLOWED: the sidecar replacement must stay on one filesystem.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub struct CowDisk {
@@ -443,6 +477,30 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("iris-cow-{}-{}.{}", tag, nanos, ext))
+    }
+
+    #[test]
+    fn sidecar_publication_creates_replaces_and_reports_failure() {
+        let dir = unique_tmp("sidecar-publication", "dir");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("disk.overlay.dirty");
+        for dirty in [HashSet::from([1, 9]), HashSet::from([4]), HashSet::new()] {
+            save_dirty_sidecar(&path, &dirty).unwrap();
+            assert_eq!(load_dirty_sidecar(&path).unwrap(), dirty);
+            assert!(!path.with_extension("dirty.tmp").exists());
+        }
+        let blocked = dir.join("blocked.dirty");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), b"untouched").unwrap();
+        assert!(save_dirty_sidecar(&blocked, &HashSet::from([2])).is_err());
+        assert_eq!(std::fs::read(blocked.join("keep")).unwrap(), b"untouched");
+        #[cfg(windows)]
+        {
+            let malformed = dir.join("disk.overlay.dirty\0ignored");
+            assert_eq!(replace_sidecar_windows(&path, &malformed).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert!(path.exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The fallback copies the dirty sectors and nothing else: a 64 MiB

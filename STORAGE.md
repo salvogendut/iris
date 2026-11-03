@@ -151,6 +151,11 @@ Protects disk images from corruption during development and testing. The base
 `.overlay.dirty` record beside it of which sectors the overlay holds. Delete
 both to reset to the clean base.
 
+Sidecar replacement flushes the new file before publishing it. Unix then
+flushes the containing directory; native Windows uses a write-through rename,
+so creating or compacting a raw overlay does not require opening a directory
+as a regular file. Publication errors are reported to the caller.
+
 The record grows as each write lands, so ending iris any way at all (Ctrl-C,
 `kill`, `kill -9`, a crash of iris itself) keeps every write the guest had
 made. To the guest that is a power cut: its filesystem recovers as it would on

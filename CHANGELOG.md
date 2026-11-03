@@ -21,6 +21,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Native Windows raw disks
+
+- Publish raw disk overlay records with a write-through rename on Windows.
+  Guest writes and clean flushes no longer fail with Access Denied while
+  attempting to open the containing directory as a regular file.
+
 ### JIT restart in embedded frontends
 
 - Keep priority compilation requests within their owning JIT pool. Restarting
