@@ -1,5 +1,14 @@
 # Preserve embedded lifecycle support when merging upstream machine changes
 
+Current workflow (2026-11-03): at the user's request, all performance-branch
+work is now integrated into `xiri` via `26771f9`. Develop only on `xiri`;
+`perf/sgiemu-port` is retired, not deleted. The root checkout now owns `xiri`;
+the former integration worktree is clean and detached at `26771f9`, and the
+NetBSD qualification worktree remains pinned. The separate-branch instructions
+below describe the earlier upstream-only update, not the current workflow.
+SGIEmu GPR/RTC caching is opt-in and off by default; see
+[the per-machine policy note](../perf/sgiemu-policy-belongs-to-the-machine.md).
+
 2026-11-02 integration of upstream `43e525a` into Xiri.
 
 The fork loads Octane firmware through an embedded firmware provider, so upstream diagnostics cannot assume a local `prom_path` exists. Describe the loaded PROM revision instead. The initial merged build exposed that reference; both workspace and JIT/idle suites pass after correcting it.

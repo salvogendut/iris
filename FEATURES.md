@@ -285,6 +285,7 @@ TOML option and does not change the standalone defaults above; see
 
 | Key | Default | Values and behavior |
 |---|---|---|
+| `perf.sgiemu_optimizations` | `false` | Opt in to SGIEmu-inspired integer JIT GPR caching and Indy/Indigo2 RTC calendar caching. Requires machine restart; the GPR cache requires `jitv2` without `developer`/`jitv2_lockstep`. Ordinary JIT compilation and correctness fixes stay enabled independently. |
 | `perf.thread_affinity` | `false` | Enable supported host thread-affinity setup. |
 | `perf.cpu_core` | `automatic when unset` | Host logical CPU index for the guest CPU thread. |
 | `perf.rex3_core` | `automatic when unset` | Host logical CPU index for Newport drawing. |

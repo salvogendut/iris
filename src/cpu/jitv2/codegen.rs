@@ -31,6 +31,9 @@ use crate::cpu::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, Exe
 /// own reusable scratch allocations Cranelift would otherwise reallocate
 /// per function.
 pub struct Codegen {
+    /// Per-machine opt-in. Retained across arena resets and included in the
+    /// persistent code fingerprint; diagnostic builds still bypass the cache.
+    pub gpr_cache_enabled: bool,
     /// L1-D geometry for the inline load/store fast path, published by the
     /// CPU once at startup (`Jitv2::set_dc_geometry`). `Codegen` is not
     /// generic over `C: Cache`, so the shape has to arrive as data rather
@@ -641,6 +644,7 @@ impl Codegen {
     ) -> Self {
         Self {
             ctx: module.make_context(),
+            gpr_cache_enabled: false,
             module,
             builder_ctx: FunctionBuilderContext::new(),
             func_id_counter: 0,
@@ -854,7 +858,7 @@ impl Codegen {
         use std::fmt::Write as _;
         let _ = write!(
             s,
-            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
+            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} gpr_cache={} dc={:?} triple={} flags={}",
             crate::cpu::jitv2::comp::max_instrs_per_compile(),
             crate::cpu::jitv2::comp::min_instrs_to_compile(),
             Self::opt_level_speed(),
@@ -865,6 +869,7 @@ impl Codegen {
             crate::cpu::jitv2::entry_preamble_forced(),
             skip_entry_preamble,
             crate::cpu::jitv2::isa::mips4_enabled(),
+            self.gpr_cache_enabled,
             self.dc_geometry,
             isa.triple(),
             isa.flags(),
@@ -1704,7 +1709,8 @@ impl Codegen {
         // FPU regions also keep that path: retaining page-wide GPR values
         // regressed call-heavy FP benchmarks. Limit this optimization to
         // integer regions until a selective cache pays off for mixed code.
-        let gpr_cache: Option<[Variable; 31]> = if !cfg!(any(feature = "developer", feature = "jitv2_lockstep"))
+        let gpr_cache: Option<[Variable; 31]> = if self.gpr_cache_enabled
+            && !cfg!(any(feature = "developer", feature = "jitv2_lockstep"))
             && !has_fpu
             && !instrs_linear(instrs).any(|instr| instr.is_fallback)
         {

@@ -7,6 +7,19 @@ Build-feature and configuration combinations are listed in
 
 ## Testing and benchmarking
 
+The optional SGIEmu GPR cache should be checked in both modes against the
+interpreter. The equivalence harness accepts a test-only selector; it does not
+change normal emulator configuration:
+
+```sh
+IRIS_TEST_SGIEMU=0 cargo test --features jitv2 cpu::jitv2::equiv_test -- --test-threads=2
+IRIS_TEST_SGIEMU=1 cargo test --features jitv2 cpu::jitv2::equiv_test -- --test-threads=2
+```
+
+Omit `developer` and `jitv2_lockstep` to exercise the register cache. RTC unit
+tests exercise both policies automatically. Normal machines select the caches
+with `[perf] sgiemu_optimizations`, which defaults to false; see [HELP.md](HELP.md).
+
 Two bare-metal MIPS suites run on the emulated CPU with no operating system in
 the way. They answer different questions and neither replaces the other.
 

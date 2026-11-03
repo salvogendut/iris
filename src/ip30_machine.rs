@@ -378,7 +378,7 @@ impl OctaneMachine {
             .map(|id| {
                 macro_rules! build {
                     ($cache:ty) => {
-                        Self::build_cpu::<$cache>(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone())
+                        Self::build_cpu::<$cache>(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone(), cfg.perf.sgiemu_optimizations)
                     };
                 }
                 match cfg.machine.cpu {
@@ -608,8 +608,9 @@ impl OctaneMachine {
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
+        sgiemu_optimizations: bool,
     ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<C>(memory);
+        let cfg = MipsCpuConfig::for_model::<C>(memory).with_sgiemu_optimizations(sgiemu_optimizations);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.

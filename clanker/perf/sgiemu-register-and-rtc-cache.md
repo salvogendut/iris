@@ -1,6 +1,10 @@
 # Cache native GPR values explicitly and RTC conversion once per tick
 
-Status: implemented on `perf/sgiemu-port`, 2026-11-01.
+Status: integrated into `xiri`, 2026-11-03. `perf/sgiemu-port` is retired.
+Both caches now require `[perf] sgiemu_optimizations = true` (default false).
+Historical measurements below were made with the caches enabled. See
+[sgiemu-policy-belongs-to-the-machine.md](sgiemu-policy-belongs-to-the-machine.md)
+for policy propagation and validation of the toggle.
 
 ## Source and scope
 

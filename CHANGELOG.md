@@ -30,6 +30,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGIEmu-inspired emulation optimizations
 
+- Integrate the performance work into `xiri`. Both caches are now opt-in via
+  `[perf] sgiemu_optimizations = true`, or the Performance control in iris-gui
+  and Prismatic. Defaults and existing configurations leave them off. A change
+  takes effect when the machine restarts; correctness fixes apply in either mode.
 - Keep guest GPR values in compiler SSA variables across native integer JIT
   regions, reducing repeated loads around interrupt checks and memory calls. Register
   writes still update architectural state immediately for faults and exits.

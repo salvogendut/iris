@@ -361,6 +361,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [phase3-platform.md](perf/phase3-platform.md) | design | Phase 3 platform notes |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
 | [sgiemu-register-and-rtc-cache.md](perf/sgiemu-register-and-rtc-cache.md) | measure | SGIEmu-inspired GPR caching and centisecond RTC conversion caching |
+| [sgiemu-policy-belongs-to-the-machine.md](perf/sgiemu-policy-belongs-to-the-machine.md) | rule | Opt-in GPR/RTC caches belong to each machine; preserve worker policy and separate persistent code keys |
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
 
 ## testing/

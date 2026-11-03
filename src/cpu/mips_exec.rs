@@ -696,6 +696,8 @@ impl TranslateResult {
 #[derive(Debug, Clone)]
 pub struct MipsCpuConfig {
     pub tlb_entries: usize,
+    /// Opt in to the SGIEmu-inspired GPR cache for this CPU's JIT pool.
+    pub sgiemu_optimizations: bool,
     /// Where the machine has memory.
     pub memory: Arc<crate::memory_map::MemoryMap>,
 }
@@ -704,7 +706,7 @@ impl MipsCpuConfig {
     /// Default configuration matching SGI Indy (R4400): 48-entry TLB.
     /// Cache geometry is fixed at compile time via constants in mips_cache_v2.
     pub fn indy() -> Self {
-        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)) }
+        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)), sgiemu_optimizations: false }
     }
 
     /// The JTLB size the CPU model declares.
@@ -716,7 +718,12 @@ impl MipsCpuConfig {
     /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
     /// test — every one of its reported failures was that write going nowhere.
     pub fn for_model<C: crate::cpu::mips_cache_v2::CpuModel>(memory: Arc<crate::memory_map::MemoryMap>) -> Self {
-        Self { tlb_entries: C::TLB_ENTRIES, memory }
+        Self { tlb_entries: C::TLB_ENTRIES, memory, sgiemu_optimizations: false }
+    }
+
+    pub fn with_sgiemu_optimizations(mut self, enabled: bool) -> Self {
+        self.sgiemu_optimizations = enabled;
+        self
     }
 }
 
@@ -2322,7 +2329,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
         // doc comments on the struct fields.
         #[cfg(feature = "jitv2")]
-        let mut jitv2 = crate::cpu::jitv2::Jitv2::for_memory(crate::cpu::jitv2::JITV2_INITIAL_PAGE_CAPACITY, &cfg.memory);
+        let mut jitv2 = crate::cpu::jitv2::Jitv2::for_memory(crate::cpu::jitv2::JITV2_INITIAL_PAGE_CAPACITY, &cfg.memory)
+            .with_sgiemu_optimizations(cfg.sgiemu_optimizations);
         // The ISA level travels as data rather than through a global: the
         // model's `MIPS4` const goes to the compile pool here and to this
         // executor's own inline analyzer below, and from there into
@@ -11430,7 +11438,7 @@ mod undo_range_tests {
     impl BusDevice for NoBus {}
 
     fn tracked(ranges: Vec<MemRange>, virt: u64) -> usize {
-        let cfg = MipsCpuConfig { tlb_entries: 48, memory: Arc::new(MemoryMap::new(ranges)) };
+        let cfg = MipsCpuConfig { tlb_entries: 48, memory: Arc::new(MemoryMap::new(ranges)), sgiemu_optimizations: false };
         let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
             MipsExecutor::new(Arc::new(NoBus), PassthroughTlb::default(), &cfg);
         exec.core.cp0_status |= STATUS_KX;

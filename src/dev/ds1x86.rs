@@ -31,6 +31,8 @@ struct RtcData {
     // Calendar registers already represent this tick. Never serialized: loads
     // and guest writes invalidate it, including writes within the same tick.
     converted_centiseconds: Option<u64>,
+    // Host policy, not snapshot state. Accessed under the existing RTC lock.
+    calendar_cache_enabled: bool,
 }
 
 pub struct Ds1x86 {
@@ -56,6 +58,7 @@ impl Ds1x86 {
                 base_centiseconds: 0,
                 time_base: Instant::now(),
                 converted_centiseconds: None,
+                calendar_cache_enabled: false,
             }),
             size,
             nvram_path,
@@ -86,6 +89,14 @@ impl Ds1x86 {
         }
 
         rtc
+    }
+
+    /// Configure the optional calendar cache. A policy change invalidates the
+    /// old conversion; snapshots and NVRAM never override the host's choice.
+    pub fn set_calendar_cache_enabled(&self, enabled: bool) {
+        let mut data = self.data.lock();
+        data.calendar_cache_enabled = enabled;
+        data.converted_centiseconds = None;
     }
 
     /// Default save path for this NVRAM (the same file we loaded from).
@@ -211,7 +222,7 @@ impl Ds1x86 {
         let elapsed_centiseconds = (elapsed.as_secs() * 100) + (elapsed.subsec_nanos() / 10_000_000) as u64;
         let current_centiseconds = rtc_data.base_centiseconds + elapsed_centiseconds;
 
-        if rtc_data.converted_centiseconds != Some(current_centiseconds) {
+        if !rtc_data.calendar_cache_enabled || rtc_data.converted_centiseconds != Some(current_centiseconds) {
             self.centiseconds_to_regs(current_centiseconds, &mut rtc_data.regs, 0);
             rtc_data.converted_centiseconds = Some(current_centiseconds);
         }
@@ -517,68 +528,100 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cached_calendar_advances_at_centisecond_boundaries() {
+    fn calendar_cache_is_opt_in_and_policy_is_not_restored() {
         let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
-        let mut data = rtc.data.lock();
-        let now = Instant::now();
-        // 2000-02-28 23:59:59.99 UTC, immediately before leap day.
-        data.base_centiseconds = 95178239999;
-        data.time_base = now;
-        rtc.update_time_at(&mut data, now);
-        let before = data.regs.clone();
-        rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(9));
-        assert_eq!(data.regs, before);
-        rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(10));
-        assert_eq!(data.regs[0], 0);
-        assert_eq!(data.regs[1], 0);
-        assert_eq!(data.regs[2], 0);
-        assert_eq!(data.regs[4], 0);
-        assert_eq!(data.regs[8], 0x29);
-        assert_eq!(data.regs[9] & 0x1f, 0x02);
+        assert!(!rtc.data.lock().calendar_cache_enabled);
+        for enabled in [false, true] {
+            rtc.set_calendar_cache_enabled(enabled);
+            let mut data = rtc.data.lock();
+            let now = data.time_base;
+            rtc.update_time_at(&mut data, now);
+            let seconds = data.regs[1];
+            // A stale value at the same tick exposes whether conversion was
+            // actually bypassed, rather than merely producing equal dates.
+            data.regs[1] = 0xff;
+            rtc.update_time_at(&mut data, now);
+            assert_eq!(data.regs[1], if enabled { 0xff } else { seconds });
+            drop(data);
+            let saved = rtc.save_state();
+            rtc.set_calendar_cache_enabled(!enabled);
+            rtc.load_state(&saved).unwrap();
+            assert_eq!(rtc.data.lock().calendar_cache_enabled, !enabled);
+        }
+    }
+
+    #[test]
+    fn cached_calendar_advances_at_centisecond_boundaries() {
+        for enabled in [false, true] {
+            let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
+            rtc.set_calendar_cache_enabled(enabled);
+            let mut data = rtc.data.lock();
+            let now = Instant::now();
+            // 2000-02-28 23:59:59.99 UTC, immediately before leap day.
+            data.base_centiseconds = 95178239999;
+            data.time_base = now;
+            rtc.update_time_at(&mut data, now);
+            let before = data.regs.clone();
+            rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(9));
+            assert_eq!(data.regs, before);
+            rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(10));
+            assert_eq!(data.regs[0], 0);
+            assert_eq!(data.regs[1], 0);
+            assert_eq!(data.regs[2], 0);
+            assert_eq!(data.regs[4], 0);
+            assert_eq!(data.regs[8], 0x29);
+            assert_eq!(data.regs[9] & 0x1f, 0x02);
+        }
     }
 
     #[test]
     fn raw_monitor_write_invalidates_calendar_cache() {
-        let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
-        let now = Instant::now();
-        let before = {
+        for enabled in [false, true] {
+            let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
+            rtc.set_calendar_cache_enabled(enabled);
+            let now = Instant::now();
+            let before = {
+                let mut data = rtc.data.lock();
+                data.time_base = now;
+                rtc.update_time_at(&mut data, now);
+                data.regs[1]
+            };
+            rtc.execute_command("rtc", &["w", "1", "99"], Box::new(std::io::sink())).unwrap();
             let mut data = rtc.data.lock();
-            data.time_base = now;
+            assert!(data.converted_centiseconds.is_none());
+            // Raw monitor writes do not reset the time base. The next update
+            // must still restore the running clock, even in the same tick.
             rtc.update_time_at(&mut data, now);
-            data.regs[1]
-        };
-        rtc.execute_command("rtc", &["w", "1", "99"], Box::new(std::io::sink())).unwrap();
-        let mut data = rtc.data.lock();
-        assert!(data.converted_centiseconds.is_none());
-        // Raw monitor writes do not reset the time base. The next update
-        // must still restore the running clock, even in the same tick.
-        rtc.update_time_at(&mut data, now);
-        assert_eq!(data.regs[1], before);
+            assert_eq!(data.regs[1], before);
+        }
     }
 
     #[test]
     fn calendar_cache_is_invalidated_by_writes_and_restore() {
-        let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
-        {
-            let mut data = rtc.data.lock();
-            rtc.update_time(&mut data);
-            assert!(data.converted_centiseconds.is_some());
+        for enabled in [false, true] {
+            let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
+            rtc.set_calendar_cache_enabled(enabled);
+            {
+                let mut data = rtc.data.lock();
+                rtc.update_time(&mut data);
+                assert!(data.converted_centiseconds.is_some());
+            }
+            // Freeze then write seconds, just as a guest sets the clock.
+            rtc.write8(CMD_REG_OFFSET as u64, 0);
+            rtc.write8(1, 0x42);
+            assert!(rtc.data.lock().converted_centiseconds.is_none());
+            let saved = rtc.save_state();
+            rtc.write8(CMD_REG_OFFSET as u64, TE_BIT);
+            assert_eq!(rtc.read8(1).data, 0x42);
+            assert!(rtc.data.lock().converted_centiseconds.is_some());
+            rtc.load_state(&saved).unwrap();
+            assert!(rtc.data.lock().converted_centiseconds.is_none());
+            assert_eq!(rtc.read8(1).data, 0x42);
+            // Re-enabling within the same tick must not reuse pre-restore data.
+            rtc.write8(CMD_REG_OFFSET as u64, TE_BIT);
+            assert!(rtc.data.lock().converted_centiseconds.is_none());
+            assert_eq!(rtc.read8(1).data, 0x42);
         }
-        // Freeze then write seconds, just as a guest sets the clock.
-        rtc.write8(CMD_REG_OFFSET as u64, 0);
-        rtc.write8(1, 0x42);
-        assert!(rtc.data.lock().converted_centiseconds.is_none());
-        let saved = rtc.save_state();
-        rtc.write8(CMD_REG_OFFSET as u64, TE_BIT);
-        assert_eq!(rtc.read8(1).data, 0x42);
-        assert!(rtc.data.lock().converted_centiseconds.is_some());
-        rtc.load_state(&saved).unwrap();
-        assert!(rtc.data.lock().converted_centiseconds.is_none());
-        assert_eq!(rtc.read8(1).data, 0x42);
-        // Re-enabling within the same tick must not reuse pre-restore data.
-        rtc.write8(CMD_REG_OFFSET as u64, TE_BIT);
-        assert!(rtc.data.lock().converted_centiseconds.is_none());
-        assert_eq!(rtc.read8(1).data, 0x42);
     }
 
     /// Phase 1.7 round-trip: a fresh RTC loaded from a captured save_state must

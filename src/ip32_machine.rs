@@ -241,8 +241,8 @@ impl O2Machine {
         let boot = Arc::new(BootState::new());
         let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
+            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone(), cfg.perf.sgiemu_optimizations),
+            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone(), cfg.perf.sgiemu_optimizations),
             _ => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
 
@@ -366,13 +366,14 @@ impl O2Machine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
-                    ram: Arc<O2Memory>) -> Arc<dyn CpuDevice>
+                    ram: Arc<O2Memory>, sgiemu_optimizations: bool) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>(memory);
+        let cfg = MipsCpuConfig::for_model::<C>(memory).with_sgiemu_optimizations(sgiemu_optimizations);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         exec.cache.set_pd_tag_store_hook(Box::new(move |tag| ram.stack_tag_store(tag)));

@@ -1542,6 +1542,10 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PerfConfig {
+    /// Opt-in SGIEmu-inspired JIT GPR and DS1386 calendar caches.
+    /// Applied when constructing a machine; changing it requires a restart.
+    #[serde(default)]
+    pub sgiemu_optimizations: bool,
     #[serde(default)]
     pub thread_affinity: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1555,6 +1559,7 @@ pub struct PerfConfig {
 impl Default for PerfConfig {
     fn default() -> Self {
         Self {
+            sgiemu_optimizations: false,
             thread_affinity: false,
             cpu_core: None,
             rex3_core: None,
@@ -3104,6 +3109,21 @@ pub fn parse_nat_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, std::net::Ipv
 
 #[cfg(test)]
 mod export_tests {
+    #[test]
+    fn sgiemu_optimizations_default_off_and_roundtrip() {
+        use super::MachineConfig;
+        for text in ["", "[perf]\nthread_affinity = false\n"] {
+            let cfg: MachineConfig = toml::from_str(text).unwrap();
+            assert!(!cfg.perf.sgiemu_optimizations);
+        }
+        for enabled in [false, true] {
+            let cfg: MachineConfig = toml::from_str(&format!("[perf]\nsgiemu_optimizations = {enabled}\n")).unwrap();
+            let saved = toml::to_string(&cfg).unwrap();
+            let restored: MachineConfig = toml::from_str(&saved).unwrap();
+            assert_eq!(restored.perf.sgiemu_optimizations, enabled);
+        }
+    }
+
     use super::*;
 
     #[test]

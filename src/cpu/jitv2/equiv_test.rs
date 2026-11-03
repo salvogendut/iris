@@ -249,6 +249,18 @@ mod tests {
         core
     }
 
+    // Run the equivalence suite in separate processes with this test-only
+    // selector set to 0 and 1. Production policy always comes from the machine.
+    fn sgiemu_test_mode() -> bool {
+        std::env::var("IRIS_TEST_SGIEMU").as_deref() == Ok("1")
+    }
+
+    fn test_codegen() -> Codegen {
+        let mut codegen = Codegen::new();
+        codegen.gpr_cache_enabled = sgiemu_test_mode();
+        codegen
+    }
+
     /// Build a fresh `MipsExecutor` over its own `MockMemory`, seeded
     /// identically for both engines: gpr/pc as given, nothing pending so
     /// the pending-interrupt preamble never bails during the test (that's a
@@ -276,7 +288,7 @@ mod tests {
         // right and the harness is the unusual one.
         let mem = Arc::new(mem);
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
-        let cfg = MipsCpuConfig::indy();
+        let cfg = MipsCpuConfig::indy().with_sgiemu_optimizations(sgiemu_test_mode());
         let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
             MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
         exec.core.gpr = gpr;
@@ -389,7 +401,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)?;
 
         let (exec, mem) = seeded_executor(gpr, pc);
@@ -475,7 +487,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, true, false)?;
 
         let (exec, mem) = seeded_executor(gpr, pc);
@@ -518,7 +530,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, true, false)?;
 
         let (exec, mem) = seeded_executor(gpr, pc);
@@ -996,7 +1008,7 @@ mod tests {
             let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, n as usize);
             assert!(non_empty);
             let mut instrs_owned = *walked;
-            let mut codegen = Codegen::new();
+            let mut codegen = test_codegen();
             let _jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
                 .expect("ADD chain must be compilable for this test to be meaningful");
             let size = codegen.last_code_size();
@@ -1024,7 +1036,7 @@ mod tests {
             let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, n as usize);
             assert!(non_empty);
             let mut instrs_owned = *walked;
-            let mut codegen = Codegen::new();
+            let mut codegen = test_codegen();
             let _jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
                 .expect("ADDU chain must be compilable for this test to be meaningful");
             let size = codegen.last_code_size();
@@ -1122,7 +1134,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded — check the test's encoding");
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         // The FR mode the code is pinned to MUST match the mode the core is
         // actually in, or emit_fr_mode_guard fires at entry and calls
         // jit_kill_entry — which this harness has no tracked
@@ -1292,7 +1304,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, fr1, false)?;
 
         let (exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
@@ -1344,7 +1356,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, fr1, false)?;
 
         let (exec, mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
@@ -1782,7 +1794,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 2);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("standalone word-0 region must compile");
 
@@ -2016,7 +2028,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, word_offset, page_base, 1);
         assert!(non_empty, "entry instruction must not be excluded");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
             .expect("region must be compilable for this test to be meaningful");
 
@@ -2140,7 +2152,7 @@ mod tests {
             let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base as u32, 2);
             assert!(non_empty, "entry instruction must not be excluded");
             let mut instrs_owned = *walked;
-            let mut codegen = Codegen::new();
+            let mut codegen = test_codegen();
             let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
                 .expect("region must be compilable for this test to be meaningful");
 
@@ -2234,7 +2246,7 @@ mod tests {
             let (walked, non_empty) = analyzer.walk_bounded(&page_words, word_offset, page_base, 1);
             assert!(non_empty, "entry instruction must not be excluded");
             let mut instrs_owned = *walked;
-            let mut codegen = Codegen::new();
+            let mut codegen = test_codegen();
             let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
                 .expect("region must be compilable for this test to be meaningful");
 
@@ -2435,12 +2447,12 @@ mod tests {
         // Helpers are a process-wide option. Isolate both configurations so
         // another test changing that option cannot bypass this regression.
         let Ok(mode) = std::env::var("IRIS_TEST_GPR_CACHE") else {
-            for mode in ["inline", "helpers"] {
+            for mode in ["inline-off", "inline-on", "helpers-off", "helpers-on"] {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact", "cpu::jitv2::equiv_test::tests::gpr_cache_loop_survives_memory_helpers_and_fault"])
                     .env("IRIS_TEST_GPR_CACHE", mode)
                     .env_remove("IRIS_MEM_HELPERS");
-                if mode == "helpers" { child.env("IRIS_MEM_HELPERS", "1"); }
+                if mode.starts_with("helpers") { child.env("IRIS_MEM_HELPERS", "1"); }
                 assert!(child.status().unwrap().success(), "{mode} regression failed");
             }
             return;
@@ -2470,8 +2482,9 @@ mod tests {
         assert!(non_empty);
         let mut instrs = *walked;
         assert!(!crate::cpu::jitv2::analyzer::instrs_linear(&instrs).any(|i| i.is_fallback));
-        let mut codegen = Codegen::new();
-        if mode == "helpers" {
+        let mut codegen = test_codegen();
+        codegen.gpr_cache_enabled = mode.ends_with("-on");
+        if mode.starts_with("helpers") {
             assert!(crate::cpu::jitv2::codegen::mem_helpers_enabled());
             // Build the real destination-writing helpers, but force their
             // slow path: PassthroughCache has no L1D backing pointers.
@@ -2615,7 +2628,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("J region must compile");
 
@@ -2667,7 +2680,7 @@ mod tests {
         assert!(non_empty);
         assert_eq!(walked[0].taken_exit, Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving));
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("J region must compile even though its target is off-page");
 
@@ -2725,7 +2738,7 @@ mod tests {
         assert_eq!(walked[0].taken_exit, Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving),
             "J is always classified PageLeaving regardless of on-page-ness (analyzer::jump_target's doc comment)");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("J region must compile");
 
@@ -2780,7 +2793,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 1, page_base, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 1, true, false)
             .expect("standalone word-1 region must compile");
 
@@ -2837,7 +2850,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("standalone word-0 region must compile");
 
@@ -2878,7 +2891,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("standalone word-0 region must compile");
 
@@ -2921,7 +2934,7 @@ mod tests {
         assert!(non_empty);
         assert_eq!(walked[4].taken_exit, Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving));
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 4, true, false)
             .expect("BEQ region must compile even though its taken target is off-page");
 
@@ -3246,7 +3259,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, LAST_WORD, page_base, 1);
         assert!(non_empty, "0xFFC word must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, LAST_WORD, true, false)
             .expect("0xFFC region must compile (ForeignPageSlot, not a decline)");
 
@@ -3434,7 +3447,7 @@ mod tests {
         assert!(non_empty);
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word, false, true)
             .expect("region must compile");
 
@@ -3516,7 +3529,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, page_base, 3);
         assert!(non_empty, "entry instruction must not be excluded");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, true, true)
             .expect("region must be compilable for this test to be meaningful");
 
@@ -3560,7 +3573,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, word, PAGE_A_BASE as u32, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word, true, true)
             .expect("single-instruction region must compile");
 
@@ -3621,7 +3634,7 @@ mod tests {
         assert!(non_empty);
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word, false, true)
             .expect("region must compile");
 
@@ -3662,7 +3675,7 @@ mod tests {
         assert!(non_empty);
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, last_word, true, false)
             .expect("region must compile");
 
@@ -3717,7 +3730,7 @@ mod tests {
         assert!(non_empty);
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word, false, false)
             .expect("nested branch-in-delay-slot region must compile without a verifier error");
 
@@ -3796,7 +3809,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, head_word, page_base as u32, usize::MAX);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, head_word, true, false)
             .expect("region must compile — must not panic indexing instrs[1024]");
 
@@ -3852,7 +3865,7 @@ mod tests {
         assert!(!walked[head_word as usize].has_inline_slot,
             "its slot must be deferred, not inlined");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, head_word, true, false)
             .expect("a branch with a deferred slot must compile");
 
@@ -4098,7 +4111,7 @@ mod tests {
         assert!(non_empty);
         let mut instrs_owned = *walked;
 
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word, false, false)
             .expect("self-loop region must compile");
 
@@ -4502,7 +4515,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, page_base, 1);
         assert!(non_empty, "entry instruction must not be excluded — check the test's instruction encoding");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
             .expect("masked store must be compilable for this test to be meaningful");
         let (jit_exec, jit_mem) = seeded_executor(gpr, pc);
@@ -4604,7 +4617,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 2);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("SWL+SWR region must compile");
         let (jit_exec, jit_mem) = seeded_executor(gpr, pc);
@@ -4697,7 +4710,7 @@ mod tests {
                     let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, page_base, 1);
                     assert!(non_empty);
                     let mut instrs_owned = *walked;
-                    let mut codegen = Codegen::new();
+                    let mut codegen = test_codegen();
                     let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
                         .expect("MOVCI must be compilable for this test to be meaningful");
                     let (jit_exec, _) = seeded_executor(gpr, pc);
@@ -4759,7 +4772,7 @@ mod tests {
                     let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 1);
                     assert!(non_empty);
                     let mut instrs_owned = *walked;
-                    let mut codegen = Codegen::new();
+                    let mut codegen = test_codegen();
                     let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, fr1, false)
                         .expect("FMOVCF must be compilable for this test to be meaningful");
 
@@ -5094,7 +5107,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 2);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("BEQ+ADD region must compile even though the slot traps");
 
@@ -5170,7 +5183,7 @@ mod tests {
         // it claims to.
         assert!(walked[1].visited && !walked[1].is_slot_only, "word 1 must be promoted to a real head (reached both as word 0's slot and word 3's branch target) for this test to be meaningful");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("region must be compilable for this test to be meaningful");
 
@@ -5227,7 +5240,7 @@ mod tests {
         assert!(non_empty, "entry instruction must not be excluded");
         assert!(walked[1].visited && !walked[1].is_slot_only, "word 1 must be promoted to a real head (reached both as word 0's slot and word 3's branch target) for this test to be meaningful");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("region must be compilable for this test to be meaningful");
 
@@ -5277,7 +5290,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 2);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("BEQ+ADD region must compile even though the slot traps");
 
@@ -5329,7 +5342,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("BEQL+ADD region must compile");
 
@@ -5435,7 +5448,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
             .expect("ADD.S must be compilable even though this test exercises the CU1-clear path");
         // fpu_seeded_executor's default MockMemory::new_not_compilable() is
@@ -5812,7 +5825,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         // compile_region has no cp0_status input — the CU1 guard it emits
         // is a runtime check baked into the compiled body, so this must
         // compile successfully regardless of live CU1 state at test time.
@@ -5875,7 +5888,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, 0, 2);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, true, false)
             .expect("branch with LWC1 slot must compile");
 
@@ -6567,7 +6580,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 1);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
             .expect("C.SEQ.S must be compilable");
         let (mut jit_exec, _m2) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
@@ -7232,7 +7245,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, excluded_word, page_base, 1);
         assert!(non_empty, "a lone excluded word must be a compilable (fallback) region");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, excluded_word, true, false)
             .expect("region containing a fallback must still compile");
 
@@ -7304,7 +7317,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, excluded_word, page_base, 2);
         assert!(non_empty, "a region entered at an excluded (fallback) word must compile");
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, excluded_word, true, false)
             .expect("region containing a fallback must still compile");
 
@@ -7716,7 +7729,7 @@ mod tests {
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, excluded_word, page_base, 2);
         assert!(non_empty);
         let mut instrs_owned = *walked;
-        let mut codegen = Codegen::new();
+        let mut codegen = test_codegen();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, excluded_word, true, false)
             .expect("region containing a fallback must still compile");
 
@@ -7812,7 +7825,7 @@ mod tests {
             let mut analyzer = Analyzer::new();
             let (walked, _) = analyzer.walk_bounded(&page_words, 0, (pc & !(PAGE_SIZE as u64 - 1)) as u32, 1);
             let mut instrs_owned = *walked;
-            let mut codegen = Codegen::new();
+            let mut codegen = test_codegen();
             let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable");
             let (exec, mem) = seeded_executor_over(
                 MockMemory::new().with_magic_responses(addr, responses), gpr, pc);
@@ -7880,7 +7893,7 @@ mod tests {
             let (walked, non_empty) = analyzer.walk_bounded(&page, 0, 0, ENTRIES_PER_PAGE as usize);
             assert!(non_empty, "probe region must not be empty");
             let mut region = *walked;
-            let mut codegen = Codegen::new();
+            let mut codegen = test_codegen();
             let jit_fn: JitFn = codegen
                 .compile_region(&mut region, 0, fr1, false)
                 .expect("probe instruction must be compilable");

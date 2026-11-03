@@ -484,6 +484,7 @@ impl Machine {
             }
         };
         let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int, scsi_buses);
+        hpc3.rtc().set_calendar_cache_enabled(cfg.perf.sgiemu_optimizations);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Backdoor-inject the configured (or default) Ethernet station
@@ -746,7 +747,8 @@ impl Machine {
         let sysad: Arc<dyn BusDevice> = phys.clone();
         let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone());
+        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone())
+            .with_sgiemu_optimizations(cfg.perf.sgiemu_optimizations);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.

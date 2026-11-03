@@ -2000,6 +2000,9 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.heading(t!("config-tab-performance"));
     subtitle(ui, t!("config-perf-subtitle"));
 
+    ui.checkbox(&mut cfg.perf.sgiemu_optimizations, t!("config-perf-sgiemu"))
+        .tip(t!("config-perf-sgiemu-tip"));
+
     ui.separator();
     ui.label(RichText::new(t!("config-perf-threads")).strong());
     Grid::new("perf_grid").num_columns(2).striped(true).show(ui, |ui| {

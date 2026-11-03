@@ -2326,6 +2326,8 @@ pub struct Jitv2 {
     /// exclusion discipline the compile thread already has by construction
     /// (only it ever touches its own moved-out copy).
     pub codegen: Mutex<Option<crate::cpu::jitv2::codegen::Codegen>>,
+    /// Fixed at construction, shared by inline compilation and every worker.
+    sgiemu_optimizations: bool,
 
     /// L1-D geometry for the inline load/store fast path, published once by
     /// the CPU thread at startup (`MipsExecutor::publish_jit_dc_geometry`)
@@ -2411,10 +2413,18 @@ impl Jitv2 {
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
+            sgiemu_optimizations: false,
             dc_geometry: Mutex::new(crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()),
             jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
             stats: Arc::new(JitStats::default()),
         }
+    }
+
+    /// Set the policy before this pool is shared with CPUs or started.
+    pub fn with_sgiemu_optimizations(mut self, enabled: bool) -> Self {
+        self.sgiemu_optimizations = enabled;
+        self.codegen.get_mut().as_mut().expect("new pool has inline codegen").gpr_cache_enabled = enabled;
+        self
     }
 
     /// Release `slot` back to the free list.
@@ -3373,6 +3383,7 @@ impl CompileQueue {
             let g = j.lock();
             codegen.dc_geometry = *g.dc_geometry.lock();
             codegen.jit_consts = *g.jit_consts.lock();
+            codegen.gpr_cache_enabled = g.sgiemu_optimizations;
         }
         // First worker to get here builds the shared helpers into the arena's
         // lowest range. Startup only — the flush path rebuilds them from the
@@ -3815,6 +3826,45 @@ impl CompileQueue {
 mod tests {
     use super::*;
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
+
+    #[test]
+    fn sgiemu_policy_reaches_workers_and_survives_restarts_and_arena_reset() {
+        let bus: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+        for enabled in [true, false] {
+            let owner = Arc::new(Mutex::new(Jitv2::new(1).with_sgiemu_optimizations(enabled)));
+            assert_eq!(owner.lock().codegen.lock().as_ref().unwrap().gpr_cache_enabled, enabled);
+            let mut queue = CompileQueue::new();
+            queue.set_owner(Arc::downgrade(&owner));
+            queue.set_thread_count(2);
+            for _ in 0..2 {
+                queue.start(bus.clone(), Arc::new(JitStats::default()));
+                let workers = queue.stop();
+                assert_eq!(workers.len(), 2);
+                for mut codegen in workers {
+                    assert_eq!(codegen.gpr_cache_enabled, enabled);
+                    // No code was published or executed by this empty pool.
+                    unsafe { codegen.reset(); }
+                    assert_eq!(codegen.gpr_cache_enabled, enabled);
+                    unsafe { codegen.release(); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sgiemu_modes_have_distinct_persistent_code_fingerprints() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let mut codegen = crate::cpu::jitv2::codegen::Codegen::new();
+        assert!(!codegen.gpr_cache_enabled);
+        let off = codegen.cache_fingerprint(false).unwrap();
+        codegen.gpr_cache_enabled = true;
+        let on = codegen.cache_fingerprint(false).unwrap();
+        assert_ne!(off, on);
+        // No pointers to code exist; resetting must preserve the cache domain.
+        unsafe { codegen.reset(); }
+        assert_eq!(codegen.cache_fingerprint(false), Some(on));
+        unsafe { codegen.release(); }
+    }
 
     /// A claimed, otherwise-untouched page slot for the FR-pin tests below.
     /// `claim` debug-asserts the slot is clean, so it must start unclaimed.

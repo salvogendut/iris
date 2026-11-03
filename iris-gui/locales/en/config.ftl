@@ -364,6 +364,8 @@ config-debug-rebuild-gui-tip =
 ## Performance
 
 config-perf-subtitle = How much of the host the emulator costs. None of this changes what the guest sees.
+config-perf-sgiemu = SGIEmu optimizations
+config-perf-sgiemu-tip = Optional JIT integer register and Indy/Indigo2 clock caches. Off by default; takes effect at the next machine start. JIT compilation itself remains available when this is off.
 config-perf-threads = Threads
 config-perf-affinity = Pin threads to cores
 config-perf-affinity-tip = Keep each emulator thread on one host core, so they don't fight over the same one. Needs a machine with at least three cores to help.

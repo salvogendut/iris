@@ -744,6 +744,7 @@ prebuf_ms = 20
 # ── Host tuning and debugging ────────────────────────────────────────────────
 
 [perf]
+sgiemu_optimizations = false # optional JIT GPR and Indy/Indigo2 RTC caches
 thread_affinity = false     # pin threads to cores
 # cpu_core = 2
 # rex3_core = 3
@@ -759,6 +760,17 @@ no_idle = false             # disable idle park (idle-pause builds); IRIS_NO_IDL
 gui_gl_capture = false      # iris-gui GL capture path; IRIS_GUI_GL
 # debug_log = "scsi,net"    # devlog module spec; IRIS_DEBUG_LOG
 ```
+
+The SGIEmu optimizations are off by default. Set `[perf] sgiemu_optimizations = true`
+to enable integer register caching in JIT builds and calendar caching on the
+Indy/Indigo2 RTC. The setting applies when a machine is constructed: restart it
+after changing the value. It is also available in iris-gui's **Performance** tab
+and in Prismatic under **F9 → Advanced → Performance → SGIEmu optimizations**
+(enable **Tinker** to show Advanced). Prismatic saves it separately for each
+machine label and confirms a restart when changing a running machine.
+Ordinary JIT compilation and the restart/rendering fixes remain available with
+this option off. Developer and lockstep builds bypass the GPR cache; the RTC
+cache still follows the setting. O2 and Octane use different RTCs.
 
 On a CD-ROM, hybrid ISO9660 discs (e.g. Hot Mix 19) may not automount under
 IRIX, while EFS and pure ISO9660 discs do. Mounting by hand works:

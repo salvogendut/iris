@@ -209,6 +209,7 @@ are not always the right trade:
 | **Pin threads to cores** | Keep the CPU, graphics and refresh threads on separate host cores. Helps when there are cores to spare; on a two-core machine it costs more than it saves, so leave it off |
 | **Processors** | Emulated CPUs. Only the Octane takes more than one |
 | **JIT compile threads** | How many threads jitv2 builds pages with. One is enough on a small host, where extra threads only compete with the emulated CPU |
+| **SGIEmu optimizations** | Off by default. Enable integer JIT register caching and Indy/Indigo2 RTC calendar caching at the next machine start. Ordinary JIT compilation and correctness fixes are independent of this choice |
 | **Keep compiled code between runs** | jitv2's persistent page cache, and its folder |
 
 The frame path is built for the same reason. The renderer publishes only the

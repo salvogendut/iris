@@ -667,12 +667,16 @@ code into host code with Cranelift. The concepts:
   dispatched once stale. Aliased pages share a counter.
 - **No speculation.** Guest registers stay current in `MipsCore` memory,
   so the interpreter can take over at any instruction boundary and exceptions
-  need no rollback. Integer regions with no interpreter fallbacks also keep GPR
+  need no rollback. With `[perf] sgiemu_optimizations = true` (default false),
+  integer regions with no interpreter fallbacks also keep GPR
   copies in Cranelift SSA variables, letting the compiler reuse values across
   loops, interrupt checks and memory calls. Writes update both copies; a shared load
   helper refreshes its destination's SSA copy after success. Developer and
   lockstep builds, and regions containing FPU instructions, use the memory-only
-  path.
+  path. The policy belongs to each machine's JIT pool, is copied to every
+  compile worker and its inline compiler, and survives arena resets and worker
+  restarts. It is part of the persistent compiled-page fingerprint, so the two
+  modes cannot reuse each other's machine code. SMP CPUs share the same policy.
 - **Memory access.** Loads and stores that hit an already-cached L1D line are
   inlined; everything else calls back into Rust. Callouts take the core
   pointer as their first argument and return status in registers.
