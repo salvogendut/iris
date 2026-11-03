@@ -431,7 +431,10 @@ The export is a single root, so mount it as `/`:
 ```
 
 Use the gateway address shown in the GUI (it tracks your NAT subnet). The server
-fakes uid/gid/mode so the export behaves the same regardless of the host OS.
+fakes uid/gid/mode so the export behaves the same regardless of the host OS. The one
+mode bit it keeps is the execute bit (on Unix hosts): a file the host marks
+executable shows as `0755`, and a guest `chmod` or `CREATE` that sets or clears an
+execute bit changes the host file, so a binary linked on the share can run from it.
 
 For NetBSD, explicitly select UDP for both MOUNT and NFS; its default NFS
 transport is TCP, which this server does not implement:
@@ -651,7 +654,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
+profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
 cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
@@ -780,6 +783,29 @@ addresses the second controller.
 
 ---
 
+## Checking a configuration
+
+`iris --validate --config FILE` reads a configuration the way a run would and
+reports what is wrong with it, without starting the machine, opening a window
+or touching the sound device. It exits 0 and prints `iris: FILE: ok (machine)`
+if a run from the command line would start, and otherwise exits 1 with one
+`Configuration error:` line per problem on stderr; a missing disk image is one,
+because a command-line run stops on it. A `Warning:` line is for something a run
+carries on past, such as a missing `prom` file on the Indy or Indigo2, which run
+their built-in PROM. Other options (`--scsi1`, `--cpu` and so on) apply first,
+as they do in a run.
+
+It checks that the file parses and has no unknown keys; that the settings agree
+(`machine.profile` with its processor, count, banks, graphics board and SCSI
+IDs, and the Unix serial sockets); that the PROM, every disk and CD image, the
+`load_elf` file and the NFS, TFTP and rsh directories exist; that the directories
+for the serial logs, serial sockets and scratch volumes exist; and that
+`serial_port_a`, `serial_port_b`, `monitor_port` and `gdb_port` are different
+ports. Whether a port is free, or a file is a valid image, is only known when a
+machine starts.
+
+---
+
 ## Command-line options
 
 All options are optional and override the corresponding `iris.toml` value.
@@ -793,7 +819,8 @@ Configuration
   --prom <FILE>               PROM image
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
-  --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
+  --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
+  --ip22                      Same as --machine indigo2_ip22
   --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
   --cpu <MODEL>               r4400 (default), r5000, or r10000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
@@ -830,6 +857,7 @@ Automation and debugging
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
+  --validate                  Check the --config file and exit; 0 if iris would start
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --serial-socket-a <PATH>    Also serve channel A on a Unix socket
