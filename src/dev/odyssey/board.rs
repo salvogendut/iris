@@ -100,7 +100,6 @@ pub(super) struct Reports {
     pub gl_program_mem_reported: bool,
     pub gl_texgen_logged: bool,
     pub gl_clip_logged: bool,
-    pub gl_texture_stage_logged: bool,
     pub gl_block_logged: bool,
     pub ctx_open_prim_logged: bool,
     pub ctx_shadow_fail_reported: bool,
@@ -291,6 +290,9 @@ pub(super) struct Geometry {
     pub lit: bool,
     /// The lit program lights back faces with the back material.
     pub two_sided: bool,
+    /// The lit program keeps the specular colour apart (its texture-mode
+    /// finish): GL_SEPARATE_SPECULAR_COLOR.
+    pub separate_specular: bool,
     pub local_viewer: bool,
     /// The geometry program renormalises transformed normals.
     pub normalize: bool,
@@ -304,6 +306,8 @@ pub(super) struct Geometry {
     pub program_half: u32,
     /// Derived from the retained program list.
     pub linear_texgen: u32,
+    /// GL_SPHERE_MAP generation, a bit a coordinate (S 1, T 2).
+    pub sphere_texgen: u32,
 }
 
 /// The 2D stream's GL immediate-mode subset, the X server's and greeter's
@@ -568,7 +572,6 @@ impl Default for Board {
                 gl_program_mem_reported: false,
                 gl_texgen_logged: false,
                 gl_clip_logged: false,
-                gl_texture_stage_logged: false,
                 gl_block_logged: false,
                 ctx_open_prim_logged: false,
                 ctx_shadow_fail_reported: false,
@@ -720,6 +723,7 @@ impl Default for Board {
                 clip_eye: [0; (CLIP_PLANES * 4) as usize],
                 lit: false,
                 two_sided: false,
+                separate_specular: false,
                 local_viewer: false,
                 normalize: false,
                 colour_overridden: false,
@@ -728,6 +732,7 @@ impl Default for Board {
                 regs_20_35: [0; 22],
                 program_half: 0,
                 linear_texgen: 0,
+                sphere_texgen: 0,
             },
             gl_color_index: 0,
             gl_color_is_index: false,
@@ -1064,17 +1069,18 @@ impl Board {
         self.geom.lit = false;
         self.geom.local_viewer = false;
         self.geom.two_sided = false;
+        self.geom.separate_specular = false;
         self.geom.normalize = false;
         self.geom.colour_overridden = false;
         self.diag.gl_program_logged_count = 0;
         self.diag.gl_texgen_logged = false;
         self.geom.linear_texgen = 0;
+        self.geom.sphere_texgen = 0;
         self.tex.linear_plane = [[0; 4]; 2];
         self.tex.linear_plane_r = [0; 4];
         self.tex.linear_plane_q = [0; 4];
         self.tex.linear_valid = 0;
         self.diag.gl_clip_logged = false;
-        self.diag.gl_texture_stage_logged = false;
         self.diag.gl_block_logged = false;
         self.diag.ctx_open_prim_logged = false;
         self.diag.ctx_shadow_fail_reported = false;
