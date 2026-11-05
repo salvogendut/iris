@@ -165,6 +165,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [release-forward-listeners-before-rebind.md](net/release-forward-listeners-before-rebind.md) | rule | Release old forwarding sockets before rebinding their ports |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
+| [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 mounts the share only if portmap has no TCP mappings and the MOUNT v3 reply lists AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
 | [nfs-fileid-1-panics-irix53-imon.md](net/nfs-fileid-1-panics-irix53-imon.md) | rule | NFS fileid 1 panics IRIX 5.3 through imon (fam) |
 | [netbsd-fragmented-nfs-upload-corruption.md](net/netbsd-fragmented-nfs-upload-corruption.md) | open | Intermittent NetBSD NFS upload corruption with 8192-byte requests after restore |
@@ -270,7 +271,9 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 | [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
 | [monitor-reads-quiesce-the-board.md](odyssey/monitor-reads-quiesce-the-board.md) | design | `vpro` state commands quiesce the board through `BoardLocks::quiesce` (format under the guard, write after); pixel, screen and memory dumps read board memory lock-free as the display does |
 | [wid-copies-move-the-bytes-the-masks-name.md](odyssey/wid-copies-move-the-bytes-the-masks-name.md) | rule | The X server fills a menu's overlay with whole-pixel copies in the window-id buffer under draw mask 0xc: copy raw only between like fields, write only the bytes the draw and plane masks name |
-| [front-and-back-arrives-as-front.md](odyssey/front-and-back-arrives-as-front.md) | open | pixtest's FRONT_AND_BACK geometry comes with draw mask 1, word for word the front-only draw; no board model can write the back from it; unsettled on the V10 (no double-buffered visual) |
+| [edge-flag-and-window-reads.md](odyssey/edge-flag-and-window-reads.md) | rule | glEdgeFlag is two zero-operand words (`0x2f00c02e` true, `0x3000c02e` false); a read or copy from a window takes its colour layout from the window's display mode, not the header's format byte; an ambiguous class-0 read is stencil unless the window shows indices; two-sided lighting |
+| [drawpixels-skips-fragment-operations.md](odyssey/drawpixels-skips-fragment-operations.md) | open | glDrawPixels pixels bypass depth, stencil, alpha and blend in the model; the fragment depth would come from the unmodelled raster position blocks 0x3cf8-0x3cfb |
+| [front-and-back-arrives-as-front.md](odyssey/front-and-back-arrives-as-front.md) | open | FRONT_AND_BACK geometry comes with draw mask 1, word for word the front-only draw, yet the real V10 draws both buffers (piglit `drawbuffer-modes`): the difference is outside the FIFO words the model sees |
 | [public-references.md](odyssey/public-references.md) | open | Odyssey (VPro) public references: two console-level drivers, no GL stream |
 | [test-encoder-hides-decoder-mistakes.md](odyssey/test-encoder-hides-decoder-mistakes.md) | rule | Golden scenes reach the pipeline's words through a test encoder that mirrors the decoder, so they cannot catch a misread word (bit 23 winding); judge on a real-stream replay |
 | [ring-wakeup-needs-seqcst-head-store.md](odyssey/ring-wakeup-needs-seqcst-head-store.md) | rule | The shader and back-end rings' sleep handshake lost wake-ups: a Release head store let the sleeping-flag load pass it; both sides must be SeqCst |
@@ -398,6 +401,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | [fetchverify-stale-code-detector.md](testing/fetchverify-stale-code-detector.md) | design | `fetchverify`: catching stale code that lockstep cannot see |
 | [installed-probe-test-is-load-flaky.md](testing/installed-probe-test-is-load-flaky.md) | history | `installed_probe_round_trips_to_the_compile_side` is load-flaky |
 | [loading-code-before-post-ram-is-unmapped.md](testing/loading-code-before-post-ram-is-unmapped.md) | rule | Loading code before POST: RAM is unmapped, and the write is silent |
+| [piglit-on-irix.md](testing/piglit-on-irix.md) | howto | piglit's IRIX branch against IRIS: the board lists, moving files in and out of guests and real machines, comparing emulated and real VPro runs |
 | [running-cpu-tests-on-real-hardware.md](testing/running-cpu-tests-on-real-hardware.md) | howto | Running cpu-tests on a real SGI Indy |
 | [scc-serial-output-from-bare-metal-code.md](testing/scc-serial-output-from-bare-metal-code.md) | rule | Getting serial output out of bare-metal guest code |
 | [sgi-volume-directory-layout-verified-on-real-media.md](testing/sgi-volume-directory-layout-verified-on-real-media.md) | rule | SGI volume directory: layout verified against real media |
@@ -409,6 +413,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 
 | Note | Kind | Title |
 |---|---|---|
+| [telnet-lines-are-cut-at-256.md](irix/telnet-lines-are-cut-at-256.md) | rule | A command line sent over telnet is cut at 256 characters (tty canonical mode): keep `irix-sh.py run` commands short or push a script; some images' xdm grabs the server until a console login |
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
 | [delay-loop-calibrated-cold.md](irix/delay-loop-calibrated-cold.md) | open | IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short (Octane "RAD UST not incrementing") |
 | [default-visual-24bit.md](irix/default-visual-24bit.md) | rule | The ip28 guest's X server defaults to 24-bit TrueColor |

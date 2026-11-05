@@ -355,7 +355,8 @@ pub(super) fn tag_name(tag: u32) -> Option<&'static str> {
         t if t == 0x4c0 + query::KIND_RASTER => "QUERY_RASTER",
         0x740 => "WORD_740",
         0x741 => "WORD_741",
-        0x2f00c02e | 0x3000c02e => "SYNC",
+        gl_cmd::EDGE_FLAG_TRUE => "EDGE_FLAG true",
+        gl_cmd::EDGE_FLAG_FALSE => "EDGE_FLAG false",
         cmd::COPY_RECT_TRIGGER => "COPY_RECT",
         cmd::IMAGE_BOX => "IMAGE_BOX",
         cmd::IMAGE_HEADER => "IMAGE_HEADER",
@@ -495,6 +496,14 @@ impl Board {
         let floats = if tag_floats(tag) && n > 0 { format!("  ({})", words_f32(ops)) } else { String::new() };
         let kernel = if self.cmd.from_kernel { "" } else { " user" };
         self.trace.fifo(format_args!("{name} {tag:#x} [{}] {}{floats}{kernel}", self.cmd.operand_count, words_hex(ops)));
+    }
+
+    /// The operands of a word the model does not know, as the parser passed
+    /// over them (Board::cmd_classify()).
+    pub fn trace_skipped(&self) {
+        let n = (self.cmd.operand_count as usize).min(self.cmd.operand.len());
+        let ops = &self.cmd.operand[..n];
+        self.trace.fifo(format_args!("skipped {:#x} [{}] {}  ({})", self.cmd.tag, self.cmd.operand_count, words_hex(ops), words_f32(ops)));
     }
 
     /// One of the parser's other completions (copy rect, pattern load, image
