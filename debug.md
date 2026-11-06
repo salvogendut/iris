@@ -403,6 +403,16 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `block debug <on\|off>` | Block/span draw logging to `block.log` **[DEV]** |
 | `draw debug <on\|off>` | Draw a debug overlay on the framebuffer **[DEV]** |
 
+Build with `--features rex-dirty-upload` to make Newport framebuffer snapshot
+copies and GL source-texture uploads use conservative 64x32 RGB/auxiliary
+dirty tiles. The feature is off by default. Register-only, palette, cursor,
+topscan, and heartbeat refreshes do not fabricate framebuffer damage. In a
+feature-enabled build, set `REX3_FORCE_FULL_UPLOAD=1` to restore the
+two-full-plane upload behavior for A/B debugging. A build with both
+`rex-dirty-upload` and `perfetto` exposes separate raster, copy, RGB/auxiliary
+upload, composition, and readback slices and byte/tile/rectangle counters; see
+[docs/perfetto.md](docs/perfetto.md#newport-framebuffer-damage-and-presentation).
+
 **GR2 (XZ / Extreme)**
 
 | Command | Description |

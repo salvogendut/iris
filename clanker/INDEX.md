@@ -375,6 +375,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [idle-pause-work.md](perf/idle-pause-work.md) | history | Idle-pause work — findings & handoff |
 | [idle-poll-backoffs-for-small-hosts.md](perf/idle-poll-backoffs-for-small-hosts.md) | rule | Idle poll backoffs: sleeps in milliseconds, not microseconds |
 | [phase3-platform.md](perf/phase3-platform.md) | design | Phase 3 platform notes |
+| [rex3-dirty-uploads-cut-presentation-traffic.md](perf/rex3-dirty-uploads-cut-presentation-traffic.md) | measure | REX3 dirty uploads cut source-plane presentation traffic |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
 | [sgiemu-register-and-rtc-cache.md](perf/sgiemu-register-and-rtc-cache.md) | measure | SGIEmu-inspired GPR caching and centisecond RTC conversion caching |
 | [sgiemu-policy-belongs-to-the-machine.md](perf/sgiemu-policy-belongs-to-the-machine.md) | rule | Opt-in GPR/RTC caches belong to each machine; preserve worker policy and separate persistent code keys |
