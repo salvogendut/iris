@@ -740,7 +740,7 @@ pub fn serial_line_with_override(
     let Some(host) = host else { return serial_line(line, log, ci); };
     if let Some(ci) = ci {
         if let Some(log) = log { ci.set_log(log); }
-        return (Arc::new(FanoutBackend(vec![ci.clone(), host.clone()])), true);
+        return (Arc::new(FanoutBackend::new(vec![ci.clone(), host.clone()])), true);
     }
     match log {
         Some(log) => (Arc::new(TeeBackend::new(host.clone(), log)), true),
