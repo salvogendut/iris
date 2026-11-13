@@ -269,7 +269,7 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 | `debug <on\|off\|file <path>>` | Print every executed instruction, or write them to a file **[DEV]** |
 | `trace start <path>` / `trace stop` / `trace status` | Record full per-instruction architectural state to a file **[DEV]** |
 | `idleprof <on\|off\|report [n]\|stats>` | Sample the PC to find idle and spin loops (`idle-pause` builds); `stats` prints park counters |
-| `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks it ended after a slice with every CPU idle, to poll the run queue; `alone`: idle-looking windows not parked because no other CPU was in the same loop), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
+| `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks it ended after a slice with every CPU idle, to poll the run queue; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
 | `instrstats [report\|clear\|dump]` | Per-instruction decode/execute counters (`--features instr_stats`) **[DEV]** |
 
 The undo buffer tracks register changes and memory writes. It does not
@@ -498,6 +498,7 @@ guest. `y = 0` is the top display line throughout.
 | `vpro raw <x> <y> [w] [h]` | Frame-buffer pixels' bytes as the scan-out reads them, with each pixel's window-id and overlay bytes |
 | `vpro peek <addr> [bytes]` | Board memory at an address in 16-byte units (the unit every base register uses), as hex bytes |
 | `vpro shot <file.png>` | The screen composed from board memory now, without waiting for the display thread |
+| `vpro scanout save <file>` | What the scan-out reads: the display registers, the displayed-buffer bits and the memory under the frame buffer and window-id buffer. The compose bench replays it offline (`VPRO_SCANOUT=file,... cargo test --release --lib odyssey::display_bench::compose_captures -- --ignored --nocapture`) |
 | `vpro fbdump [dir]` | The composed screen as `screen.png`, all of board memory as `board.bin` (offset = address x 16), and `layout.txt` with the pixel mode, the scan-out registers and the display modes (default `vprodump/`) |
 | `vpro hash` | The hash of board memory a replay checkpoint takes (`golden/replay.rs`), to compare a live board with a recording |
 | `vpro unimp` | Offsets and command words the board reported as not modelled |

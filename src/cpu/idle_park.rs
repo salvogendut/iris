@@ -43,9 +43,37 @@ const IDLE_STREAK: u32 = 1;
 /// count as idle: one batch's worth (1000 instructions, a sample every ~320),
 /// less one for a helper the idle loop calls from outside its own range.
 const RECENT_SAMPLES: usize = 3;
-/// The slice of a parked CPU: how long a `running` change or, on a
-/// multiprocessor, work queued by another CPU's interrupt handler may wait.
+/// Compiled batches between two probe runs of a stationary compiled loop
+/// that the last run did not find idle: a busy kernel loop with one exit
+/// loses one run ([`PROBE_RUN`] interpreted batches) in this many.
+const PROBE_BACKOFF: u32 = 256;
+/// Interpreted batches in one probe run: enough to fill the ring (ten) with
+/// a margin for a clock handler or the clears an interrupt costs, bounded so
+/// a loop the detector keeps resetting (interrupts masked) is not
+/// interpreted for good.
+const PROBE_RUN: u32 = 16;
+/// The slice of a parked uniprocessor: how often it looks at `running`
+/// while it waits for a line.
 const SLICE_NS: u64 = 1_000_000;
+/// The longest park of a multiprocessor's CPU while every CPU is idle. Work
+/// reaches an idle CPU without an interrupt, but only after some CPU has run
+/// an interrupt handler (a disk or network completion, an inter-processor
+/// interrupt) or work of its own, and that CPU wakes the others when it
+/// parks again or leaves its idle loop ([`kick_peers`]). What a CPU's own
+/// clock tick wakes waits for the other CPUs' ticks, and this slice bounds
+/// a hand-off nothing announced: one IRIX clock tick.
+/// `IRIS_IDLE_SLICE_US` overrides it.
+const ALL_IDLE_SLICE_NS: u64 = 10_000_000;
+/// Batches a CPU may run between two parks without waking the others when
+/// it parks again. A CPU woken to poll its run queue finds nothing and parks
+/// after one or two batches; one that ran longer did work, which may have
+/// made threads runnable on the other CPUs' queues. Low enough to catch a
+/// short thread, high enough that the polls of woken CPUs never wake each
+/// other in turn.
+const KICK_AFTER_BATCHES: u32 = 4;
+/// Region-exit signatures (PC, return address) a CPU remembers as its idle
+/// loop seen through compiled code (see [`IdleParkState::known_cluster`]).
+const KNOWN_PAIRS: usize = 32;
 /// The slice of a multiprocessor's parked CPU while another CPU still runs:
 /// how long work that CPU queues for it may wait (see `park`).
 const PEER_SLICE_NS: u64 = PEER_SLICE_DEFAULT_NS;
@@ -100,6 +128,10 @@ static SEEN: AtomicU8 = AtomicU8::new(0);
 /// leaves it. A CPU between two parks keeps its bit, so its waking does not
 /// count as another CPU running.
 static IDLE: AtomicU8 = AtomicU8::new(0);
+/// A bit per CPU another CPU asked to poll its run queue ([`kick_peers`]).
+/// Set before the unpark and consumed by the parked CPU, so it can tell the
+/// request from the wake every device interrupt sends to all parked CPUs.
+static KICKED: AtomicU8 = AtomicU8::new(0);
 /// The PC range (lowest, highest) of each CPU's dominant cluster while its
 /// window looks idle, zero otherwise. On a multiprocessor a CPU parks only
 /// where another CPU's idle-looking cluster lies within [`SHARED_LOOP_BYTES`]
@@ -134,6 +166,21 @@ pub static PARK_WAKE_SLICE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Idle-looking windows a multiprocessor's CPU did not park on because no
 /// other CPU was in the same loop.
 pub static PARK_ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Interrupt wakes by the lowest pending Cause.IP line (IP0..IP7), and by
+/// CPU: which source keeps parked CPUs from sleeping.
+pub static PARK_WAKE_IRQ_LINE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static PARK_WAKE_IRQ_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Parks a multiprocessor ended because another CPU asked this one to poll.
+pub static PARK_WAKE_KICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times a CPU asked the others to poll ([`kick_peers`]).
+pub static KICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Parks decided on compiled-code samples alone, from a learned signature.
+pub static KNOWN_PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Probe runs whose region-exit signature was learned as the idle loop.
+pub static LEARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Batches a jitv2 build ran interpreted to sample the PCs inside a compiled
+/// loop (see [`IdleParkState::wants_probe`]).
+pub static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IRQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -163,6 +210,30 @@ fn announce_parked(core: &MipsCore) {
 
 fn clear_parked(core: &MipsCore) {
     PARKED.fetch_and(!(1 << core.cpu_id), Ordering::SeqCst);
+}
+
+/// Ask every other CPU of a multiprocessor to leave its park and poll its run
+/// queue once. Called when this CPU may have made work for them: it parks
+/// again after running an interrupt handler or a stretch of work, or it
+/// leaves its idle loop. Same order as [`wake`]: the bits first, then the
+/// look at `PARKED`, so a CPU about to sleep either sees its bit or is
+/// unparked.
+fn kick_peers(core: &MipsCore) {
+    let others = SEEN.load(Ordering::Relaxed) & !(1 << core.cpu_id);
+    if others == 0 {
+        return;
+    }
+    KICKS.fetch_add(1, Ordering::Relaxed);
+    KICKED.fetch_or(others, Ordering::SeqCst);
+    if PARKED.load(Ordering::SeqCst) & others != 0 {
+        for (cpu, t) in PARKER.lock().iter().enumerate() {
+            if others & (1 << cpu) != 0 {
+                if let Some(t) = t {
+                    t.unpark();
+                }
+            }
+        }
+    }
 }
 
 /// Detects kernel idle loops from a per-instruction PC sample ring.
@@ -203,6 +274,38 @@ pub struct IdleParkState {
     busy: bool,
     /// Doublings of the peer slice since this CPU last had work.
     peer_backoff: u32,
+    /// Compiled batches until the next probe run of a stationary loop.
+    probe_backoff: u32,
+    /// Interpreted batches left in the current probe run.
+    probe_left: u32,
+    /// Return address (r31) of each sample, parallel to `pcs`. Under jitv2 a
+    /// sample is a region exit, often the entry of a helper on another page,
+    /// and the return address says which loop called it.
+    ras: [u64; PC_RING],
+    /// `core.irqs_taken` when this CPU last parked.
+    irqs_at_park: u64,
+    /// Batches since this CPU last parked (see [`KICK_AFTER_BATCHES`]).
+    batches_since_park: u32,
+    /// Region-exit signatures learned as this CPU's idle loop: the
+    /// (PC, return address) pairs of a stationary compiled ring that a probe
+    /// run then found idle at once.
+    known: [(u64, u64); KNOWN_PAIRS],
+    known_len: usize,
+    /// Next slot `learn` overwrites once `known` is full.
+    known_next: usize,
+    /// The interpreted idle cluster the signatures belong to, published for
+    /// the shared-loop rule when a park is decided on compiled samples.
+    known_loop: (u64, u64),
+    /// The dominant cluster of the last park decided on interpreted samples.
+    last_loop: (u64, u64),
+    /// The signature of the ring that started the current probe run.
+    probe_sig: [(u64, u64); CLUSTER_MIN_DISTINCT],
+    probe_sig_len: usize,
+    /// The last park was decided on a learned signature.
+    parked_known: bool,
+    /// `hot.cycles` at the last update: a reset starts it again from zero,
+    /// and the signatures of the old kernel go with it.
+    last_cycles: u64,
 }
 
 /// What to do with the current sample window.
@@ -246,6 +349,20 @@ impl IdleParkState {
             idle: false,
             busy: false,
             peer_backoff: 0,
+            probe_backoff: 0,
+            probe_left: 0,
+            ras: [0; PC_RING],
+            irqs_at_park: 0,
+            batches_since_park: 0,
+            known: [(0, 0); KNOWN_PAIRS],
+            known_len: 0,
+            known_next: 0,
+            known_loop: (0, 0),
+            last_loop: (0, 0),
+            probe_sig: [(0, 0); CLUSTER_MIN_DISTINCT],
+            probe_sig_len: 0,
+            parked_known: false,
+            last_cycles: 0,
             park_skip_until_cycle: 0,
             started: *PROCESS_START.get_or_init(Instant::now),
             warmup,
@@ -281,6 +398,7 @@ impl IdleParkState {
         self.sample_countdown = SAMPLE_EVERY;
         let user = !matches!(core.get_privilege_mode(), crate::cpu::mips_core::PrivilegeMode::Kernel);
         self.pcs[self.pc_pos] = core.pc;
+        self.ras[self.pc_pos] = core.gpr[31];
         self.user[self.pc_pos] = user;
         self.pc_pos = (self.pc_pos + 1) % PC_RING;
         if self.pc_len < PC_RING {
@@ -340,7 +458,15 @@ impl IdleParkState {
     /// queue; without this test it was parked again after one batch, and
     /// ran that handler 1000 instructions per clock tick (minutes at "The
     /// system is coming up." on a 4-CPU Tezro).
-    fn idle_cluster(&self) -> Option<(u64, u64)> {
+    ///
+    /// Returns the range and whether the newest batch is inside it. A
+    /// cluster the CPU has just left (the handler of the interrupt that
+    /// woke it, or work it found) is not idle, but not a busy window either:
+    /// the CPU keeps its idle flag and its published cluster until a full
+    /// window of other work displaces the loop. Clearing the flag on the
+    /// handler batch made every clock tick flip it, and the other CPUs,
+    /// seeing a peer running, cut their parks to the short peer slice.
+    fn idle_cluster(&self) -> Option<((u64, u64), bool)> {
         if self.pc_len < PC_RING {
             return None;
         }
@@ -354,7 +480,165 @@ impl IdleParkState {
                 !self.user[i] && (lo..=hi).contains(&self.pcs[i])
             })
             .count();
-        (recent + 1 >= RECENT_SAMPLES).then_some((lo, hi))
+        Some(((lo, hi), recent + 1 >= RECENT_SAMPLES))
+    }
+
+    /// Whether to start a probe run: the next batches run interpreted to see
+    /// where a compiled loop really is. Compiled code keeps a loop's
+    /// back-edges inside the region, so between `step_jit` calls the run
+    /// loop samples only region exits: an idle guest shows one or two PCs,
+    /// under `CLUSTER_MIN_DISTINCT`, and never parked (a jitv2 Tezro idled at
+    /// 400% host CPU). When the ring holds a stationary kernel cluster with
+    /// too few distinct PCs, the ring is cleared and [`PROBE_RUN`]
+    /// interpreted batches refill it with the loop's own PCs for the
+    /// ordinary test ([`IdleParkState::probe_done`] says when to stop). A run
+    /// that found no idle loop backs off [`PROBE_BACKOFF`] compiled batches.
+    pub fn wants_probe(&mut self) -> bool {
+        if self.probe_backoff > 0 {
+            self.probe_backoff -= 1;
+            return false;
+        }
+        if self.pc_len < PC_RING {
+            return false;
+        }
+        // A learned idle signature: `decide` reads this ring itself.
+        if self.known_cluster().is_some() {
+            return false;
+        }
+        if let Some(range) = self.stationary_range() {
+            let (pairs, n) = self.cluster_pairs(range);
+            let n = n.min(CLUSTER_MIN_DISTINCT);
+            self.probe_sig[..n].copy_from_slice(&pairs[..n]);
+            self.probe_sig_len = n;
+            self.clear_window();
+            self.probe_left = PROBE_RUN;
+            return true;
+        }
+        false
+    }
+
+    /// Whether this CPU has learned a compiled signature of its idle loop,
+    /// so the batches after a park can run compiled.
+    pub fn knows_compiled_idle(&self) -> bool {
+        self.known_len > 0
+    }
+
+    fn knows(&self, pair: (u64, u64)) -> bool {
+        self.known[..self.known_len].contains(&pair)
+    }
+
+    /// The distinct (PC, return address) pairs of the ring's kernel samples
+    /// inside `range`.
+    fn cluster_pairs(&self, (lo, hi): (u64, u64)) -> ([(u64, u64); PC_RING], usize) {
+        let mut pairs = [(0u64, 0u64); PC_RING];
+        let mut n = 0usize;
+        for i in 0..self.pc_len {
+            let pair = (self.pcs[i], self.ras[i]);
+            if !self.user[i] && (lo..=hi).contains(&pair.0) && !pairs[..n].contains(&pair) {
+                pairs[n] = pair;
+                n += 1;
+            }
+        }
+        (pairs, n)
+    }
+
+    /// The idle loop recognised from compiled samples: a stationary ring
+    /// whose every (PC, return address) pair in the dominant cluster is a
+    /// learned signature. Returns the learned loop's range and, as
+    /// [`IdleParkState::idle_cluster`] does, whether the newest samples
+    /// (all but one) are signature pairs. A busy loop that exits through
+    /// the same helper as the idle loop is told apart by the return address.
+    fn known_cluster(&self) -> Option<((u64, u64), bool)> {
+        if self.known_len == 0 {
+            return None;
+        }
+        let range = self.stationary_range()?;
+        let (pairs, n) = self.cluster_pairs(range);
+        if !pairs[..n].iter().all(|&p| self.knows(p)) {
+            return None;
+        }
+        let recent = (1..=RECENT_SAMPLES)
+            .filter(|k| {
+                let i = (self.pc_pos + PC_RING - k) % PC_RING;
+                !self.user[i] && self.knows((self.pcs[i], self.ras[i]))
+            })
+            .count();
+        Some((self.known_loop, recent + 1 >= RECENT_SAMPLES))
+    }
+
+    /// Remember the signature that started the current probe run as the
+    /// idle loop seen through compiled code.
+    fn learn(&mut self) {
+        for k in 0..self.probe_sig_len {
+            let pair = self.probe_sig[k];
+            if self.knows(pair) {
+                continue;
+            }
+            if self.known_len < KNOWN_PAIRS {
+                self.known[self.known_len] = pair;
+                self.known_len += 1;
+            } else {
+                self.known[self.known_next] = pair;
+                self.known_next = (self.known_next + 1) % KNOWN_PAIRS;
+            }
+        }
+        self.known_loop = self.last_loop;
+        LEARNED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A full ring dominated by a stationary kernel cluster of too few
+    /// distinct PCs: a compiled loop seen only at its region exits, or a
+    /// short poll loop. What the CPU does is unknown, so neither counts as
+    /// work: the idle flag and the published cluster are left as they were,
+    /// and a peer's probe run can still match the cluster this CPU published
+    /// from its own last run, where withdrawing it meant two CPUs had to
+    /// probe at the same moment to ever park (none did: 442 parks in a
+    /// 3-minute jitv2 boot).
+    fn stationary_unknown(&self) -> bool {
+        self.stationary_range().is_some()
+    }
+
+    /// The dominant cluster's range when the ring is stationary-unknown.
+    fn stationary_range(&self) -> Option<(u64, u64)> {
+        if self.pc_len < PC_RING {
+            return None;
+        }
+        let (samples, distinct, users, range) = self.largest_cluster();
+        (users <= PC_RING / 4 && samples >= CLUSTER_MIN_SAMPLES && distinct < CLUSTER_MIN_DISTINCT).then_some(range)
+    }
+
+    /// A probe batch ran and the detector decided `parked`: whether the next
+    /// batch probes too. A park gives the run a fresh budget, so the batches
+    /// after a wake stay interpreted while the clock handler the wake ran
+    /// returns to the idle loop (that batch is not idle, and a back-off there
+    /// put the CPU into compiled idle batches, 100 ms of them, every tick).
+    /// A run that spends its budget without a park is over, and backs off.
+    ///
+    /// A run that parks within its first two batches (the ring refills in
+    /// two) was started by the idle loop's own exits: their signature is
+    /// learned, and from then on compiled batches are read directly
+    /// ([`IdleParkState::known_cluster`]) and the run ends at its park.
+    pub fn probe_done(&mut self, parked: bool) -> bool {
+        PROBES.fetch_add(1, Ordering::Relaxed);
+        if parked {
+            if self.probe_sig_len > 0 && PROBE_RUN - self.probe_left <= 2 {
+                self.learn();
+            }
+            self.probe_sig_len = 0;
+            self.probe_backoff = 0;
+            if self.knows_compiled_idle() {
+                self.probe_left = 0;
+                return false;
+            }
+            self.probe_left = PROBE_RUN;
+            return true;
+        }
+        self.probe_left = self.probe_left.saturating_sub(1);
+        if self.probe_left > 0 {
+            return true;
+        }
+        self.probe_backoff = PROBE_BACKOFF;
+        false
     }
 
     /// Publish this CPU's idle-looking cluster (or none) for the others.
@@ -385,6 +669,13 @@ impl IdleParkState {
     /// mask bit set the spin is safe to `park`; a pending-but-masked interrupt
     /// is paced instead (see [`IdleParkState::pace`]).
     pub fn update(&mut self, core: &MipsCore) -> IdleDecision {
+        // A reset restarts the cycle counter, and may boot another kernel.
+        if core.hot.cycles < self.last_cycles {
+            self.known_len = 0;
+            self.known_next = 0;
+        }
+        self.last_cycles = core.hot.cycles;
+        self.batches_since_park = self.batches_since_park.saturating_add(1);
         let decision = self.decide(core);
         if core.smp {
             let bit = 1 << core.cpu_id;
@@ -406,6 +697,9 @@ impl IdleParkState {
                     IDLE.fetch_or(bit, Ordering::Relaxed);
                 } else {
                     IDLE.fetch_and(!bit, Ordering::Relaxed);
+                    // The others sleep long while every CPU is idle: tell
+                    // them one is not, so they poll on the peer slice.
+                    kick_peers(core);
                 }
             }
         }
@@ -485,32 +779,50 @@ impl IdleParkState {
                 RESET_USER.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if let Some(range) = self.idle_cluster() {
-            if core.smp {
-                Self::publish_cluster(core, Some(range));
-                if !Self::shared_by_a_peer(core, range) {
-                    PARK_ALONE.fetch_add(1, Ordering::Relaxed);
-                    self.streak = 0;
-                    return IdleDecision::None;
+        let (cluster, known) = match self.idle_cluster() {
+            Some(c) => (Some(c), false),
+            None => (self.known_cluster(), true),
+        };
+        match cluster {
+            Some((range, true)) => {
+                if core.smp {
+                    Self::publish_cluster(core, Some(range));
+                    if !Self::shared_by_a_peer(core, range) {
+                        PARK_ALONE.fetch_add(1, Ordering::Relaxed);
+                        self.streak = 0;
+                        return IdleDecision::None;
+                    }
+                }
+                self.streak += 1;
+                if self.streak >= IDLE_STREAK {
+                    self.streak = IDLE_STREAK;
+                    self.parked_known = known;
+                    if known {
+                        KNOWN_PARKS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.last_loop = range;
+                    }
+                    return IdleDecision::Park;
                 }
             }
-            self.streak += 1;
-            if self.streak >= IDLE_STREAK {
-                self.streak = IDLE_STREAK;
-                return IdleDecision::Park;
+            // The idle loop still dominates the ring, but the newest batch
+            // left it: a handler, or work. Neither idle nor busy yet.
+            Some((_, false)) => self.streak = 0,
+            None => {
+                let unknown = self.stationary_unknown();
+                if core.smp && !unknown {
+                    Self::publish_cluster(core, None);
+                }
+                self.streak = 0;
+                self.busy = self.pc_len == PC_RING && !unknown;
             }
-        } else {
-            if core.smp {
-                Self::publish_cluster(core, None);
-            }
-            self.streak = 0;
-            self.busy = self.pc_len == PC_RING;
         }
         IdleDecision::None
     }
 
-    /// Park in ≤1 ms slices until an interrupt is pending (masked or not)
-    /// or the CPU stops.
+    /// Park until an interrupt is pending (masked or not) or the CPU stops;
+    /// on a multiprocessor also until another CPU kicks this one or the
+    /// slice is up (see the comment on `peer_running` below).
     ///
     /// The Count==Compare interrupt needs no special handling here: the
     /// compare timer fires on the hptimer thread and ORs IP7 into
@@ -531,6 +843,20 @@ impl IdleParkState {
         // 60 s warm-up keeps the PROM and boot at full speed.
         PARK_COUNT.fetch_add(1, Ordering::Relaxed);
         PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
+        // This CPU ran an interrupt handler or a stretch of work since it
+        // last parked: either may have queued threads on the other CPUs' run
+        // queues, which they find only by polling. Wake them to poll now,
+        // so they can sleep long while nothing happens. The CP0 timer's own
+        // tick does not count (`irqs_taken`): on IP35 every CPU takes it, so
+        // each polls on its own tick anyway, and what a tick wakes is due
+        // only to the tick. Kicking on it tripled the parks of an idle Tezro.
+        if core.smp && (core.irqs_taken != self.irqs_at_park || self.batches_since_park >= KICK_AFTER_BATCHES) {
+            kick_peers(core);
+        }
+        self.irqs_at_park = core.irqs_taken;
+        self.batches_since_park = 0;
+        let bit = 1u8 << core.cpu_id;
+        let start = Instant::now();
         loop {
             if !running.load(Ordering::Relaxed) {
                 PARK_WAKE_OTHER.fetch_add(1, Ordering::Relaxed);
@@ -553,6 +879,13 @@ impl IdleParkState {
             // timer for good in such a loop: an IRIX 6.5 hang.)
             if ip != 0 {
                 PARK_WAKE_IRQ.fetch_add(1, Ordering::Relaxed);
+                PARK_WAKE_IRQ_LINE[((ip >> 8).trailing_zeros() & 7) as usize].fetch_add(1, Ordering::Relaxed);
+                PARK_WAKE_IRQ_CPU[core.cpu_id as usize % MAX_CPUS].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            // Another CPU asked this one to poll its run queue.
+            if core.smp && KICKED.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+                PARK_WAKE_KICK.fetch_add(1, Ordering::Relaxed);
                 break;
             }
             // ci_clock has no hptimer — the fire point is a cycles threshold
@@ -566,33 +899,44 @@ impl IdleParkState {
             // processor that queues work for it sends no interrupt. While any
             // other CPU still runs, poll again after a short slice; sleeping
             // until the next clock tick stalls every hand-off (an IP35 boot
-            // crawls). Once every CPU is parked, work still arrives without
-            // an interrupt for this CPU: the one that takes the clock tick
-            // runs the timeouts and queues the threads they wake on the
-            // other CPUs' run queues, and the IP35 kernel stops an idle
-            // CPU's own clock. So on a multiprocessor every slice ends the
-            // park and the idle loop polls; alone, sleep on until a line.
+            // crawls). Once every CPU is idle, work still arrives without an
+            // interrupt for this CPU: the one that takes the clock tick runs
+            // the timeouts and queues the threads they wake on the other
+            // CPUs' run queues, and the IP35 kernel stops an idle CPU's own
+            // clock. That CPU kicks the others when it parks again
+            // (`kick_peers`), so the slice is only a bound. Alone, sleep on
+            // until a line.
             let peer_running = core.smp && {
                 let others = SEEN.load(Ordering::Relaxed) & !(1 << core.cpu_id);
                 (PARKED.load(Ordering::SeqCst) | IDLE.load(Ordering::Relaxed)) & others != others
             };
-            let slice = if peer_running { peer_slice_ns() << self.peer_backoff } else { SLICE_NS };
+            let slice = if peer_running {
+                peer_slice_ns() << self.peer_backoff
+            } else if core.smp {
+                all_idle_slice_ns()
+            } else {
+                SLICE_NS
+            };
+            // A multiprocessor's park ends when its slice is up. Every device
+            // interrupt unparks all parked CPUs (`wake`), so a wake that was
+            // for another CPU sleeps on for the rest of the slice.
+            let waited = if core.smp { start.elapsed().as_nanos() as u64 } else { 0 };
+            if waited >= slice {
+                if peer_running {
+                    PARK_WAKE_PEER.fetch_add(1, Ordering::Relaxed);
+                    self.peer_backoff = (self.peer_backoff + 1).min(PEER_BACKOFF_MAX);
+                } else {
+                    PARK_WAKE_SLICE.fetch_add(1, Ordering::Relaxed);
+                }
+                break;
+            }
             let t0 = Instant::now();
             // Still a bounded slice — `running` and the ci_clock threshold are
             // only polled — but an interrupt now ends it at once.
-            std::thread::park_timeout(Duration::from_nanos(slice));
+            std::thread::park_timeout(Duration::from_nanos(slice - waited));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             PARK_SLEEP_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
             advance_parked(core, elapsed_ns);
-            if peer_running {
-                PARK_WAKE_PEER.fetch_add(1, Ordering::Relaxed);
-                self.peer_backoff = (self.peer_backoff + 1).min(PEER_BACKOFF_MAX);
-                break;
-            }
-            if core.smp {
-                PARK_WAKE_SLICE.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
         }
         // If the wake was for a line the guest cannot take (masked), this
         // was not an idle loop; back off so a device-poll or DELAY loop runs
@@ -602,6 +946,11 @@ impl IdleParkState {
         let im = core.cp0_status & STATUS_IM_MASK;
         if ip != 0 && (ip & im) == 0 {
             self.park_skip_until_cycle = core.hot.cycles.saturating_add(PARK_BACKOFF_CYCLES);
+            // A signature that led here was not the idle loop.
+            if self.parked_known {
+                self.known_len = 0;
+                self.known_next = 0;
+            }
         }
         // Every exit, including the ci_clock one, leaves the flag clear: a
         // stale `true` would put `wake` on the mutex for a running CPU.
@@ -686,6 +1035,14 @@ static IDLE_INIT: std::sync::Once = std::sync::Once::new();
 /// The multiprocessor masks `idle status` shows: CPUs seen, idle, parked.
 pub fn smp_masks() -> (u8, u8, u8) {
     (SEEN.load(Ordering::Relaxed), IDLE.load(Ordering::Relaxed), PARKED.load(Ordering::Relaxed))
+}
+
+/// The all-idle slice, overridable with `IRIS_IDLE_SLICE_US` for tuning.
+fn all_idle_slice_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        std::env::var("IRIS_IDLE_SLICE_US").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&us| us > 0).map_or(ALL_IDLE_SLICE_NS, |us| us * 1000)
+    })
 }
 
 /// The peer slice, overridable with `IRIS_IDLE_PEER_US` for tuning.
@@ -837,6 +1194,122 @@ mod tests {
         assert!(matches!(drive(&mut s0, &mut c0, &idle), IdleDecision::None));
         IdleParkState::publish_cluster(&c0, None);
         IdleParkState::publish_cluster(&c1, None);
+    }
+
+    /// A ring of one repeated kernel PC (region exits under jitv2) starts a
+    /// probe run; the run lasts until the ring is full, a run that parked
+    /// continues one batch at a time, and one that found nothing backs off.
+    #[test]
+    fn a_stationary_ring_of_few_pcs_starts_a_probe_run() {
+        let mut core = kernel_idle();
+        let mut st = IdleParkState::ready();
+        let exits = vec![0xffff_ffff_8800_1000u64; PC_RING];
+        assert!(matches!(drive(&mut st, &mut core, &exits), IdleDecision::None));
+        assert!(st.wants_probe(), "one repeated exit PC is a compiled loop to look into");
+        assert_eq!(st.pc_len, 0, "the run starts with an empty ring");
+        // Interpreted batches of a busy loop with few PCs: the run lasts its
+        // budget, then gives up and backs off.
+        let mut batches = 0;
+        loop {
+            for &pc in &exits[..3] {
+                core.pc = pc;
+                for _ in 0..SAMPLE_EVERY {
+                    st.sample(&core);
+                }
+            }
+            assert!(!matches!(st.update(&core), IdleDecision::Park));
+            batches += 1;
+            if !st.probe_done(false) {
+                break;
+            }
+        }
+        assert_eq!(batches, PROBE_RUN, "a run is its budget long");
+        // The back-off: this many compiled batches are not probed.
+        for _ in 0..PROBE_BACKOFF {
+            assert!(!st.wants_probe(), "a run that found no idle loop backs off");
+        }
+        assert!(st.wants_probe(), "and starts again after the back-off");
+        // A run whose interpreted samples are the idle loop parks at once:
+        // the exits that started it are learned, and the run ends there.
+        let idle = six_five_idle_pcs();
+        assert!(matches!(drive(&mut st, &mut core, &idle), IdleDecision::Park));
+        assert!(!st.probe_done(true), "a learned signature ends the run");
+        assert!(st.knows_compiled_idle());
+    }
+
+    /// A run that parks only late, or one not started by a stationary ring,
+    /// learns nothing and keeps probing after its park, as before.
+    #[test]
+    fn a_late_park_learns_no_signature() {
+        let mut core = kernel_idle();
+        let mut st = IdleParkState::ready();
+        let exits = vec![0xffff_ffff_8800_1000u64; PC_RING];
+        assert!(matches!(drive(&mut st, &mut core, &exits), IdleDecision::None));
+        assert!(st.wants_probe());
+        for _ in 0..3 {
+            assert!(st.probe_done(false));
+        }
+        assert!(matches!(drive(&mut st, &mut core, &six_five_idle_pcs()), IdleDecision::Park));
+        assert!(st.probe_done(true), "no signature: the batches after the park probe on");
+        assert!(!st.knows_compiled_idle());
+    }
+
+    /// Fill the ring with compiled-loop exits: each PC with its return
+    /// address.
+    fn drive_exits(st: &mut IdleParkState, core: &mut MipsCore, exits: &[(u64, u64)]) -> IdleDecision {
+        for i in 0..PC_RING {
+            let (pc, ra) = exits[i % exits.len()];
+            core.pc = pc;
+            core.gpr[31] = ra;
+            for _ in 0..SAMPLE_EVERY {
+                st.sample(core);
+            }
+        }
+        st.update(core)
+    }
+
+    /// Once a probe run has found the idle loop behind a ring of exits, the
+    /// same exits park directly, with no probe; the same exit PC reached
+    /// from another caller (return address) is not the idle loop.
+    #[test]
+    fn a_learned_exit_signature_parks_without_a_probe() {
+        let mut core = kernel_idle();
+        let mut st = IdleParkState::ready();
+        let helper = 0xffff_ffff_8801_ba90u64;
+        let idle_ra = 0xffff_ffff_880d_af00u64;
+        let exits = [(helper, idle_ra), (helper + 0x40, idle_ra)];
+        assert!(matches!(drive_exits(&mut st, &mut core, &exits), IdleDecision::None));
+        assert!(st.wants_probe());
+        assert!(matches!(drive(&mut st, &mut core, &six_five_idle_pcs()), IdleDecision::Park));
+        assert!(!st.probe_done(true));
+        let before = KNOWN_PARKS.load(Ordering::Relaxed);
+        assert!(
+            matches!(drive_exits(&mut st, &mut core, &exits), IdleDecision::Park),
+            "the learned exits are the idle loop"
+        );
+        assert!(KNOWN_PARKS.load(Ordering::Relaxed) > before);
+        assert!(!st.wants_probe(), "a known ring needs no probe");
+        // A busy loop calling the same helper from elsewhere.
+        let busy = [(helper, 0xffff_ffff_8820_0040u64), (helper + 0x40, 0xffff_ffff_8820_0040u64)];
+        assert!(matches!(drive_exits(&mut st, &mut core, &busy), IdleDecision::None));
+        assert!(st.wants_probe(), "an unknown caller is probed");
+    }
+
+    /// A reset (the cycle counter starting again) forgets the signatures.
+    #[test]
+    fn a_reset_forgets_the_learned_signatures() {
+        let mut core = kernel_idle();
+        core.hot.cycles = 1_000_000;
+        let mut st = IdleParkState::ready();
+        let exits = [(0xffff_ffff_8801_ba90u64, 0xffff_ffff_880d_af00u64)];
+        drive_exits(&mut st, &mut core, &exits);
+        assert!(st.wants_probe());
+        drive(&mut st, &mut core, &six_five_idle_pcs());
+        st.probe_done(true);
+        assert!(st.knows_compiled_idle());
+        core.hot.cycles = 10;
+        st.update(&core);
+        assert!(!st.knows_compiled_idle());
     }
 
     /// The real 6.5 idle path calls helpers far from the scheduler loop
@@ -1272,6 +1745,80 @@ mod wake_tests {
             elapsed < Duration::from_millis(200),
             "park waited {elapsed:?} for the cycle threshold"
         );
+    }
+
+    /// Two SMP cores (CPU 0 parks, CPU 1 is the other) with both seen and
+    /// idle, and no stale kick.
+    fn smp_pair() -> (MipsCore, MipsCore) {
+        let mut c0 = MipsCore::default();
+        c0.smp = true;
+        c0.cpu_id = 0;
+        c0.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        let mut c1 = MipsCore::default();
+        c1.smp = true;
+        c1.cpu_id = 1;
+        SEEN.fetch_or(0b11, Ordering::SeqCst);
+        IDLE.fetch_or(0b11, Ordering::SeqCst);
+        KICKED.store(0, Ordering::SeqCst);
+        (c0, c1)
+    }
+
+    fn smp_pair_done() {
+        SEEN.fetch_and(!0b11, Ordering::SeqCst);
+        IDLE.fetch_and(!0b11, Ordering::SeqCst);
+        KICKED.store(0, Ordering::SeqCst);
+    }
+
+    /// With every CPU idle a multiprocessor's park no longer ends after a
+    /// millisecond; a stray wake (another CPU's interrupt) does not end it
+    /// either, and a kick from another CPU ends it at once.
+    #[test]
+    fn an_all_idle_multiprocessor_park_sleeps_until_kicked() {
+        let _one = PARK_TEST_LOCK.lock();
+        let (mut c0, c1) = smp_pair();
+        let running = AtomicBool::new(true);
+        let kicks = PARK_WAKE_KICK.load(Ordering::Relaxed);
+        let kicker = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while !parked() && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            wake();
+            std::thread::sleep(Duration::from_millis(2));
+            let at = Instant::now();
+            kick_peers(&c1);
+            at
+        });
+        let t0 = Instant::now();
+        IdleParkState::ready().park(&mut c0, &running);
+        let returned = Instant::now();
+        let kicked_at = kicker.join().unwrap();
+        smp_pair_done();
+        assert!(returned >= kicked_at, "the park ended {:?} before the kick", kicked_at - returned);
+        assert!(returned - t0 >= Duration::from_millis(4), "the park ended after {:?}", returned - t0);
+        assert!(returned - kicked_at < Duration::from_millis(5), "the kick took {:?}", returned - kicked_at);
+        assert!(PARK_WAKE_KICK.load(Ordering::Relaxed) > kicks);
+    }
+
+    /// A park that follows an interrupt handler kicks the other CPUs; one
+    /// that follows only a poll of the idle loop does not.
+    #[test]
+    fn parking_after_an_interrupt_kicks_the_others() {
+        let _one = PARK_TEST_LOCK.lock();
+        let (mut c0, _c1) = smp_pair();
+        let stopped = AtomicBool::new(false);
+        let mut st = IdleParkState::ready();
+        st.park(&mut c0, &stopped);
+        KICKED.store(0, Ordering::SeqCst);
+        st.park(&mut c0, &stopped);
+        assert_eq!(KICKED.load(Ordering::SeqCst) & 0b10, 0, "a poll's park must not kick");
+        c0.irqs_taken += 1;
+        st.park(&mut c0, &stopped);
+        let kicked = KICKED.load(Ordering::SeqCst);
+        smp_pair_done();
+        assert_ne!(kicked & 0b10, 0, "the park after a handler must kick CPU 1");
+        assert_eq!(kicked & 0b01, 0, "a CPU does not kick itself");
     }
 
     #[test]

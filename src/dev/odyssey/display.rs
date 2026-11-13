@@ -143,26 +143,38 @@ impl Display {
     /// As present(), for lines given with their numbers.
     pub(super) fn present_lines<'a>(&self, lines: impl Iterator<Item = (usize, &'a [u32])>, width: usize, height: usize) {
         let mut screen = self.screen.lock();
-        let w = width.min(FB_STRIDE);
-        let h = height.min(screen.rgba.len() / FB_STRIDE);
-        screen.width = w;
-        screen.height = h;
-        screen.prebuilt = true;
-        screen.status_bar_only = false;
-        let planes = &mut *screen;
+        let (w, h) = (width.min(FB_STRIDE), height.min(screen.fb_rgb.len() / FB_STRIDE));
         for (y, src) in lines {
             if y >= h {
                 continue;
             }
-            // 0x00RRGGBB to opaque 0xAABBGGRR: a byte swap with alpha set,
-            // written to both copies in one pass.
+            // 0x00RRGGBB to opaque 0xAABBGGRR: a byte swap with alpha set.
             let at = y * FB_STRIDE;
-            let line = &mut planes.fb_rgb[at..at + w];
-            let rgba = &mut planes.rgba[at..at + w];
-            for ((d, e), &rgb) in line.iter_mut().zip(rgba.iter_mut()).zip(&src[..w]) {
-                let v = 0xff00_0000 | rgb.swap_bytes() >> 8;
-                *d = v;
-                *e = v;
+            for (d, &rgb) in screen.fb_rgb[at..at + w].iter_mut().zip(&src[..w]) {
+                *d = super::frame::to_screen(rgb);
+            }
+        }
+        self.present_in_place(screen, width, height);
+    }
+
+    /// Present the screen whose `fb_rgb` holds the frame, `width` by
+    /// `height` (the display thread composes into it under this lock).
+    /// `rgba` is brought level with it only when something reads it: a
+    /// screenshot, a frame request, a capturing VNC client. The renderers
+    /// take `fb_rgb`.
+    pub(super) fn present_in_place(&self, mut screen: parking_lot::MutexGuard<'_, Rex3Screen>, width: usize, height: usize) {
+        let w = width.min(FB_STRIDE);
+        let h = height.min(screen.fb_rgb.len() / FB_STRIDE);
+        screen.width = w;
+        screen.height = h;
+        screen.prebuilt = true;
+        screen.status_bar_only = false;
+        let wanted = self.screenshot.load(Ordering::Acquire) || self.frame.load(Ordering::Acquire) || self.capture.load(Ordering::Acquire) != 0;
+        if wanted {
+            let planes = &mut *screen;
+            for y in 0..h {
+                let at = y * FB_STRIDE;
+                planes.rgba[at..at + w].copy_from_slice(&planes.fb_rgb[at..at + w]);
             }
         }
         *self.shown.lock() = (width, height);

@@ -21,6 +21,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Freeing the Fuel, Tezro and Origin 3200
+
+- Under jitv2, dropping a Fuel, Tezro or Origin 3200 now frees the machine: it
+  kept a strong handle on its first processor, whose batch hook holds the board,
+  so the disks, overlays and flash store stayed open until the process ended.
+  On Windows the files could not be deleted or reopened in the meantime, which
+  failed `tezro_power_off_then_drop` there.
 ### Serial consoles
 
 - A TCP or Unix-socket console client that stops reading no longer loses the
@@ -58,15 +65,32 @@ hashes are given where a change is easiest to understand by reading the commit.
   mapped page holds that frame. The encodings naming a secondary instruction
   cache, which the R10000 does not have, do nothing. R10000, R12000, R14000
   and R16000; the R4400 and R5000 are unchanged.
+### R10000-family cache lines
+
+- A secondary cache line a PROM holds as memory now ends at Index Writeback
+  Invalidate, Hit Invalidate and Hit Writeback Invalidate, and a primary
+  instruction line at Index Invalidate and Hit Invalidate, not only at Index Store
+  Tag. The writeback operations write a line that is DirtyExclusive or was
+  stored to back to memory, and invalidating a secondary line invalidates the
+  primary instruction lines inside it. Their tags then read back Invalid.
+  R10000, R12000, R14000 and R16000.
+
 ### Idle parking on multiprocessors
+### Idle parking on multiprocessors and under jitv2
 
 - With `idle-pause`, a parked CPU of a multiprocessor (an Octane, Tezro,
   Origin or Onyx with more than one CPU) no longer sleeps until an
   interrupt. An idle IRIX CPU polls its run queue and gets no interrupt when
   another CPU queues work for it, so a 4-CPU Tezro sat for minutes at "The
   system is coming up." with every CPU parked. Every park now ends after a slice and the idle loop polls: 100 µs,
-  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), 1 ms
-  while all are idle.
+  doubling to 800 µs, while another CPU is busy (`IRIS_IDLE_PEER_US`), and
+  up to 10 ms while all are idle (`IRIS_IDLE_SLICE_US`).
+- A CPU that ran a device or inter-processor interrupt handler, or a stretch
+  of other work, wakes the others to poll their run queues when it parks
+  again (not on its own CP0 timer tick), so an idle multiprocessor no longer
+  wakes every millisecond: an idle 4-CPU Tezro takes about 445 parks a
+  second instead of 2,665 under jitv2. `idle status` adds `wake_kick`,
+  `kicks` and the interrupt wakes by line and CPU.
 - A CPU is parked again only when the newest batch is back in its idle loop,
   not while it runs the interrupt handler that woke it. This applies to
   uniprocessors too.
@@ -75,6 +99,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   during the rc scripts) is no longer slowed to one batch per slice.
 - `idle status` shows the multiprocessor counters (`wake_peer`, `wake_slice`,
   `alone`) and which CPUs are seen, idle and parked.
+- Idle parking works under jitv2. Compiled code keeps a loop inside its
+  region, so the detector saw only region exits and never parked (a jitv2
+  Tezro idled at 400% host CPU); a stationary loop of few exits is now
+  sampled by a short run of interpreted batches, and the ordinary test
+  decides. The idle loop's compiled exit signature (PC and return address)
+  is learned from the first such run, after which the CPU parks and wakes
+  without interpreted batches. `idle status` counts the interpreted batches
+  (`probes`), the parks on a learned signature (`known_parks`) and the
+  signatures learned (`learned`). All machines.
 
 ### Terminal console
 

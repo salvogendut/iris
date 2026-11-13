@@ -2626,6 +2626,9 @@ macro_rules! step_preamble {
                 let im = $self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
                 if (ip & im) != 0 {
                     crate::pf_instant!(crate::perfetto::events::INT_TAKEN, (ip & im) >> 8);
+                    if (ip & im) & !crate::cpu::mips_core::CAUSE_IP7 != 0 {
+                        $self.core.irqs_taken = $self.core.irqs_taken.wrapping_add(1);
+                    }
                     let s = exec_exception(EXC_INT);
                     return $self.handle_exception(s);
                 }
@@ -11349,6 +11352,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // src/cpu/idle_park.rs.
             #[cfg(feature = "idle-pause")]
             let mut idle_state = crate::cpu::idle_park::IdleParkState::default();
+            // The next batch runs interpreted to sample a compiled loop's PCs
+            // (`IdleParkState::wants_probe`).
+            #[cfg(all(feature = "idle-pause", feature = "jitv2"))]
+            let mut probe_next = false;
 
             while running.load(Ordering::Relaxed) {
                 // Another thread is holding this CPU: stop here, between
@@ -11379,6 +11386,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 let jit_on = guard.jitv2_dispatch_enabled;
                 #[cfg(not(feature = "jitv2"))]
                 let jit_on = false;
+                // A probe batch: the interpreter for 1000 instructions, so
+                // the idle detector sees the PCs inside a compiled loop.
+                #[cfg(all(feature = "idle-pause", feature = "jitv2"))]
+                let probing = jit_on && std::mem::take(&mut probe_next);
+                #[cfg(all(feature = "idle-pause", feature = "jitv2"))]
+                let jit_on = jit_on && !probing;
 
                 #[cfg(feature = "lightning")]
                 {
@@ -11443,7 +11456,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 }
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {
-                    match idle_state.update(&guard.core) {
+                    let decision = idle_state.update(&guard.core);
+                    let parked = matches!(decision, crate::cpu::idle_park::IdleDecision::Park);
+                    match decision {
                         crate::cpu::idle_park::IdleDecision::Park => {
                             drop(guard);
                             {
@@ -11462,6 +11477,20 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         }
                         crate::cpu::idle_park::IdleDecision::None => {}
                     }
+                    // Under jitv2 the ring between batches holds region
+                    // exits: probe a stationary loop. Until the detector has
+                    // learned the idle loop's compiled signature, look again
+                    // right after a park too, when the ring holds the idle
+                    // loop a slice old and the next batch would otherwise run
+                    // it compiled for a whole batch before deciding; once it
+                    // knows the signature, the wake-ups run compiled.
+                    #[cfg(feature = "jitv2")]
+                    if guard.jitv2_dispatch_enabled {
+                        probe_next = if probing { idle_state.probe_done(parked) } else { idle_state.wants_probe() }
+                            || (parked && !idle_state.knows_compiled_idle());
+                    }
+                    #[cfg(not(feature = "jitv2"))]
+                    let _ = parked;
                 }
                 // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---
