@@ -257,7 +257,15 @@ The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
 machine constructors pick with `console_backends`: the CI backend, a TCP
 console, or a log tee. A UART's transmit is instant and its receive side
 pulls from the backend with back-pressure (`pump`), so nothing in the model
-needs a thread of its own beyond the service loop's call.
+needs a thread of its own beyond the service loop's call. A backend that can
+be full overrides `try_send_byte` (the TCP and Unix-socket consoles do, and a
+log tee or fan-out passes it on): the 16550 then holds the byte, reads busy,
+and the service loop's `poll_tx` (from the IOC3's and IOC4's receive threads
+and the O2's MACE poll, every few milliseconds) retries it for two seconds
+before handing it to the plain `send_byte`, which drops it. The retry runs
+under the chip's own lock, as the write did; a backend never calls back into
+the UART. The receive poll also moves what a TCP client's full socket held
+back, so a backend keeps at most a byte or two per client.
 
 Embedded frontends can supply `MachineConfig.serial_backends.a`/`.b` as
 `Arc<dyn SerialBackend>` transports before constructing any supported machine.
@@ -567,8 +575,11 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
   `IMSR`. Any other thread reads as CPU 0.
 - **Holding a CPU still.** `ParkSlot::hold` sets `HOST_PARK_BIT` in the CPU's
   interrupt word. Every preamble bails on any set bit, so the CPU leaves compiled
-  code at once and parks at its next batch boundary, with its executor unlocked
-  and its jitv2 page pointer cleared. HEART's disable bits use this.
+  code at once, and the interpreter's preamble then retires nothing more
+  (`EXEC_RETRY`). The CPU parks at the end of its batch, where the hold found
+  it, with its executor unlocked and its jitv2 page pointer cleared. HEART's
+  disable bits use this, and so do the IP35 PROM's presence holds
+  (`src/ip35/presence.rs`).
 - **Getting the machine to yourself.** `World::stop_others` parks every other
   CPU and runs a closure. Call it holding no lock another CPU could be waiting
   on. Two callers take turns, and the one waiting counts as parked. Remapping
