@@ -4,6 +4,48 @@ mod tests {
     use crate::cpu::mips_tlb::*;
     use crate::cpu::mips_exec::CacheAttr;
 
+    /// Region 3 base for the overlap test below.
+    const BASE: u64 = 0xc000_0000_0000_0000;
+
+    fn entry(mask: u64, hi: u64, lo: [u64; 2]) -> TlbEntry {
+        let mut e = TlbEntry::new();
+        (e.page_mask, e.entry_hi, e.entry_lo) = (mask, hi, lo);
+        e
+    }
+
+    /// CPU 1 of a two-processor Tezro: the firmware flushes the TLB with 64
+    /// invalid entries on the kernel's page number, then the kernel writes the
+    /// valid global 16 MiB entry over them. With the rule the valid entry
+    /// answers; without it an invalid duplicate does. A removed entry reads back
+    /// as unwritten with its PageMask.
+    /// Fix: overlapping writes.
+    #[test]
+    fn a_write_invalidates_the_entries_it_overlaps() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let va = BASE + 0x1234;
+            let build = |on: bool| {
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(on);
+                for index in (2..64).rev() {
+                    tlb.write(index, entry(0x1fe000, BASE, [0; 2]));
+                }
+                tlb.write(1, entry(0x1ffe000, BASE | 0x1000, [(0x40 << 6) | (5 << 3) | 0x7; 2]));
+                // A later write elsewhere; unfixed, it left an invalid duplicate answering.
+                tlb.write(0, entry(0x6000, 0xc000_0fff_ffff_9000, [1, 0x2e42f]));
+                tlb
+            };
+            assert!(matches!(build(false).translate::<1>(va, 0, AccessType::Fetch), TlbResult::Invalid { .. }));
+            let mut tlb = build(true);
+            assert!(tlb.take_write_conflict());
+            match tlb.translate::<1>(va, 0, AccessType::Fetch) {
+                TlbResult::Hit { phys_addr, .. } => assert_eq!(phys_addr, 0x1234),
+                other => panic!("expected the valid entry to answer, got {other:?}"),
+            }
+            let gone = tlb.read(2);
+            assert_eq!((gone.entry_hi, gone.entry_lo, gone.page_mask), (0, [0; 2], 0x1fe000));
+        }).unwrap().join().unwrap();
+    }
+
     #[test]
     fn test_tlb_entry_flags() {
         let mut entry = TlbEntry::new();
@@ -304,6 +346,37 @@ mod tests {
         }
     }
 
+    /// An R10000 entry's uncached attribute reaches the bus with an uncached
+    /// reference, in XKPHYS's bits 58:57: the Onyx2's IRIX maps the
+    /// InfiniteReality command page uncached accelerated with attribute 1 (I/O),
+    /// and without it the pipe's commands went to node memory. A cached page
+    /// leaves the attribute behind.
+    #[test]
+    fn an_uncached_entry_carries_its_uncached_attribute() {
+        let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+        let page = 0x0000_0000_08c1_0000u64;
+        let mut entry = TlbEntry::new();
+        entry.entry_hi = (3u64 << 62) | 0x0202_0000 | (1 << 12);
+        entry.entry_lo[0] = (1u64 << 62) | (page >> 6) | (7 << 3) | 0x7;
+        entry.entry_lo[1] = (1u64 << 62) | ((page + 0x1000) >> 6) | (3 << 3) | 0x7;
+        tlb.write(3, entry);
+
+        let pa = |va: u64, tlb: &mut MipsTlb| match tlb.translate::<1>(va, 0, AccessType::Write) {
+            TlbResult::Hit { phys_addr, .. } => phys_addr,
+            res => panic!("expected a hit at {va:#x}, got {res:?}"),
+        };
+        let va = 0xc000_0000_0202_0000;
+        assert_eq!(pa(va + 8, &mut tlb), (1 << 57) | page | 8, "uncached accelerated");
+        assert_eq!(pa(va + 0x1008, &mut tlb), page + 0x1008, "cached");
+
+        // Plain uncached carries the attribute too, all of its values.
+        entry.entry_lo[0] = (3u64 << 62) | (page >> 6) | (2 << 3) | 0x7;
+        entry.entry_lo[1] = (2u64 << 62) | ((page + 0x1000) >> 6) | (2 << 3) | 0x7;
+        tlb.write(3, entry);
+        assert_eq!(pa(va + 8, &mut tlb), (3 << 57) | page | 8, "uncached, attribute 3");
+        assert_eq!(pa(va + 0x1008, &mut tlb), (2 << 57) | (page + 0x1008), "uncached, attribute 2");
+    }
+
     #[test]
     fn test_tlb_probe_32bit_vs_64bit() {
         let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
@@ -542,4 +615,53 @@ fn tlb_write_inside_a_larger_entry_count_is_kept() {
     r10000.write(63, entry);
     assert_eq!(r10000.read(63).entry_hi, entry.entry_hi, "...and its last slot");
 }
+}
+
+/// A mapped uncached page carries EntryLo's uncached attribute (bits 63:62)
+/// to the bus as physical bits 58:57; a cached page never does, whatever those bits
+/// hold, and no attribute leaves the PFN alone. "Uncached" is the model's C
+/// table, so a model that decodes a C value differently, or a table installed
+/// after the entry was written, changes the answer.
+#[test]
+fn only_uncached_pages_carry_the_uncached_attribute() {
+    use super::{MipsTlb, Tlb, TlbEntry};
+    use crate::cpu::mips_exec::CacheAttr;
+    // MipsTlb is large; give the one instance room, as its neighbours do.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let pfn = 0x0d100u64 << 6;
+            let base = |tlb: &MipsTlb| tlb.read(0).pfn_base;
+            let write = |tlb: &mut MipsTlb, lo0: u64, lo1: u64| {
+                let mut entry = TlbEntry::new();
+                entry.entry_hi = 0xC000_0000_0004_0000;
+                entry.entry_lo = [lo0, lo1];
+                tlb.write(0, entry);
+            };
+            let mut tlb = Box::new(MipsTlb::new(64));
+            // The default table: C=2 and the reserved values are uncached.
+            for (cca, expect) in [(2u64, 1u64 << 57), (6, 1 << 57), (3, 0), (5, 0)] {
+                let lo = (1 << 62) | pfn | (cca << 3) | 0x6;
+                write(&mut tlb, lo, lo);
+                assert_eq!(base(&tlb), [0x0d10_0000 | expect; 2], "cca {cca}");
+            }
+            write(&mut tlb, pfn | (2 << 3), 0);
+            assert_eq!(base(&tlb)[0], 0x0d10_0000, "no attribute leaves the PFN alone");
+
+            // The R10000 table reads C=7 (uncached accelerated) as uncached and
+            // 5 as cacheable; a model that read 7 as cacheable carries nothing.
+            let mut table = [CacheAttr::Uncached; 8];
+            table[3] = CacheAttr::Cacheable;
+            table[5] = CacheAttr::CacheableCoherent;
+            tlb.set_cache_attrs(table);
+            let lo = (1 << 62) | pfn | (7 << 3) | 0x6;
+            write(&mut tlb, lo, lo);
+            assert_eq!(base(&tlb), [0x0d10_0000 | 1 << 57; 2], "C=7 uncached under this table");
+            table[7] = CacheAttr::Cacheable;
+            tlb.set_cache_attrs(table);
+            assert_eq!(base(&tlb), [0x0d10_0000; 2], "the table, installed later, decides");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

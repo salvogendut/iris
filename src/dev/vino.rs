@@ -9,7 +9,7 @@
 /// Master I2C bus for programming SAA7191 (DMSD) and CDMC camera controller.
 ///
 /// References:
-///   docs/vino/vino.pdf        — SGI VINO Design Spec 099-8937-001 v2.0
+///   docs/datasheets/indy/vino/vino.pdf        — SGI VINO Design Spec 099-8937-001 v2.0
 ///   docs/vino/vino.{h,cpp}   — MAME reference implementation (Ryan Holtz)
 ///   irix/stand/arcs/ide/IP22/video/VINO/vinohw.h — IRIX diagnostic headers
 
@@ -353,6 +353,13 @@ impl DmaWake {
         let mut pending = self.mutex.lock();
         while !*pending { self.cond.wait(&mut pending); }
         *pending = false;
+    }
+    /// Sleep until notified unless `ready` holds. It runs with the mutex held,
+    /// so a notify cannot land between it and the wait.
+    fn wait_unless(&self, ready: impl FnOnce() -> bool) {
+        let mut guard = self.mutex.lock();
+        if !*guard && !ready() { self.cond.wait(&mut guard); }
+        *guard = false;
     }
 }
 
@@ -941,14 +948,17 @@ impl Vino {
         }
     }
 
+    fn dma_enabled(&self) -> bool {
+        self.state.lock().control & (ctrl::CHA_DMA_EN | ctrl::CHB_DMA_EN) != 0
+    }
+
     fn process_dma(&self) {
         loop {
-            let active = {
-                let st = self.state.lock();
-                st.control & (ctrl::CHA_DMA_EN | ctrl::CHB_DMA_EN) != 0
-            };
-            if !active {
-                self.wake.wait();
+            if !self.dma_enabled() {
+                // Stop is part of the condition: its notify may already be past.
+                self.wake.wait_unless(|| {
+                    self.dma_enabled() || !self.running.load(Ordering::SeqCst)
+                });
                 if !self.running.load(Ordering::Relaxed) { return; }
                 continue;
             }
@@ -1514,6 +1524,7 @@ impl Device for Vino {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use crate::traits::{BusDevice, BUS_OK};
     use crate::video_source::{Field, FieldParity};
 
@@ -1886,6 +1897,30 @@ mod tests {
         let p = &field.pixels;
         assert_eq!(&bytes[..],
                    &[p[0], p[1], p[2], p[5], p[8], p[9], p[10], p[13]][..]);
+    }
+
+    /// The DMA thread tests its state holding the wake mutex and then waits.
+    /// A `stop` that notifies without the mutex can land in between and the
+    /// join hangs. Play that thread: hold the mutex, let `stop` clear the
+    /// flag, then wait. The wait must be woken.
+    #[test]
+    fn stop_wakes_a_dma_thread_caught_between_its_check_and_its_wait() {
+        let vino = Vino::new();
+        vino.running.store(true, Ordering::SeqCst);
+        thread::scope(|s| {
+            let mut guard = vino.wake.mutex.lock();
+            s.spawn(|| vino.stop());
+            let until = Instant::now() + Duration::from_secs(10);
+            while vino.running.load(Ordering::SeqCst) {
+                assert!(Instant::now() < until, "stop never cleared the running flag");
+                thread::yield_now();
+            }
+            // Give a lock-free notify time to land ahead of the wait.
+            thread::sleep(Duration::from_millis(200));
+            let woken = !vino.wake.cond.wait_for(&mut guard, Duration::from_secs(10)).timed_out();
+            drop(guard);
+            assert!(woken, "stop notified the DMA thread before it waited: the wakeup was lost");
+        });
     }
 }
 

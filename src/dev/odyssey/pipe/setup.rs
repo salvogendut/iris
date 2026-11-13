@@ -77,6 +77,26 @@ impl Transform<'_> {
         d.iter().enumerate().take(CLIP_PLANES as usize).any(|(i, &di)| self.st.clip_planes & (1 << i) != 0 && !(di >= 0.0))
     }
 
+    /// Where a convex primitive whose vertices have user plane values d
+    /// lies against the enabled planes. A plane value is linear in eye
+    /// space, so a fragment's (its perspective-correct interpolation, a
+    /// weighted mean of the vertices' with weights of one sign) is never
+    /// below the least vertex value nor above the greatest: with every
+    /// vertex on the kept side of every enabled plane no fragment needs
+    /// the test, and with every vertex outside one plane none survives.
+    pub fn user_side(&self, d: &[[f64; CLIP_PLANES as usize]]) -> PlaneSide {
+        let mut side = PlaneSide::Inside;
+        for i in (0..CLIP_PLANES as usize).filter(|&i| self.st.clip_planes & (1 << i) != 0) {
+            if d.iter().all(|v| v[i] < 0.0) {
+                return PlaneSide::Outside;
+            }
+            if !d.iter().all(|v| v[i] >= 0.0) {
+                side = PlaneSide::Across;
+            }
+        }
+        side
+    }
+
     /// The window pixels a primitive's fragments may fall on within the
     /// window's own bounds `owned`, inclusive: within the viewport. None
     /// when there are none.
@@ -160,6 +180,18 @@ pub(crate) fn clip_triangle(clip: &Clip, in_: &[VolumeVertex; 3]) -> ([VolumeVer
     let mut tmp = [VolumeVertex::default(); CLIPPED_MAX];
     let (n, _) = clip.clip_polygon_by::<NearW, _>(&mut out, &mut tmp, 3, any);
     (out, if n < 3 { 0 } else { n })
+}
+
+/// Where a primitive lies against the enabled user clip planes
+/// (Transform::user_side()).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaneSide {
+    /// Every fragment is kept: no test.
+    Inside,
+    /// No fragment is kept.
+    Outside,
+    /// The fragments are tested one by one.
+    Across,
 }
 
 /// A vertex in clip coordinates, as the shared GL core's clipper
@@ -287,10 +319,11 @@ impl Draw<'_> {
         let mut texel = [[0i32; 4]; 4];
         if self.textured {
             let at = |dx: f64, dy: f64| std::array::from_fn(|k| (frag.tex[k] + dx * frag.dx[k] + dy * frag.dy[k]) as f32);
-            let q = TexQuad { c: [at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0)] };
+            let px: [[f32; 4]; 4] = [at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0)];
+            let q = TexQuad { c: std::array::from_fn(|k| px.map(|c| c[k])) };
             self.tex.sample_quad(&q, 1, &mut texel);
         }
-        if !p.shader.shade(self.textured, &mut rgba, &texel[0], zw, coverage) {
+        if !p.shader.shade(self.textured, &mut rgba, &texel.map(|c| c[0]), zw, coverage) {
             return;
         }
         let c = rgba.map(|c| quantise12(c) as u16);
@@ -326,6 +359,9 @@ pub(crate) struct Tri {
     /// 1/w and the user plane values at the vertices.
     pub inv_w: [f64; 3],
     pub clip: [[f64; 6]; 3],
+    /// Whether the user planes are tested at each fragment: some plane is
+    /// enabled and the triangle lies across one (Transform::user_side()).
+    pub planes: bool,
 }
 
 impl Tri {
@@ -393,6 +429,11 @@ impl Draw<'_> {
         let Some((px0, py0, px1, py1)) = self.bounds else {
             return;
         };
+        let planes = match self.xf.user_side(&v.map(|r| r.clip)) {
+            PlaneSide::Inside => false,
+            PlaneSide::Outside => return,
+            PlaneSide::Across => true,
+        };
         let repeat = [self.tex.regs.wrap(0) == Wrap::Repeat, self.tex.regs.wrap(1) == Wrap::Repeat];
         let tex = TriTex::setup(&v.map(|r| texture_values(&r)), repeat);
         let smooth = !p.raster.flat;
@@ -407,10 +448,25 @@ impl Draw<'_> {
             tex,
             inv_w: v.map(|r| r.inv_w),
             clip: v.map(|r| r.clip),
+            planes,
         };
         let rst = super::raster::RasterState { offset_steps: p.fill_steps, offset_fill: true, ..p.raster };
 
-        if let (Some(live), Some(ring)) = (self.live, p.ring.as_ref().filter(|_| p.shade)) {
+        if let Some(g) = p.gpu_unit() {
+            // The unit walks, textures and shades what its kernels cover; a
+            // fogged triangle, or one across a user plane, is shaded here and
+            // its quads stored by the unit (emit()).
+            let tex = p.gpu_tex.as_deref().filter(|_| self.textured);
+            let simple = !p.shader.fog && !planes && (tex.is_some() || !self.textured);
+            if simple {
+                if let Some((x0, y0, x1, y1)) = super::raster::walk_bounds(&rst, &ts.tri, Some((px0, py0, px1, py1))) {
+                    let (ox, oy) = (rst.ox, rst.oy);
+                    let bounds = (ox.wrapping_add(x0), oy.wrapping_add(y0), ox.wrapping_add(x1), oy.wrapping_add(y1));
+                    g.push_tri(&ts, ox, oy, bounds, rst.offset_steps, rst.depth_range, rst.depth_slack, p.gpu_words.0, p.gpu_words.1, p.gpu_slot.as_ref().expect("a slot with the unit"), tex, p.shader.specular);
+                }
+                return;
+            }
+        } else if let (Some(live), Some(ring)) = (self.live, p.ring.as_ref().filter(|_| p.shade)) {
             // The shader thread shades the quads in the ring, from the draw's
             // context and the triangle's record.
             live.capture(self);
@@ -451,59 +507,176 @@ impl Draw<'_> {
         let iw = t.inv_w.map(|w| w as f32);
         // Window depth, which fog reads, from the barycentrics as the walk
         // takes it.
-        let zw = |i: usize| -> f64 {
-            if !p.shader.fog {
-                return 0.0;
-            }
-            p.raster.window_depth32(t.tri.depth_ratio(q.l1[i], q.l2[i])).unwrap_or(0.0) as f64
-        };
+        let zw = |i: usize| -> f64 { p.raster.window_depth32(t.tri.depth_ratio(q.l1[i], q.l2[i])).unwrap_or(0.0) as f64 };
+        // The pixels the stipple and the user planes keep, and those an
+        // opaque stipple paints its background on.
+        let mut cov = q.cov;
+        let mut background = 0u8;
 
         for i in 0..4usize {
-            if q.cov & (1 << i) == 0 {
+            if cov & (1 << i) == 0 {
                 continue;
             }
             let px = q.x + (i & 1) as i32;
             let py = q.y + (i >> 1) as i32;
-            let Some(background) = self.stipple_pass(px, py) else {
+            let Some(b) = self.stipple_pass(px, py) else {
+                cov &= !(1 << i);
                 continue;
             };
-            if self.xf.user_planes() != 0 {
+            background |= (b as u8) << i;
+            if t.planes {
                 let (b1, b2) = t.bary(px, py);
                 let w = [(1.0 - b1 - b2) * t.inv_w[0], b1 * t.inv_w[1], b2 * t.inv_w[2]];
                 let sum = w[0] + w[1] + w[2];
                 let d: [f64; CLIP_PLANES as usize] = std::array::from_fn(|k| (w[0] * t.clip[0][k] + w[1] * t.clip[1][k] + w[2] * t.clip[2][k]) / sum);
 
                 if self.xf.user_clipped(&d) {
-                    continue;
+                    cov &= !(1 << i);
                 }
             }
-            let mut c = t.flat12;
-            let mut s = t.flat_spec12;
+        }
+        background &= cov;
+        // The colours as lanes: c[k] is component k at pixels 0 to 3.
+        let mut c = t.flat12.map(|v| [v; 4]);
+        let mut s = t.flat_spec12.map(|v| [v; 4]);
 
-            if background {
-                c = self.background.expect("an opaque stipple").map(fixed::from_f64);
-                s = [0; 3];
-            } else if t.smooth {
-                let Some(w) = interp::weights(q.l1[i], q.l2[i], &iw) else {
-                    continue;
-                };
-                for (k, ck) in c.iter_mut().enumerate() {
-                    *ck = fixed::interpolate(&w, [t.rgba12[0][k], t.rgba12[1][k], t.rgba12[2][k]]);
+        if t.smooth {
+            let (w, kept) = interp::weights4(&q.l1, &q.l2, &iw);
+            let lanes = |v: [i32; 3]| -> [i32; 4] { std::array::from_fn(|i| fixed::interpolate(&[w[0][i], w[1][i], w[2][i]], v)) };
+
+            // A background pixel takes no weights.
+            cov &= kept | background;
+            c = std::array::from_fn(|k| lanes([t.rgba12[0][k], t.rgba12[1][k], t.rgba12[2][k]]));
+            if p.shader.specular {
+                s = std::array::from_fn(|k| lanes([t.spec12[0][k], t.spec12[1][k], t.spec12[2][k]]));
+            }
+        }
+        if background != 0 {
+            let bg = self.background.expect("an opaque stipple").map(fixed::from_f64);
+
+            for i in (0..4).filter(|i| background & (1 << i) != 0) {
+                for k in 0..4 {
+                    c[k][i] = bg[k];
                 }
-                if p.shader.specular {
-                    for (k, sk) in s.iter_mut().enumerate() {
-                        *sk = fixed::interpolate(&w, [t.spec12[0][k], t.spec12[1][k], t.spec12[2][k]]);
-                    }
+                for sk in s.iter_mut() {
+                    sk[i] = 0;
                 }
             }
-            if !p.shader.shade12(self.textured, &mut c, &s, &texel[i], zw(i)) {
-                continue;
-            }
-            out.cov |= 1 << i;
+        }
+        cov &= p.shader.shade12x4(self.textured, &mut c, &s, &texel, zw);
+        out.cov = cov;
+        for i in (0..4).filter(|i| cov & (1 << i) != 0) {
             out.zq[i] = q.zq[i];
-            out.rgba[i] = c.map(|c| colour12(c) as u16);
+            out.rgba[i] = std::array::from_fn(|k| colour12(c[k][i]) as u16);
         }
     }
+}
+
+impl Draw<'_> {
+    /// A line segment a to b as the triangle (a, b, a), for its pixels'
+    /// shading (line_pixel()): a pixel at parameter t along the segment is
+    /// the triangle's at barycentrics (t, 0), so a line takes the filled
+    /// triangle's perspective weights, 12-bit colours, depth and texture
+    /// arithmetic. `provoking` is the vertex a flat segment takes its
+    /// colours from.
+    pub(super) fn line_tri(&self, a: &RasterVertex, b: &RasterVertex, provoking: &[f32]) -> Tri {
+        let v = [*a, *b, *a];
+        let flat: [f64; 4] = std::array::from_fn(|k| provoking[vtx::COLOR + k] as f64);
+        let flat_spec: [f64; 3] = std::array::from_fn(|k| provoking[vtx::SPECULAR + k] as f64);
+        let repeat = [self.tex.regs.wrap(0) == Wrap::Repeat, self.tex.regs.wrap(1) == Wrap::Repeat];
+        Tri {
+            // The area only scales barycentrics a line does not take from
+            // edges.
+            tri: Triangle::setup(v.map(|r| (r.x, r.y)), v.map(|r| r.z), v.map(|r| r.depth_w), 1, true),
+            live: std::ptr::null(),
+            rgba12: v.map(|r| r.rgba.map(fixed::from_f64)),
+            flat12: flat.map(fixed::from_f64),
+            spec12: v.map(|r| r.spec.map(fixed::from_f64)),
+            flat_spec12: flat_spec.map(fixed::from_f64),
+            smooth: !self.pipe.raster.flat,
+            tex: TriTex::setup(&v.map(|r| texture_values(&r)), repeat),
+            inv_w: v.map(|r| r.inv_w),
+            clip: v.map(|r| r.clip),
+            // A segment's walk tests its planes itself (user_clip).
+            planes: false,
+        }
+    }
+
+    /// One aliased line pixel at window pixel (px, py) of the segment
+    /// whose triangle is t (line_tri()), at parameter l1[0], with l1[1]
+    /// and l1[2] the parameter one pixel on in x and in y (the texture's
+    /// level of detail) and l1[3] both: the quad stage of shade_quad() for
+    /// one pixel at barycentrics (l1, 0), with no polygon stipple, then
+    /// stored.
+    pub(super) fn line_pixel(&self, t: &Tri, px: i32, py: i32, l1: [f32; 4], steps: i64) {
+        if let Some(mut q) = self.line_pixel_quad(t, px, py, l1, steps) {
+            self.pipe.emit(&mut q);
+        }
+    }
+
+    /// line_pixel()'s shaded quad, for a caller that stores it itself (a
+    /// ring worker); None for a pixel not drawn.
+    pub(super) fn line_pixel_quad(&self, t: &Tri, px: i32, py: i32, l1: [f32; 4], steps: i64) -> Option<BackQuad> {
+        let p = self.pipe;
+        let rst = &p.raster;
+        let (x, y) = (rst.ox.wrapping_add(px), rst.oy.wrapping_add(py));
+        let in_scissor = rst.scissor.is_none_or(|(x0, y0, x1, y1)| px >= x0 && px <= x1 && py >= y0 && py <= y1);
+        if !in_scissor || !rst.owned(x, y) {
+            return None;
+        }
+        let l2 = [0.0f32; 4];
+        // Depth as a triangle's pixel takes it (raster::triangle_quads).
+        let (zw, zq) = if rst.depth32 {
+            let (zw, zq, kept) = t.tri.depth4(rst, &l1, &l2, steps);
+            if kept & 1 == 0 {
+                return None;
+            }
+            (zw[0] as f64, zq[0])
+        } else {
+            let b1 = l1[0] as f64;
+            let z = t.tri.z[0] + b1 * (t.tri.z[1] - t.tri.z[0]);
+            let depth_w = (1.0 - b1) * t.tri.d[0] + b1 * t.tri.d[1];
+            let Some(zw) = rst.window_depth(z, depth_w) else {
+                return None;
+            };
+            (zw, super::super::depth_word::word_with_offset((rst.depth_code)(zw), steps))
+        };
+        let mut texel = [[0i32; 4]; 4];
+        if self.textured {
+            self.tex.sample_quad(&t.tex.quad(&l1, &l2), 1, &mut texel);
+        }
+        let mut c = t.flat12.map(|v| [v; 4]);
+        let mut s = t.flat_spec12.map(|v| [v; 4]);
+        if t.smooth {
+            let iw = t.inv_w.map(|w| w as f32);
+            let (w, kept) = interp::weights4(&l1, &l2, &iw);
+            if kept & 1 == 0 {
+                return None;
+            }
+            let lanes = |v: [i32; 3]| -> [i32; 4] { std::array::from_fn(|i| fixed::interpolate(&[w[0][i], w[1][i], w[2][i]], v)) };
+            c = std::array::from_fn(|k| lanes([t.rgba12[0][k], t.rgba12[1][k], t.rgba12[2][k]]));
+            if p.shader.specular {
+                s = std::array::from_fn(|k| lanes([t.spec12[0][k], t.spec12[1][k], t.spec12[2][k]]));
+            }
+        }
+        if p.shader.shade12x4(self.textured, &mut c, &s, &texel, |_| zw) & 1 == 0 {
+            return None;
+        }
+        let mut q = BackQuad { x, y, cov: 1, zq: [zq, 0, 0, 0], ..Default::default() };
+        q.rgba[0] = std::array::from_fn(|k| colour12(c[k][0]) as u16);
+        Some(q)
+    }
+}
+
+/// An aliased line the ring's workers walk (QuadRing::push_line): its
+/// triangle (a, b, a), which leads to the draw's context, the walk's
+/// words, the polygon offset and whether the user planes test it.
+#[derive(Clone, Copy)]
+pub(crate) struct LiveLine {
+    pub tri: Tri,
+    pub words: super::super::gpu_unit::LineWords,
+    pub steps: i64,
+    pub user_clip: bool,
 }
 
 /// What the shader thread reads of a draw: the draw's context as the
@@ -514,13 +687,33 @@ impl Draw<'_> {
 pub(crate) struct LiveDraw {
     draw: std::cell::UnsafeCell<Option<Draw<'static>>>,
     tris: std::cell::UnsafeCell<Vec<Vec<Tri>>>,
+    lines: std::cell::UnsafeCell<Vec<Vec<LiveLine>>>,
     /// Some triangle went to the shader thread.
     pub used: std::cell::Cell<bool>,
 }
 
 impl Default for LiveDraw {
     fn default() -> Self {
-        LiveDraw { draw: std::cell::UnsafeCell::new(None), tris: std::cell::UnsafeCell::new(Vec::new()), used: std::cell::Cell::new(false) }
+        LiveDraw { draw: std::cell::UnsafeCell::new(None), tris: std::cell::UnsafeCell::new(Vec::new()), lines: std::cell::UnsafeCell::new(Vec::new()), used: std::cell::Cell::new(false) }
+    }
+}
+
+impl LiveDraw {
+    /// Empty it for another draw, keeping its first chunk of records:
+    /// a frame is reused (RasterCtx::frames), not allocated per draw.
+    pub fn reset(&mut self) {
+        *self.draw.get_mut() = None;
+        let tris = self.tris.get_mut();
+        tris.truncate(1);
+        if let Some(c) = tris.first_mut() {
+            c.clear();
+        }
+        let lines = self.lines.get_mut();
+        lines.truncate(1);
+        if let Some(c) = lines.first_mut() {
+            c.clear();
+        }
+        self.used.set(false);
     }
 }
 
@@ -559,6 +752,19 @@ impl LiveDraw {
         }
         let chunk = tris.last_mut().expect("a chunk");
         chunk.push(Tri { live: self, ..t });
+        chunk.last().expect("the record") as *const _
+    }
+
+    /// Keep a line's record, as push_tri() a triangle's.
+    pub fn push_line(&self, l: LiveLine) -> *const LiveLine {
+        // SAFETY: as capture().
+        let lines = unsafe { &mut *self.lines.get() };
+
+        if lines.last().is_none_or(|c| c.len() == LIVE_TRI_CHUNK) {
+            lines.push(Vec::with_capacity(LIVE_TRI_CHUNK));
+        }
+        let chunk = lines.last_mut().expect("a chunk");
+        chunk.push(LiveLine { tri: Tri { live: self, ..l.tri }, ..l });
         chunk.last().expect("the record") as *const _
     }
 

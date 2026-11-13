@@ -20,8 +20,11 @@ atomically per file, with attempted rollback on a later file failure.
 
 Format references: SGI IP22nvram.h, RACER/IP30nvram.h, RACER/sflash.h and
 stand/arcs/include/flash.h. Implementation is original Rust; no SGI source
-text is copied. Focused tests exercise bundled O2/Octane images, preservation,
-checksums, repeated presets and invalid-image rejection.
+text is copied. Focused tests exercise packed O2 firmware and a synthetic initialized Octane
+PDS, preservation, checksums, repeated presets and invalid-image rejection.
+The packed Octane release payload has no FPDS header: a fresh preset must
+return the Keep existing initialization message without writing a file.
+Do not silently manufacture firmware-owned persistent records.
 
 Console presets are independent of boot presets. IP24/IP22/IP28 store `g`/`d`
 at environment offset 2 (two bytes); IP32 uses a `console` environment record.

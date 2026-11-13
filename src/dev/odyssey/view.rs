@@ -92,6 +92,14 @@ impl View {
         self.base.wrapping_add((tile << 8 | (y & 15) << 4 | (x & 15)) << self.log2).wrapping_add(self.at as u64)
     }
 
+    /// The view's placement: the surface's first byte, its pitch in tiles,
+    /// log2 of its pixel size and the field's byte inside the pixel (for
+    /// the GPU instantiation's slots).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn parts(&self) -> (u64, u32, u8, u8) {
+        (self.base, self.pitch, self.log2, self.at)
+    }
+
     /// The view `by` bytes further into the pixel.
     pub fn shifted(mut self, by: i64) -> View {
         self.at = (self.at as i64 + by) as u8;
@@ -246,11 +254,23 @@ impl Rows {
     }
 
     /// Store the same word at pixels x0 to x1 of row y, those in the view.
+    /// The word is encoded for the field once, as store_word() encodes it.
     pub fn fill(&self, y: i32, x0: i32, x1: i32, w: u32) {
         let (x0, x1) = (x0.max(0), x1.min(self.v.width as i32 - 1));
-        for x in x0..=x1 {
-            self.store_word(x, y, w);
+        if self.v.kind == Kind::None || y < 0 || y as u32 >= self.v.height || x0 > x1 {
+            return;
         }
+        let v = match self.v.kind {
+            Kind::Coded(_) => self.v.field().store(w),
+            Kind::Z24 => w as u64 & 0xff_ffff,
+            Kind::Byte => w as u64 & 0xff,
+            _ => w as u64,
+        };
+        let len = self.v.value_len();
+        for x in x0..=x1 {
+            self.mem.store_quiet(self.v.addr(x, y), len, v);
+        }
+        self.mem.mark_written();
     }
 }
 

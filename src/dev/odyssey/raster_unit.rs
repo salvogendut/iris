@@ -105,11 +105,19 @@ pub(super) struct RasterCtx {
     /// The quad ring to the shader and back-end threads, while the raster
     /// thread runs (pipe/ring.rs).
     pub ring: Option<Arc<super::pipe::ring::QuadRing>>,
+    /// The raster unit on the host GPU (gpu_unit.rs), when the board draws
+    /// there: then no raster thread runs, every job runs inside its
+    /// submit on the front end, and the drawing goes into the unit's
+    /// batches.
+    pub gpu: Option<Box<super::gpu_unit::GpuRaster>>,
+    /// Draw frames back from finished draws, for the next draws: a draw's
+    /// context is not allocated per draw.
+    pub frames: Vec<Box<super::gl::DrawFrame>>,
 }
 
 impl RasterCtx {
     fn new() -> Self {
-        RasterCtx { line_phase: 0, ring: None }
+        RasterCtx { line_phase: 0, ring: None, gpu: None, frames: Vec::with_capacity(super::gl::FRAMES_KEPT) }
     }
 
     /// Wait for the back-end thread to store everything queued to it, so
@@ -120,6 +128,13 @@ impl RasterCtx {
         }
     }
 
+    /// Whether completions wait in the ring for the quads before them: a
+    /// raster thread with nothing else to do then drains rather than
+    /// sleep, so the guest is not kept waiting.
+    pub fn completing(&self) -> bool {
+        self.ring.as_ref().is_some_and(|r| r.completing())
+    }
+
     /// Whether the shader and back end have stored every quad in the ring.
     pub fn pipe_idle(&self) -> bool {
         self.ring.as_ref().is_none_or(|r| r.idle())
@@ -127,12 +142,30 @@ impl RasterCtx {
 
     /// The draw jobs the stages have finished with.
     pub fn reclaim_shade(&mut self) -> Vec<Box<GlDrawJob>> {
-        self.ring.as_ref().map(|r| r.reclaim()).unwrap_or_default()
+        let Some(r) = &self.ring else {
+            return Vec::new();
+        };
+        let (jobs, frames) = r.reclaim();
+        for f in frames {
+            self.give_frame(f);
+        }
+        jobs
+    }
+
+    /// Keep a finished draw's frame for a later draw, up to FRAMES_KEPT.
+    pub fn give_frame(&mut self, f: Box<super::gl::DrawFrame>) {
+        if self.frames.len() < super::gl::FRAMES_KEPT {
+            self.frames.push(f);
+        }
     }
 }
 
 /// One unit of raster work.
 pub(super) type RasterJob = Box<dyn FnOnce(&mut RasterCtx) + Send>;
+
+/// One completion: a write the guest sees once the drawing before it is
+/// stored.
+pub(super) type Completion = Box<dyn FnOnce() + Send>;
 
 /// The ring entry's address word: the value is a boxed `RasterJob`.
 const ENTRY_JOB: u32 = 1;
@@ -142,6 +175,9 @@ const ENTRY_DRAW: u32 = 2;
 /// A boxed `RasterJob` that only puts work into the quad ring (a clear's
 /// spans): ordered by the ring, it waits for no stage.
 const ENTRY_RING: u32 = 4;
+/// A boxed `Completion`: it goes into the quad ring behind the quads
+/// before it and runs once they are stored, with no drain.
+const ENTRY_COMPLETION: u32 = 3;
 /// The entry's address word is its kind in the low bits and its cost
 /// (`RasterQueue::push`) above them.
 const ENTRY_KIND_MASK: u32 = 7;
@@ -401,11 +437,16 @@ impl RasterQueue {
     }
 
     /// Hand the raster unit a job whose effect the guest can see, a fence's
-    /// token or a query's answer, behind every job before it.
-    pub fn submit_completion(&self, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
-        self.submit_work(RASTER_JOB_OVERHEAD, move |ctx| {
-            job(ctx);
-        });
+    /// token or a query's answer, behind every job before it. It runs once
+    /// the drawing before it is stored (QuadRing::complete); the raster
+    /// thread goes on to the jobs after it meanwhile.
+    pub fn submit_completion(&self, job: impl FnOnce() + Send + 'static) {
+        if !self.threaded() {
+            job();
+            return;
+        }
+        let entry = Box::into_raw(Box::new(Box::new(job) as Completion)) as u64;
+        self.push(ENTRY_COMPLETION, entry, RASTER_JOB_OVERHEAD);
     }
 
     /// Hand a GL draw to the raster unit, behind every job before it. The
@@ -571,6 +612,11 @@ impl RasterQueue {
         self.closing.store(false, SeqCst);
         // SAFETY: no raster thread runs yet, so the context is this thread's.
         let ctx = unsafe { &mut *self.ctx.get() };
+        if ctx.gpu.is_some() {
+            // The GPU unit draws inside each submit; the front end is the
+            // only thread that touches it.
+            return;
+        }
         if ctx.ring.is_none() && backend {
             // The shader's thread shades in the ring, so it comes with the
             // back end's.
@@ -630,7 +676,7 @@ impl RasterQueue {
                 while self.pushed.load(SeqCst) == self.taken.load(SeqCst) && !self.exit.load(SeqCst) {
                     if !self.held.load(SeqCst) {
                         self.kick.wait(&mut g);
-                    } else if self.flush.load(SeqCst) || ctx.pipe_idle() {
+                    } else if self.flush.load(SeqCst) || ctx.completing() || ctx.pipe_idle() {
                         break;
                     } else {
                         // The pipeline gives up its count once it runs dry
@@ -682,6 +728,14 @@ impl RasterQueue {
                     }
                     for job in ctx.reclaim_shade() {
                         self.give_back(job);
+                    }
+                } else if kind == ENTRY_COMPLETION {
+                    // SAFETY: submit_completion() put it there, and it is
+                    // taken once.
+                    let job = unsafe { Box::from_raw(value as *mut Completion) };
+                    match &ctx.ring {
+                        Some(r) => r.complete(*job),
+                        None => job(),
                     }
                 } else if kind == ENTRY_RING {
                     // SAFETY: submit_ring() put it there, and it is taken once.
@@ -751,7 +805,56 @@ impl Board {
     /// Wait for the raster unit to finish its queued jobs. The front end
     /// calls it before it touches board memory itself,
     /// and before it writes a completion word that must follow the drawing.
+    /// With the GPU unit, that means its batches are drawn and what they
+    /// wrote is back in the memory the front end reads.
     pub fn raster_wait(&self) {
         self.raster.wait_idle();
+        if !self.raster.threaded() {
+            // The unit's batches drawn; memory comes back where a reader
+            // asks for it (planes_in, dest_mem, gpu_sync).
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    if let Err(e) = g.wait() {
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu wait: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    /// With the GPU unit, the end of a run of stores: the mirror's changes
+    /// go up, and the open batch is submitted when the board is going idle
+    /// or has held it long enough (`GpuRaster::tick`), so the scanout
+    /// composing from the GPU's memory shows what the guest drew; nothing
+    /// waits.
+    pub fn gpu_upload_tick(&self, idle: bool) {
+        if !self.raster.threaded() {
+            let retired = self.fifo.retired();
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    g.tick(idle, retired);
+                }
+            });
+        }
+    }
+
+    /// `raster_wait`, and with the GPU unit the mirror brought current even
+    /// when the unit is set to skip readbacks (the replay's checkpoints).
+    pub fn gpu_sync(&self) {
+        self.raster_wait();
+        if !self.raster.threaded() {
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    if let Err(e) = g.read_back_now() {
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    /// Whether the board draws on the GPU unit.
+    pub fn gpu_unit(&self) -> bool {
+        !self.raster.threaded() && self.raster.run_now(|ctx| ctx.gpu.is_some())
     }
 }

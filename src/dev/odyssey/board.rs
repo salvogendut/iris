@@ -1,5 +1,5 @@
 //! The Odyssey (VPro) board's constants and state. The interrupt packet path
-//! is the `irq` field of the host interface (`HostInterface`, interface.rs).
+//! is the `packets` field of the host interface (`HostInterface`, interface.rs).
 //!
 //! Ported from include/hw/misc/sgi-odyssey.h in jamesbraid/qemu-sgi-origami.
 
@@ -16,7 +16,7 @@ use super::clip::ClipRect;
 use super::pixel_dma::GuestMemory;
 use super::raster_unit::RasterQueue;
 use super::reader::DisplayShared;
-use super::scanout::Scanout;
+use super::display_fifo::DisplayFifo;
 #[cfg(test)]
 use super::reader::ScanoutReader;
 /// Distinct unimplemented offsets reported before the device falls silent
@@ -74,8 +74,6 @@ pub(super) struct Reports {
     pub memory_control_reported: bool,
     pub setup_7f0_reported: bool,
     pub stats_reported: bool,
-    pub overlay_mode_reported: bool,
-    pub cursor_reported: u32,
     pub draw_mask_stereo_reported: bool,
     pub draw_mask_high_reported: bool,
     pub drawable_word_reported: bool,
@@ -162,6 +160,14 @@ pub(super) struct ImageRaster {
     pub y1: u32,
     pub x2: u32,
     pub y2: u32,
+    /// The box record's ten words as sent (operands 6 and 9 carry the
+    /// raster depth under depth testing).
+    pub box_words: [u32; 10],
+    /// The fragment state and depth word a depth-tested image's pixels take,
+    /// decoded once per box (Board::image_box_loaded()).
+    pub fragment: Option<Box<(super::pipe::backend::BackendState, u32)>>,
+    /// The slot those fragments go through on the GPU unit.
+    pub gpu_slot: Option<super::gpu_unit::Slot>,
     pub cur_x: u32,
     pub cur_y: u32,
     pub fmt: u32,
@@ -170,6 +176,8 @@ pub(super) struct ImageRaster {
     pub code: u32,
     /// The header's whole write code, format and type (write::CODE_MASK).
     pub write_code: u32,
+    /// The header's byte-swap bit (image::HEADER_SWAP): GL_UNPACK_SWAP_BYTES.
+    pub swap: bool,
     /// The bytes of the pixel a write-table image is part way through.
     pub pixel: [u8; 16],
     pub bytes: u32,
@@ -249,14 +257,6 @@ pub(super) struct Widget {
     pub ctx_shadow_addr_lower: u32,
     pub buzz: [u32; 6],
     pub nic: u32,
-    pub i2c_main_cmd: u32,
-    pub i2c_opt_cmd: u32,
-    /// Back-end entries 0x2000-0x2fff as last written (0x1000 entries). The
-    /// colour lookup RAM, the display modes, the overlay modes and the
-    /// cursor, which the display reads, are in `scanout.shared.regs`.
-    pub backend_ctl: Vec<u32>,
-    pub backend_index: u32,
-    pub backend_count: u32,
     // Command-FIFO self-test.
     pub selftest_progress: u32,
     pub cfifo_selftest_ready: bool,
@@ -401,14 +401,17 @@ pub(super) struct Board {
     pub pixel_mode: [u32; 4],
     /// Board::dest_views() for the words it was built from.
     pub dest_cache: std::cell::Cell<Option<([u32; 6], super::view::DestViews)>>,
+    /// Board::gpu_dest_slot() for the destination, clip list and id test
+    /// it was built from.
+    pub slot_cache: std::cell::Cell<Option<(super::draw::SlotKey, Option<super::gpu_unit::Slot>)>>,
 
     /// The draw state slots: the fragment side's texture registers.
     pub slots: super::pipe::slot::Slots,
     /// The vertex side's texture registers.
     pub tex: TexState,
     pub dma_seq: u64,
-    /// Monotonic for this device instance.
-    pub trace_sequence: std::sync::atomic::AtomicU64,
+    /// Monotonic for this device instance. Plain: every user holds `&mut Board`.
+    pub trace_sequence: u64,
     /// The annotated trace (trace.rs), shared with the bus side.
     pub trace: std::sync::Arc<super::trace::Trace>,
 
@@ -490,9 +493,13 @@ pub(super) struct Board {
     /// The BEGIN-0xa image raster path.
     pub image: ImageRaster,
 
-    /// The scanout's mode and the marks the display takes. The presented
-    /// frame and the retrace are the display's own (`ScanoutReader`).
-    pub scanout: Scanout,
+    /// What the board shares with the display: the display's registers,
+    /// board memory, the retrace. The presented frame and the retrace are
+    /// the display's own (`ScanoutReader`).
+    pub display: std::sync::Arc<DisplayShared>,
+    /// The display FIFO, with its own lock: processors store to it with no
+    /// wait for the board's work (display_fifo.rs).
+    pub display_fifo: std::sync::Arc<parking_lot::Mutex<DisplayFifo>>,
     /// Tests: the reader that stands in for the display thread
     /// (Board::scanout_update()).
     #[cfg(test)]
@@ -504,8 +511,8 @@ impl Default for Board {
         let front: std::sync::Arc<parking_lot::Mutex<HostInterface>> = Default::default();
         let fifo = front.lock().fifo.clone();
         let raster: std::sync::Arc<RasterQueue> = Default::default();
-        let shared = std::sync::Arc::new(DisplayShared::new(front.clone()));
-        let scanout = Scanout::new(shared);
+        let display = std::sync::Arc::new(DisplayShared::new(front.clone()));
+        let display_fifo = std::sync::Arc::new(parking_lot::Mutex::new(DisplayFifo::new(display.clone())));
         Board {
             slot: 0,
             front,
@@ -537,11 +544,6 @@ impl Default for Board {
                 ctx_shadow_addr_lower: 0,
                 buzz: [0; 6],
                 nic: 0,
-                i2c_main_cmd: 0,
-                i2c_opt_cmd: 0,
-                backend_ctl: vec![0; 0x1000],
-                backend_index: 0,
-                backend_count: 0,
                 selftest_progress: 0,
                 cfifo_selftest_ready: false,
             },
@@ -549,8 +551,6 @@ impl Default for Board {
                 memory_control_reported: false,
                 setup_7f0_reported: false,
                 stats_reported: false,
-                overlay_mode_reported: false,
-                cursor_reported: 0,
                 draw_mask_stereo_reported: false,
                 draw_mask_high_reported: false,
                 drawable_word_reported: false,
@@ -596,6 +596,7 @@ impl Default for Board {
             vram: Default::default(),
             pixel_mode: [0; 4],
             dest_cache: Default::default(),
+            slot_cache: Default::default(),
             slots: Default::default(),
             tex: TexState {
                 coord: [0; 2],
@@ -607,7 +608,7 @@ impl Default for Board {
                 linear_valid: 0,
             },
             dma_seq: 0,
-            trace_sequence: std::sync::atomic::AtomicU64::new(0),
+            trace_sequence: 0,
             trace: Default::default(),
             #[cfg(test)]
             test_slice_sleep_ms: 0,
@@ -747,6 +748,9 @@ impl Default for Board {
                 y1: 0,
                 x2: 0,
                 y2: 0,
+                box_words: [0; 10],
+                fragment: None,
+                gpu_slot: None,
                 cur_x: 0,
                 cur_y: 0,
                 fmt: 0,
@@ -754,11 +758,13 @@ impl Default for Board {
                 group_painted: 0,
                 code: 0,
                 write_code: 0,
+                swap: false,
                 pixel: [0; 16],
                 bytes: 0,
                 nbytes: 0,
             },
-            scanout,
+            display,
+            display_fifo,
             #[cfg(test)]
             reader: Default::default(),
         }
@@ -892,18 +898,12 @@ impl Board {
         self.diag.draw_mask_high_reported = false;
         self.diag.drawable_word_reported = false;
         self.widget.nic = 0;
-        self.widget.i2c_main_cmd = 0;
-        self.widget.i2c_opt_cmd = 0;
-        self.widget.backend_ctl.fill(0);
+        self.display_fifo.lock().reset();
         self.regs().reset();
-        self.diag.overlay_mode_reported = false;
-        self.diag.cursor_reported = 0;
         self.diag.gl_aux_reported = false;
         self.diag.aux_mask_reported = false;
         self.diag.copy_mixed_base_reported = false;
         self.diag.aux_image_reported = false;
-        self.widget.backend_index = 0;
-        self.widget.backend_count = 0;
         self.diag.reported_addr_count.store(0, std::sync::atomic::Ordering::Relaxed);
         self.diag.reported_cmd_count = 0;
         self.diag.line_stipple_reported = false;
@@ -1103,6 +1103,7 @@ impl Board {
         self.image.group_painted = 0;
         self.image.code = 0;
         self.image.write_code = 0;
+        self.image.swap = false;
         self.image.bytes = 0;
         self.image.nbytes = 0;
         self.diag.image_code_reported = false;
@@ -1162,7 +1163,7 @@ impl Board {
         self.draw_word = 0x8000_2000;
         self.read_word = 0x8000_2000;
         for (i, v) in [(pbj::OVERLAY_BASE, 0x14_2000), (pbj::PIXEL_BASE, 0x2000), (pbj::WIDTH, 1280), (pbj::HEIGHT, 1024), (pbj::STRIDE, 80), (pbj::DEPTH, 3)] {
-            self.widget.backend_ctl[(pbj::BASE - super::consts::backend::CTL_BASE) as usize + i] = v;
+            self.display_fifo.lock().ctl[(pbj::BASE - super::consts::backend::CTL_BASE) as usize + i] = v;
             self.regs().set_pbj(i, v);
         }
         self.regs().set_dispmode(0, 0x0096_55a6);
@@ -1175,9 +1176,10 @@ impl Board {
         }
     }
 
-    /// Scan-out entry 0x2800 + i (frame::pbj) as the back end last took it.
+    /// Scan-out entry 0x2800 + i (frame::pbj) as the back end last took it,
+    /// from the display's words (no lock: drawing reads it).
     pub fn pbj(&self, i: usize) -> u32 {
-        self.widget.backend_ctl[(super::frame::pbj::BASE - super::consts::backend::CTL_BASE) as usize + i]
+        self.regs().pbj(i)
     }
 
     /// Where drawing lands now (view::DestViews), kept for the register
@@ -1236,7 +1238,7 @@ impl Board {
         // long as the board: the memory is never resized or moved.
         {
             let mem = self.vram.ptr();
-            let _ = self.scanout.shared.vram.set(mem);
+            let _ = self.display.vram.set(mem);
         }
 
         // Setting the mode restarts the retrace at the mode's rate.
@@ -1254,13 +1256,21 @@ impl Board {
         // the board memory exists; this runs after Board::allocate(). MODEL
         // CHOICE: memory reads zero after a reset (the board's SDRAM holds
         // whatever it held; the PROM and the driver clear what they use).
-        self.vram.words_mut().fill(0);
+        self.vram.clear();
+        if !self.raster.threaded() {
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    g.clear_all();
+                }
+            });
+        }
         self.stream.poly_marks.fill(0);
         // Back to the boot size, and restart the phase.
-        if self.scanout.mode.width != ODSY_WIDTH || self.scanout.mode.height != ODSY_HEIGHT {
+        let mode = self.scanout_mode();
+        if mode.width != ODSY_WIDTH || mode.height != ODSY_HEIGHT {
             self.set_scanout_size(ODSY_WIDTH, ODSY_HEIGHT);
         }
-        self.scanout.reset();
+        self.display.restart_retrace();
     }
 }
 
@@ -1287,7 +1297,39 @@ impl Board {
         s.slot = slot;
         s.configure()?;
         s.allocate()?;
+        // VPRO_GPU=1 puts every test board on the GPU unit.
+        #[cfg(all(test, feature = "wgpu"))]
+        if std::env::var("VPRO_GPU").is_ok() {
+            s.enable_gpu(&crate::wgpu::GpuOptions::default())?;
+        }
         Ok(s)
+    }
+
+    /// Draw on the host GPU from here on (gpu_unit.rs): the raster unit's
+    /// work goes into batches on a GPU buffer, and this memory becomes the
+    /// front end's mirror of it, brought current by `raster_wait`. Before
+    /// the threads start.
+    #[cfg(feature = "wgpu")]
+    pub fn enable_gpu(&mut self, opts: &crate::wgpu::GpuOptions) -> Result<(), String> {
+        use super::wgpu::{GpuRaster, PLANE_SPAN};
+
+        if self.raster.threaded() {
+            return Err("the GPU unit must be chosen before the board's threads start".into());
+        }
+        let gpu = crate::wgpu::Gpu::new(opts)?;
+        let mut unit = GpuRaster::new(&gpu, self.vram.size(), PLANE_SPAN, PLANE_SPAN)?;
+        self.vram.track_dirty();
+        unit.attach_mirror(self.vram.ptr());
+        // The display composes on the GPU too, from the same memory.
+        let (vram, words) = unit.vram_buffer();
+        let scanout = super::wgpu::scanout::VproScanout::new(&gpu, &vram, words)?;
+        let _ = self.display.gpu_scanout.set(parking_lot::Mutex::new(scanout));
+        // Flips latch only once the unit has submitted the drawing before
+        // them (HostInterface::retrace).
+        unit.publish_stream(self.display.covered.clone());
+        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: raster unit on the GPU: {}", gpu.caps);
+        self.raster.run_now(|ctx| ctx.gpu = Some(Box::new(unit)));
+        Ok(())
     }
 }
 

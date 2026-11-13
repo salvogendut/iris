@@ -39,35 +39,12 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
     }
 }
 
-/// Mirror the flash loader's selection without reading or starting firmware.
-fn flash_prom_problems(configured: &str, defaults: &[&str], problems: &mut Vec<String>) {
-    if configured.is_empty() {
-        return;
-    }
-    if configured != DEFAULT_PROM {
-        missing_file("prom", configured, problems);
-        return;
-    }
-    for path in defaults {
-        match std::fs::metadata(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            _ => { missing_file("prom", path, problems); return; }
-        }
-    }
-}
-
-/// What the machine would warn about and carry on: a PROM file named by
-/// `prom` that is not there, on a machine with a built-in one.
+/// What the machine would warn about and carry on: the Tezro's audio card added
+/// with `no_audio` set.
 pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
     let mut warnings = Vec::new();
-    if cfg.machine.profile.has_embedded_prom()
-        && !matches!(cfg.machine.profile, MachineProfile::O2Ip32 | MachineProfile::OctaneIp30)
-        && cfg.prom != DEFAULT_PROM
-    {
-        missing_file("prom", &cfg.prom, &mut warnings);
-        for w in &mut warnings {
-            w.push_str("; the built-in PROM would run");
-        }
+    if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.tezro.audio && cfg.no_audio {
+        warnings.push(crate::ip53_machine::AUDIO_WITH_NO_AUDIO.to_string());
     }
     warnings
 }
@@ -80,21 +57,10 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
     }
     let profile = cfg.machine.profile;
 
-    // The fork's O2/Octane flash loader uses embedded bytes for an empty
-    // path or absent defaults, but never hides an invalid explicit override.
-    match profile {
-        MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 => {
-            let model = if profile == MachineProfile::O2Ip32 {
-                crate::ip32_machine::O2_PROM_FILE
-            } else {
-                crate::ip30_machine::OCTANE_PROM_FILE
-            };
-            flash_prom_problems(&cfg.prom, &[DEFAULT_PROM, model], &mut problems);
-        }
-        _ if !profile.has_embedded_prom() => {
-            missing_file("prom", &profile.prom_path(&cfg.prom), &mut problems);
-        }
-        _ => {}
+    // The PROM: one the user named must be there. Left at the default, or "(embedded)",
+    // the machine runs the PROM built into iris.
+    if cfg.prom != DEFAULT_PROM && !crate::dev::prom_image::is_embedded_keyword(&cfg.prom) {
+        missing_file("prom", &cfg.prom, &mut problems);
     }
 
     let mut keys: Vec<_> = cfg.scsi.keys().copied().collect();
@@ -179,7 +145,7 @@ pub fn report(path: &str, cfg: &MachineConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{banks_from4, CpuModel};
+    use crate::config::banks_from4;
 
     fn dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("iris-check-{name}-{}", std::process::id()));
@@ -246,7 +212,7 @@ mod tests {
         let d = dir("bad");
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R4400;
+        cfg.machine.cpu = Some("r4400".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
         cfg.prom = d.join("no-prom").to_string_lossy().into_owned();
         cfg.scsi.clear();
@@ -256,7 +222,7 @@ mod tests {
         cfg.monitor_port = Some(8880);
         let all = problems(&cfg).join("\n");
         for want in [
-            "an Octane requires cpu = r10000, r12000 or r14000",
+            "SGI Octane (IP30) takes [machine] cpu = ",
             "prom ",
             "scsi.1 ",
             "scsi.2: a disk needs a path",
@@ -270,54 +236,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The Indy and Indigo2 run their built-in PROM when `prom` names a file
-    /// that is not there, so `--validate` warns and still passes; a machine
-    /// with a strict explicit flash-PROM override fails.
+    /// A `prom` the user names must be there, on every machine; "(embedded)" and the
+    /// default ask for the built-in PROM.
     #[test]
-    fn a_missing_prom_is_a_warning_where_the_machine_has_its_own() {
+    fn a_named_prom_must_exist() {
         let mut cfg = MachineConfig::default();
         cfg.scsi.clear();
         cfg.prom = "no-such-prom.bin".into();
-        assert!(problems(&cfg).is_empty());
-        assert_eq!(warnings(&cfg).len(), 1, "{:?}", warnings(&cfg));
-        assert!(warnings(&cfg)[0].contains("built-in PROM"));
-        assert_eq!(report("indy.toml", &cfg), 0);
+        assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")), "{:?}", problems(&cfg));
+        assert_eq!(report("indy.toml", &cfg), 1);
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = Some("r10000".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
-        assert!(warnings(&cfg).is_empty());
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")));
+        cfg.prom = "(embedded)".into();
+        assert!(problems(&cfg).is_empty(), "{:?}", problems(&cfg));
+    }
+
+    /// The Tezro's audio card with `no_audio` set is present and silent; that
+    /// is worth saying, and not an error.
+    #[test]
+    fn the_tezro_audio_card_with_no_audio_is_a_warning() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::TezroIp53;
+        cfg.tezro.audio = true;
+        assert!(warnings(&cfg).is_empty());
+        cfg.no_audio = true;
+        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
+        cfg.tezro.audio = false;
+        assert!(warnings(&cfg).is_empty());
     }
 
     #[test]
     fn flash_prom_validation_preserves_embedded_and_explicit_selection() {
         let d = dir("flash-selection");
-        let generic = d.join("generic");
-        let model = d.join("model");
-        let defaults = [generic.to_str().unwrap(), model.to_str().unwrap()];
-        let check = |configured| {
-            let mut out = Vec::new();
-            flash_prom_problems(configured, &defaults, &mut out);
-            out
-        };
-        assert!(check(DEFAULT_PROM).is_empty());
-        assert!(check("").is_empty());
-        assert!(!check(model.to_str().unwrap()).is_empty());
-        std::fs::write(&model, b"firmware").unwrap();
-        assert!(check(DEFAULT_PROM).is_empty());
-        std::fs::create_dir(&generic).unwrap();
-        assert!(!check(DEFAULT_PROM).is_empty());
-        assert!(check("").is_empty());
-        assert!(check(model.to_str().unwrap()).is_empty());
         for profile in [MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
             let mut cfg = MachineConfig::default();
             cfg.machine.profile = profile;
-            cfg.machine.cpu = if profile == MachineProfile::O2Ip32 { CpuModel::R5000 } else { CpuModel::R10000 };
+            cfg.machine.cpu = Some(if profile == MachineProfile::O2Ip32 { "r5000" } else { "r10000" }.into());
             cfg.banks = banks_from4([128, 0, 0, 0]);
             cfg.prom.clear();
             cfg.scsi.clear();
             assert!(warnings(&cfg).is_empty());
             assert!(problems(&cfg).is_empty(), "{:?}", problems(&cfg));
+            cfg.prom = d.join("missing-override").to_string_lossy().into_owned();
+            assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")));
         }
         let _ = std::fs::remove_dir_all(d);
     }
@@ -329,7 +292,7 @@ mod tests {
         let d = dir("lenient");
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = Some("r10000".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
         cfg.prom = d.join("absent-prom").to_string_lossy().into_owned();
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")), "{:?}", problems(&cfg));

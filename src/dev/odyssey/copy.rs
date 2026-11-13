@@ -34,22 +34,33 @@
 //! Before a copy the library points the pixel mode (block 0x017) at the
 //! destination, whose layout gives the destination's packing.
 //!
-//! Word 7 bits 31 and 30 are set in the X server's window moves, whose
-//! destinations lie right of and below their overlapping sources (traced),
-//! and read as the walk's direction (INFERRED; the signed upload's copy, to
-//! another surface, has 31 set and 30 clear). The model reads the whole
-//! source before it writes, which gives what an ordered walk gives, so it
-//! does not need them.
+//! Word 7 bits 31 and 30 say the source is walked in decreasing x and y,
+//! and a BEGIN-0xa image open around the copy says which way the
+//! destination is walked: its box, reversed where x2 < x1 or y2 < y1. On
+//! an axis where the two disagree the copy mirrors (traced with pixtest
+//! on the GL library's copies: glCopyPixels at zoom 1, -1 sends a box
+//! reversed in both axes with bit 31 alone, so x is straight and y
+//! mirrored; an overlapping copy whose destination lies right of its
+//! source sends a box reversed in x with bit 31, so nothing mirrors and the
+//! walk clears the overlap; glCopyTexImage sends a box reversed in y with
+//! neither bit, so the texture is flipped). With no image open (the X
+//! server's window moves, which set the bits for their overlapping walks)
+//! nothing mirrors but a copy between a drawable and memory, whose rows the
+//! library lists bottom first. The model reads the whole source before it
+//! writes, so the walk's order itself does not matter.
 //!
 //! A destination the drawable bit names is a window: its pixels pass the
 //! window clip and id test, as a GL pixel copy's. A destination given by
 //! address is not tested: the X server's window moves copy outside the clip
 //! rectangles in force (traced), as screen-to-screen copies do.
 
+use super::gpu_unit::{CopyOp, CopySelect, CopyWindow};
+use super::pipe::backend::{widen8, DestMem};
+use super::pipe::ring::BackQuad;
 use super::bits::sextract32;
 use super::board::Board;
 use super::consts::{tex, ODSY_DID_MAIN_SHIFT, ODSY_PLANE_MASK_SHIFT};
-use super::field::{Codec, Field, Layout, FIELD_FOUR, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
+use super::field::{Codec, Field, Layout, FIELD_FOUR, FIELD_INDEX, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
 use super::view::{Rows, View, MAX_DIM};
 use super::vram::{Format, Surface, ADDR_MASK, DRAWABLE, PITCH_MASK};
 
@@ -76,6 +87,12 @@ pub(super) struct CopyOperands {
     pub w: [u32; 8],
 }
 
+/// Word 7 bits 4:0, the format the copy writes (the Odyssey RE notes).
+const WRITE_FORMAT_MASK: u32 = 0x1f;
+const WRITE_FORMAT_COLOR_INDEX: u32 = 1;
+/// Word 7 bit 27.
+const COPY_TRANSFORM: u32 = 1 << 27;
+
 impl CopyOperands {
     pub fn decode(op: &[u32]) -> CopyOperands {
         let mut w = [0; 8];
@@ -101,6 +118,24 @@ impl CopyOperands {
             bytes: 2 << ((w[4] >> 13) & 7),
             format: w[4] & 0xff,
         }
+    }
+
+    /// Word 7's write format, bits 4:0 (the Odyssey RE notes; not checked
+    /// against a board). Its type, bits 8:5, runs into bit 8: do not mask a
+    /// byte.
+    pub fn write_format(&self) -> u32 {
+        self.w[7] & WRITE_FORMAT_MASK
+    }
+
+    /// Word 7 bit 27: the copy is a textured rectangle (a zoom sets it too)
+    /// and not the short copy path.
+    pub fn transform(&self) -> bool {
+        self.w[7] & COPY_TRANSFORM != 0
+    }
+
+    /// The read and write field sizes, bits 15:13 of words 4 and 7.
+    pub fn same_width(&self) -> bool {
+        (self.w[4] >> 13) & 7 == (self.w[7] >> 13) & 7
     }
 
     pub fn dst(&self) -> Side {
@@ -151,7 +186,8 @@ impl Board {
     /// is the packing it asks for, not the window's. None where the mode
     /// names no field there.
     pub fn drawable_codec(&self, x: i32, y: i32, at: u8) -> Option<Codec> {
-        let did = self.dest_mem().did.load1(x, y)? as u32;
+        // The id bytes are the front end's own: no wait (Board::id_compare_passes).
+        let did = DestMem::of(self.vram_ptr(), &self.dest_views()).did.load1(x, y)? as u32;
         let mode = self.regs().dispmode((did >> ODSY_DID_MAIN_SHIFT) as usize);
         super::frame::mode_fields(mode).into_iter().find(|f| f.at == at).map(|f| f.codec)
     }
@@ -162,9 +198,14 @@ impl Board {
         let (w, h) = c.size();
         let (src, dst) = (c.src(), c.dst());
 
-        self.raster_wait();
         if w == 0 || h == 0 {
             return;
+        }
+        // The copy's own rectangles come back below; the CPU unit waits
+        // for everything.
+        let gpu = self.gpu_unit();
+        if !gpu {
+            self.raster_wait();
         }
         // The destination's format is the pixel mode's field at the offset
         // the copy names; word 7's field size is the unit moved, the colour
@@ -208,10 +249,19 @@ impl Board {
         let to = side_rows(&dst, dst_codec, dst_base);
         let (ox, oy) = if src.drawable { (self.win.read_origin[0], self.win.read_origin[1]) } else { (0, 0) };
         let (dx0, dy0) = if dst.drawable { (self.win.origin[0], self.win.origin[1]) } else { (0, 0) };
-        // A copy between a drawable and memory lists its rows bottom first
-        // (INFERRED from guest traces of glReadPixels, glCopyTexImage and
-        // glDrawPixels of the signed types; no known operand bit says so).
-        let flip = src.drawable != dst.drawable;
+        // Which axes the copy mirrors (see the module): inside a BEGIN-0xa
+        // image, those where word 7's walk bits and the box's direction
+        // disagree; outside one, the rows of a copy between a drawable and
+        // memory.
+        let (mirror_x, mirror_y) = if self.image.active {
+            let reversed = |a: u32, b: u32| b < a;
+            (
+                (c.w[7] >> 31 != 0) != reversed(self.image.x1, self.image.x2),
+                ((c.w[7] >> 30) & 1 != 0) != reversed(self.image.y1, self.image.y2),
+            )
+        } else {
+            (false, src.drawable != dst.drawable)
+        };
         // A copy of whole window-id pixels writes the id and overlay bytes
         // the drawing mask selects, under the plane mask, as Board::paint_aux()
         // does: the X server fills a menu's overlay by copying a tile under
@@ -221,11 +271,76 @@ impl Board {
             let b = self.draw_buffers();
             [if b & 1 != 0 { m } else { 0 }, if b & 2 != 0 { m } else { 0 }]
         });
-        let sb = &self.tex_regs().scale_bias;
-        let filter = (0..4).any(|c| sb[c * 2] != tex::SCALE_BIAS_ONE || sb[c * 2 + 1] != 0);
+        let filter = {
+            let sb = &self.tex_regs().scale_bias;
+            (0..4).any(|c| sb[c * 2] != tex::SCALE_BIAS_ONE || sb[c * 2 + 1] != 0)
+        };
+        // A colour index is not a colour. The X server tiles a colour-index
+        // root window by copying a seed block across the screen with read
+        // byte 0x08 (traced), the read that names one component in a 2-byte
+        // field; the same read serves luminance and alpha, so the index
+        // meaning comes from the write side. Unpacked as a luminance texel
+        // the 8-bit index, held as 0x00nn, came out as its top byte, 0,
+        // twice: a black background. The field moves as it is when all hold
+        // (the Odyssey RE notes, not checked against a board):
+        //  - the short copy path: word 7 bit 27 clear; a textured rectangle,
+        //    a zoom included, keeps converting;
+        //  - the copy writes COLOR_INDEX (word 7 bits 4:0);
+        //  - read and write fields are the same size (bits 15:13 of words 4
+        //    and 7), here the 2-byte one;
+        //  - the read is the one-component 2-byte one above;
+        //  - the scale and bias (block 0x203b, separate state, not in these
+        //    words) are the identity.
+        // Known limitation: what a non-identity scale or bias does to an
+        // index copy is unknown, so that case converts as before.
+        // The seed's own DMA upload names the same format word and already
+        // lands as an index, because `dma_fields` takes the pixel-mode
+        // surface's layout over the format byte; the copy is the one place
+        // that read the byte differently.
+        let one_component = Codec::Texel { bytes: 2, field: FIELD_ONE };
+        let index = !filter
+            && !c.transform()
+            && c.write_format() == WRITE_FORMAT_COLOR_INDEX
+            && c.same_width()
+            && src_codec(src.at) == one_component
+            && matches!(dst_codec, Codec::Texel { field: FIELD_INDEX, bytes: 2 });
+        // A copy inside a depth-tested image (glCopyPixels under the depth
+        // test, traced: the copy comes inside a BEGIN-0xa image whose box
+        // carries the raster depth) goes through the fragment back end
+        // pixel by pixel, as the image's own pixels do (Board::image_put).
+        // It needs the decoded words, so it is never a raw move.
+        let fragment = self.image.active && dst.drawable && self.image.fragment.is_some();
         // Bytes move as they are when both sides hold a word the same way.
-        let raw = src_codec(src.at) == dst_codec && !filter;
+        let raw = !fragment && (index || (src_codec(src.at) == dst_codec && !filter));
 
+        if gpu {
+            // The unit copies within its own memory, in order with the
+            // records and with no readback, when it can take the copy.
+            if !fragment {
+                let op = self.copy_op(&c, &src, &dst, &from, ab.as_ref(), &to, (ox, oy), (dx0, dy0), (mirror_x, mirror_y), raw, byte_masks, filter);
+                if self.raster.run_now(|ctx| ctx.gpu.as_mut().is_some_and(|g| g.copy(&op))) {
+                    return;
+                }
+            }
+            // Otherwise the source and destination rectangles come back,
+            // current in the mirror, and the CPU copies.
+            let region = |rows: &Rows, x: i32, y: i32| {
+                self.raster.run_now(|ctx| {
+                    if let Some(g) = &mut ctx.gpu {
+                        if let Err(e) = g.read_back_view(&rows.v, x, y, x.wrapping_add(w as i32 - 1), y.wrapping_add(h as i32 - 1)) {
+                            crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                        }
+                    }
+                });
+            };
+            let (sx, sy) = ((src.x as i32).wrapping_add(ox), (src.y as i32).wrapping_add(oy));
+            region(&from, sx, sy);
+            if let Some(f) = &ab {
+                region(&f[0], sx, sy);
+                region(&f[1], sx, sy);
+            }
+            region(&to, (dst.x as i32).wrapping_add(dx0), (dst.y as i32).wrapping_add(dy0));
+        }
         // The whole source first, so an overlapping copy reads what was there.
         let n = w as usize * h as usize;
         let mut words = vec![0u32; n];
@@ -245,18 +360,32 @@ impl Board {
                 }
             }
         }
-        if filter {
+        if filter && !raw {
             self.copy_post_filter(&mut words, !src.drawable);
         }
         for y in 0..h {
-            let row = if flip { h - 1 - y } else { y };
+            let row = if mirror_y { h - 1 - y } else { y };
             for x in 0..w {
-                let (px, py) = ((dst.x + x) as i32 + dx0, (dst.y + row) as i32 + dy0);
+                let col = if mirror_x { w - 1 - x } else { x };
+                let (px, py) = ((dst.x + col) as i32 + dx0, (dst.y + row) as i32 + dy0);
                 if dst.drawable && !self.pixel_allowed(px as i64, py as i64) {
                     continue;
                 }
                 let i = (y * w + x) as usize;
-                if let (true, Some(m)) = (raw, byte_masks) {
+                if fragment {
+                    let Some(f) = self.image.fragment.as_deref() else { continue };
+                    let word = words[i];
+                    let src4 = [word >> 24, word >> 16, word >> 8, word].map(|c| widen8(c & 0xff));
+                    let zq = f.1;
+                    match self.image.gpu_slot {
+                        // The unit tests and stores it in order, as a fragment.
+                        Some(slot) => {
+                            let q = BackQuad { x: px, y: py, cov: 1, zq: [zq, 0, 0, 0], rgba: [src4.map(|c| c as u16), [0; 4], [0; 4], [0; 4]], ..Default::default() };
+                            self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").push_frag(&q, &slot));
+                        }
+                        None => f.0.fragment_q(&self.dest_mem(), px, py, zq, src4),
+                    }
+                } else if let (true, Some(m)) = (raw, byte_masks) {
                     // The id byte, then the overlay byte: the field's top two.
                     let n = to.v.len();
                     let mask = (m[0] as u64) << (8 * (n - 1)) | (m[1] as u64) << (8 * (n.max(2) - 2));
@@ -271,6 +400,54 @@ impl Board {
         }
     }
 
+    /// The copy as the GPU unit takes it (`GpuRaster::copy`): the sides as
+    /// views, the per-pixel buffer choice, the masks, the filter's words and
+    /// the destination window's tests.
+    #[allow(clippy::too_many_arguments, reason = "the copy's decoded sides")]
+    fn copy_op(&mut self, c: &CopyOperands, src: &Side, dst: &Side, from: &Rows, ab: Option<&[Rows; 2]>, to: &Rows, (ox, oy): (i32, i32), (dx0, dy0): (i32, i32), mirror: (bool, bool), raw: bool, byte_masks: Option<[u8; 2]>, filter: bool) -> CopyOp {
+        let did = DestMem::of(self.vram_ptr(), &self.dest_views()).did.v;
+        let (views, select) = match ab {
+            None => ([from.v, from.v], CopySelect::Fixed(0)),
+            Some(f) => {
+                let front = c.w[4] >> 31 != 0;
+                let select = if self.read_drawable_offscreen() {
+                    CopySelect::Fixed(self.read_buffer(front, 0, 0) as usize & 1)
+                } else {
+                    CopySelect::PerPixel { did, displayed: self.front.lock().displayed_buffer, front }
+                };
+                ([f[0].v, f[1].v], select)
+            }
+        };
+        let byte_mask = byte_masks.map(|m| {
+            let n = to.v.len() as usize;
+            (m[0] as u64) << (8 * (n - 1)) | (m[1] as u64) << (8 * (n.max(2) - 2))
+        });
+        let filter = filter.then(|| {
+            let sb = &self.tex_regs().scale_bias;
+            (std::array::from_fn(|i| sextract32(sb[i], 0, tex::SCALE_BIAS_BITS)), !src.drawable)
+        });
+        let window = dst.drawable.then(|| {
+            let mut clip = [[0i32; 4]; 4];
+            for (i, r) in self.win.clip_rect.iter().enumerate().take(4) {
+                clip[i] = [r.x0, r.y0, r.x1, r.y1];
+            }
+            CopyWindow { width: self.dest_views().colour[0].width, clip, clip_kept: self.win.clip_kept, id_compare: self.win.id_compare, did }
+        });
+        CopyOp {
+            src: views,
+            select,
+            dst: to.v,
+            size: c.size(),
+            src_xy: ((src.x as i32).wrapping_add(ox), (src.y as i32).wrapping_add(oy)),
+            dst_xy: ((dst.x as i32).wrapping_add(dx0), (dst.y as i32).wrapping_add(dy0)),
+            mirror,
+            raw,
+            byte_mask,
+            filter,
+            window,
+        }
+    }
+
     /// Whether the board reads the bytes of a copy's source as signed values
     /// when it filters them. INFERRED, and nothing board-visible establishes
     /// it: the library sends a signed type's burst and write code as the
@@ -281,10 +458,11 @@ impl Board {
     /// drawable as unsigned.
     ///
     /// The post-filter (block 0x203b) on a copy's words, lane by lane in R,
-    /// G, B, A order: byte b of a lane becomes clamp(x * scale + bias, 0, 1)
-    /// as a byte, with x = b / 255 (signed: the byte as a signed value over
-    /// 255), scale and bias signed 3.12 fixed point (ESTABLISHED as the
-    /// layout). An alpha lane whose bias is full scale (0x1000) is the
+    /// G, B, A order: byte b of a lane becomes b / 255 * scale + bias as a
+    /// byte (signed: the byte as a signed value over 255), scale and bias
+    /// signed 3.12 fixed point (ESTABLISHED as the layout), clamped to the
+    /// byte and rounded to the nearest, ties up; computed exactly in
+    /// integers, the same on both raster units. An alpha lane whose bias is full scale (0x1000) is the
     /// library's opaque overwrite for a source without alpha: 1.0.
     /// glPixelTransfer's scale and bias on an image pixel drawn into a
     /// window: the library programs block 0x203b before the image (traced,
@@ -303,10 +481,7 @@ impl Board {
 
     pub fn copy_post_filter(&self, words: &mut [u32], signed: bool) {
         let sb = &self.tex_regs().scale_bias;
-        let lane = |c: usize| {
-            (sextract32(sb[c * 2], 0, tex::SCALE_BIAS_BITS) as f64 / tex::SCALE_BIAS_ONE as f64,
-             sextract32(sb[c * 2 + 1], 0, tex::SCALE_BIAS_BITS) as f64 / tex::SCALE_BIAS_ONE as f64)
-        };
+        let lane = |c: usize| (sextract32(sb[c * 2], 0, tex::SCALE_BIAS_BITS) as i64, sextract32(sb[c * 2 + 1], 0, tex::SCALE_BIAS_BITS) as i64);
 
         for word in words.iter_mut() {
             let mut out = *word;
@@ -315,10 +490,12 @@ impl Board {
                 let (scale, bias) = lane(c);
                 let shift = 24 - 8 * c as u32;
                 let byte = (*word >> shift) as u8;
-                let x = if signed { byte as i8 as f64 } else { byte as f64 } / 255.0;
-                let v = if c == 3 && bias >= 1.0 { 1.0 } else { (x * scale + bias).clamp(0.0, 1.0) };
+                let x = if signed { byte as i8 as i64 } else { byte as i64 };
+                // x / 255 * scale + bias, times 255 and 4096: the byte times
+                // the scale plus 255 times the bias, exact.
+                let v = if c == 3 && bias >= tex::SCALE_BIAS_ONE as i64 { 255 } else { ((x * scale + 255 * bias).clamp(0, 255 * 4096) + 2048) >> 12 };
 
-                out = (out & !(0xff << shift)) | (((v * 255.0 + 0.5).floor() as u32) << shift);
+                out = (out & !(0xff << shift)) | ((v as u32) << shift);
             }
             *word = out;
         }

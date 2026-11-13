@@ -1,8 +1,9 @@
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, Ui};
 use iris::build_features;
+use iris::cpu::parts::Part;
 use std::path::Path;
 use iris::config::{AudioHost, CacheModel,
-    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
+    format_unix_utc, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
     MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
@@ -19,7 +20,7 @@ pub struct MemoryUiContext {
     pub started_banks: Option<[u32; iris::config::MAX_BANKS]>,
     /// The CPU the running guest actually booted on, so a pending change is
     /// shown as pending rather than as fact. `None` when nothing is running.
-    pub started_cpu: Option<CpuModel>,
+    pub started_cpu: Option<&'static Part>,
 }
 
 /// A host network interface candidate for the PCAP backend selector. This is a
@@ -265,15 +266,6 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             .small(),
         );
     }
-    // The O2 has no embedded PROM — it boots from an IP32 image, the same way
-    // the Octane does. Say so up front rather than letting the user discover
-    // it as a Start failure.
-    if o2 {
-        ui.label(
-            RichText::new(t!("config-o2-prom-warning"))
-                .color(Color32::from_rgb(220, 170, 90)),
-        );
-    }
     ui.heading(t!("config-processor"));
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t!("config-cpu"));
@@ -283,27 +275,30 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // way its RAM does.
         // Offer only CPUs implemented for this machine.
         ui.add_enabled_ui(!mem_ctx.running, |ui| {
+            let mut cpu = cfg.cpu();
             ComboBox::from_id_salt("cpu_model")
-                .selected_text(cfg.machine.cpu.label())
+                .selected_text(cpu.label())
                 .show_ui(ui, |ui| {
                     for &c in cfg.machine.profile.cpus() {
-                        ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
+                        ui.selectable_value(&mut cpu, c, c.label());
                     }
                 });
+            if cpu != cfg.cpu() { cfg.set_cpu(cpu); }
         });
         ui.end_row();
 
         // `[machine] cache`. The R10000 only has the shadow model, so the
         // choice is fixed there.
         ui.label(t!("config-cache-model"));
-        let r10k = cfg.machine.cpu.is_r10k_family();
+        let cpu = cfg.cpu();
+        let r10k = cpu.is_r10000_family();
         ui.add_enabled_ui(!mem_ctx.running && !r10k, |ui| {
-            let shown = if r10k { t!("config-cache-shadow-only") } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
+            let shown = if r10k { t!("config-cache-shadow-only") } else { cache_model_label(cfg.machine.cache, cpu) };
             ComboBox::from_id_salt("cache_model")
                 .selected_text(shown)
                 .show_ui(ui, |ui| {
                     for m in [CacheModel::Auto, CacheModel::Full, CacheModel::Shadow] {
-                        ui.selectable_value(&mut cfg.machine.cache, m, cache_model_label(m, cfg.machine.cpu));
+                        ui.selectable_value(&mut cfg.machine.cache, m, cache_model_label(m, cpu));
                     }
                 })
                 .response
@@ -313,17 +308,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         ui.label(t!("config-clock"));
         ui.horizontal(|ui| {
-            // CP0 Count is half the selected Octane CPU clock; the O2 defaults
-            // to 90 MHz, IP28 to 97.5 MHz and the Indy/IP22 to 33 MHz.
-            let auto_default = if octane {
-                cfg.machine.cpu.octane_count_hz().unwrap_or(97_500_000) as f64 / 1_000_000.0
-            } else if cfg.machine.profile.ip28() {
-                97.5
-            } else if o2 {
-                90.0
-            } else {
-                33.0
-            };
+            // CP0 Count: half the chip's clock.
+            let auto_default = cfg.cpu().count_hz() as f64 / 1e6;
             let mut mhz = cfg.clock.fixed_mhz.unwrap_or(auto_default);
             let changed = ui.add(DragValue::new(&mut mhz).range(0.1..=1000.0).suffix(" MHz")).changed();
             if changed { cfg.clock.fixed_mhz = Some(mhz); }
@@ -343,15 +329,15 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                 .color(Color32::from_rgb(220, 170, 90)),
         );
         if let Some(started) = mem_ctx.started_cpu {
-            if started != cfg.machine.cpu {
-                ui.label(t!("config-pending", running = started.label(), pending = cfg.machine.cpu.label()));
+            if started != cfg.cpu() {
+                ui.label(t!("config-pending", running = started.label(), pending = cfg.cpu().label()));
             }
         }
     } else {
         subtitle(ui, t!("config-cpu-applies-subtitle"));
     }
     subtitle(ui, t!("config-cpu-subtitle"));
-    if cfg.machine.cpu == CpuModel::R10000 {
+    if cfg.cpu().is_r10000_family() {
         subtitle(ui, t!("config-r10000-subtitle"));
     }
     // jitv2's compile pool and its persistent code cache live on the Performance
@@ -386,25 +372,20 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // is discoverable instead of "delete the text by hand". Disabled when
         // already empty, so the confirm prompt only ever appears when a custom
         // PROM is selected.
-        // Neither the Octane nor the O2 has a built-in PROM: the Octane needs
-        // the IP30 flash image and the O2 an IP32 one, so there is nothing to
-        // fall back to and the button would only strand the user.
-        if !octane && !o2 {
-            ui.label("");
-            ui.horizontal(|ui| {
-                let custom = !cfg.prom.is_empty();
-                if ui.add_enabled(custom, egui::Button::new(t!("config-prom-builtin")))
-                    .tip(t!("config-prom-builtin-tip"))
-                    .clicked()
-                {
-                    action = ConfigAction::RequestEmbeddedProm;
-                }
-                if !custom {
-                    ui.label(RichText::new(t!("config-prom-builtin-active")).weak());
-                }
-            });
-            ui.end_row();
-        }
+        ui.label("");
+        ui.horizontal(|ui| {
+            let custom = !cfg.prom.is_empty();
+            if ui.add_enabled(custom, egui::Button::new(t!("config-prom-builtin")))
+                .tip(t!("config-prom-builtin-tip"))
+                .clicked()
+            {
+                action = ConfigAction::RequestEmbeddedProm;
+            }
+            if !custom {
+                ui.label(RichText::new(t!("config-prom-builtin-active")).weak());
+            }
+        });
+        ui.end_row();
 
         ui.label(t!("config-nvram"));
         path_row(ui, "nvram", &mut cfg.nvram, Pick::SaveFile, &nvram_filters());
@@ -528,7 +509,7 @@ fn port_row(ui: &mut Ui, label: String, hover: String, value: &mut Option<u16>, 
 }
 
 /// A cache model's menu label; Auto says what it resolves to in this build.
-fn cache_model_label(m: CacheModel, cpu: CpuModel) -> String {
+fn cache_model_label(m: CacheModel, cpu: &Part) -> String {
     match m {
         CacheModel::Auto if m.is_shadow(cpu) => t!("config-cache-auto-shadow"),
         CacheModel::Auto => t!("config-cache-auto-full"),
@@ -678,12 +659,12 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 /// DIMM-pair kits of 32/64/128/256 MB filled from pair A, so a config that was
 /// an Indy a moment ago carries both.
 fn o2_defaults(cfg: &mut MachineConfig) {
-    if !cfg.machine.profile.cpus().contains(&cfg.machine.cpu) {
-        cfg.machine.cpu = CpuModel::R5000;
+    if cfg.cpu_part().is_err() {
+        cfg.machine.cpu = None;
     }
-    // CP0 Count is half the CPU clock here (90 MHz), and a clock carried over
-    // from the Indy (33 MHz) would make IRIX's clock run at the wrong rate.
-    // Unset it so the O2's own default applies.
+    // CP0 Count is half the chip's clock, and a clock carried over from
+    // another machine would make IRIX's clock run at the wrong rate. Unset it
+    // so the chip's own default applies.
     cfg.clock.fixed_mhz = None;
     // Kits only, filled from pair A. Judge the layout by the core's own rules
     // rather than restating them here, so the two cannot drift.
@@ -704,7 +685,7 @@ fn o2_defaults(cfg: &mut MachineConfig) {
 }
 
 fn octane_defaults(cfg: &mut MachineConfig) {
-    cfg.machine.cpu = CpuModel::R10000;
+    cfg.machine.cpu = None;
     let sizes = MachineProfile::OctaneIp30.bank_sizes();
     let banks = &cfg.banks[..MachineProfile::OctaneIp30.memory_banks()];
     let filled = banks.iter().take_while(|&&b| b != 0).count();
@@ -1889,7 +1870,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         // What this machine is configured to be, not how the binary was built —
         // all CPU models are always compiled in and selected at start.
         ui.label(t!("config-build-cpu"));
-        ui.label(cfg.machine.cpu.label());
+        ui.label(cfg.cpu().label());
         ui.end_row();
         // `gpujit` = all three graphics JITs. The App Store build turns them
         // off at run time with IRIS_NO_JIT, so report what will actually run.
@@ -2037,10 +2018,10 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.horizontal(|ui| {
         ui.add_enabled_ui(octane, |ui| {
             ComboBox::from_id_salt("machine_cpus")
-                .selected_text(format!("{}", cfg.machine.cpus))
+                .selected_text(format!("{}", cfg.machine.cpus()))
                 .show_ui(ui, |ui| {
                     for n in [1u8, 2] {
-                        ui.selectable_value(&mut cfg.machine.cpus, n, format!("{n}"));
+                        ui.selectable_value(&mut cfg.machine.cpus, Some(n), format!("{n}"));
                     }
                 });
         });

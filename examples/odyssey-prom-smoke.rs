@@ -2,7 +2,7 @@
 //! Usage: cargo run --example odyssey-prom-smoke -- v12 /tmp/new-v12-run [seconds] [r10000|r12000|r14000] [cpus] [graphics|serial]
 //! Graphics mode saves prom.png for visual inspection. Serial mode enters the
 //! command monitor and checks hinv for CPU model, clock, count and cache size.
-use iris::config::{CpuModel, GraphicsBoard, MachineConfig, MachineProfile, NetMode};
+use iris::config::{GraphicsBoard, MachineConfig, MachineProfile, NetMode};
 use iris::dev::serial_host::CiSerialBackend;
 use iris::hostinput::HostInput;
 use iris::ip30_machine::OctaneMachine;
@@ -39,29 +39,17 @@ fn run() -> Result<(), String> {
     let b = Arc::new(CiSerialBackend::new());
     let mut cfg = MachineConfig::default();
     cfg.machine.profile = MachineProfile::OctaneIp30;
-    cfg.machine.cpu = match args.get(4).map(String::as_str).unwrap_or("r10000") {
-        "r10000" => CpuModel::R10000,
-        "r12000" => CpuModel::R12000,
-        "r14000" => CpuModel::R14000,
-        _ => return Err("expected r10000, r12000 or r14000".into()),
-    };
-    cfg.machine.cpus = args
-        .get(5)
-        .map(|s| s.parse())
-        .transpose()
-        .map_err(|_| "invalid CPU count")?
-        .unwrap_or(1);
-    println!(
-        "{} x {}: Count {} Hz",
-        cfg.machine.cpus,
-        cfg.machine.cpu.label(),
-        cfg.machine.cpu.octane_count_hz().unwrap()
-    );
+    let cpu = args.get(4).map(String::as_str).unwrap_or("r10000");
+    let part = MachineProfile::OctaneIp30.part(Some(cpu))?;
+    cfg.set_cpu(part);
+    cfg.machine.cpus = Some(args.get(5).map(|s| s.parse()).transpose()
+        .map_err(|_| "invalid CPU count")?.unwrap_or(1));
+    println!("{} x {}: Count {} Hz", cfg.machine.cpus(), part.label(), part.count_hz());
     cfg.banks = [128, 0, 0, 0, 0, 0, 0, 0];
     cfg.graphics.board = Some(board);
     cfg.scsi.clear();
     cfg.network.mode = NetMode::Off;
-    cfg.prom.clear(); // Bundled IP30 PROM 4.9.
+    cfg.prom.clear(); // Bundled IP30 PROM.
     cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
     cfg.octane.flash = Some(dir.join("flash.bin").to_string_lossy().into_owned());
     cfg.serial_backends.a = Some(a.clone());
@@ -104,16 +92,8 @@ fn run() -> Result<(), String> {
             } else if let Some(at) = inventory {
                 let reply = String::from_utf8_lossy(&transcript[at..]);
                 if reply.contains(">> ") {
-                    let (mhz, cache_mb) = match cfg.machine.cpu {
-                        CpuModel::R10000 => (195, 1),
-                        CpuModel::R12000 => (300, 2),
-                        CpuModel::R14000 => (600, 2),
-                        _ => unreachable!(),
-                    };
-                    let expected_cpu = format!(
-                        "{mhz} Mhz {},",
-                        cfg.machine.cpu.label().trim_start_matches("MIPS ")
-                    );
+                    let cache_mb = part.l2_kb / 1024;
+                    let expected_cpu = format!("{} Mhz R{},", part.mhz, part.family as u32);
                     // PROM hinv prints the cache on its own line; it does
                     // not use IRIX's combined processor/cache inventory line.
                     let processors = reply.lines().filter(|line| {
@@ -122,7 +102,7 @@ fn run() -> Result<(), String> {
                                 && value.trim().starts_with(&expected_cpu)
                         })
                     }).count();
-                    inventory_complete = processors == cfg.machine.cpus as usize
+                    inventory_complete = processors == cfg.machine.cpus() as usize
                         && reply.contains(&format!("Secondary cache size: {cache_mb} Mbytes"));
                     break;
                 }
@@ -135,10 +115,10 @@ fn run() -> Result<(), String> {
             if !inventory_complete {
                 return Err("PROM inventory did not confirm CPU model, clock, count and cache before timeout".into());
             }
-            println!("{}: PROM hinv identified the CPU", cfg.machine.cpu.label());
+            println!("{}: PROM hinv identified the CPU", part.label());
             return Ok(());
         }
-        let (width, height, pixels) = input.frame()?;
+        let (width, height, pixels, _) = input.frame()?;
         let first = pixels.first().copied().unwrap_or(0);
         let changed = pixels.iter().filter(|&&p| p != first).count();
         println!("{product}: {width}x{height}; {changed} pixels differ from the first pixel");

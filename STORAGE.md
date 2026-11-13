@@ -114,7 +114,9 @@ image, so the extra cost falls on a fresh `.diff.chd` filling up.
   `ScsiDevice::with_write_cache` applies it; a bare `ScsiDevice` has no cache.
   `perform_write` in `src/scsi.rs` calls `flush_data` before GOOD for a
   WRITE(10) with FUA and, when WCE is 0, for every write. SYNCHRONIZE CACHE
-  (10) and (16) call `flush` on the whole disk and ignore the range and IMMED.
+  (10) and (16) call `flush_data` on the whole disk and ignore the range and
+  IMMED. They skip the housekeeping `flush` adds, which an overlay's record
+  needs only at a clean stop.
 
 What a `BlockNode` promises (the `block_node.rs` module docs say the same):
 
@@ -177,14 +179,32 @@ cdrom = false
 overlay = true
 ```
 
-Writes go to `scsi1.raw.overlay`. Monitor commands:
+Writes go to `scsi1.raw.overlay`. One emulator can use an overlay at a time: a
+second is refused at start-up, with `... is in use by another iris`, because two
+writers ruin the filesystem in it. The lock is on `scsi1.raw.overlay.lock`, an
+empty file that stays behind and can be ignored; the lock itself goes with the
+process, however it ends. A `--ci` run has its own overlay under `/tmp`, so any
+number can run beside an interactive iris.
+
+Monitor commands:
 - `cow status` - show dirty sector count
 - `cow commit [id]` - merge overlay into base image (permanent)
 - `cow reset [id]` - discard all overlay writes
 
-CHD images get the same protection automatically: writes go
-to a `.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or
-the GUI's "Commit changes to disk") folds the diff back into the base.
+A compressed CHD gets the same protection automatically: writes go to a
+`.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or the
+GUI's "Commit changes to disk") folds the diff back into the base. An
+uncompressed CHD is written in place unless `overlay = true`, which puts its
+writes in a diff too; that diff is kept apart until `cow commit`, and the
+folds above leave it alone.
+
+While a fold runs, the guest must be stopped and each disk being folded
+answers as a drive with its tray empty. When the fold ends every disk is
+attached again, whether or not it was folded. A disk that was folded is
+reopened on its new base when the guest next uses it, and a compressed base
+gets its empty diff then, not before. One whose fold failed or was
+cancelled is reopened on its base and diff as they were, so a guest
+resumed afterwards still has its disks and its writes.
 
 
 ## Snapshots and rollback
@@ -196,8 +216,8 @@ See [TODO.md](clanker/TODO.md) for remaining device and restore work.
 
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
-SCSI controller, and the Seeq Ethernet chip all round-trip. Current schema
-version is 5: postcard-encoded binary device state plus content-addressable
+SCSI controller, and the Seeq Ethernet chip all round-trip. The current schema
+version is 7: postcard-encoded binary device state plus content-addressable
 chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
 adds **zero bytes** to disk for any RAM region that didn't change — same
 storage model as Docker layers. Restore republishes the saved memory-controller bank map before execution,
@@ -216,9 +236,9 @@ also lack complete snapshot coverage; do not treat these snapshots as full VM
 backups.
 
 The O2 and the Octane save in this format too. An Octane snapshot covers one
-processor and no graphics board: with two processors or an IMPACT or VPro board
-fitted, a save or load is refused with the reason. Neither board's state is
-saved.
+processor and no graphics board: with two processors, an IMPACT or VPro board
+or virtio-serial, a save or load is refused with the reason. None of those
+saves its state.
 
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```

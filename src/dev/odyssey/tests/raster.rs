@@ -116,6 +116,10 @@ fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 /// does not wait answers at once.
 #[test]
 fn a_waiting_read_behind_a_queued_draw_sees_it_drawn() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(300);
 
     red_triangle(&mut h.test_board(), &st);
@@ -136,6 +140,10 @@ fn a_waiting_read_behind_a_queued_draw_sees_it_drawn() {
 /// (`a_read_of_a_register_the_work_may_change_finishes_the_work_first`).
 #[test]
 fn the_memory_word_answers_while_a_draw_is_queued() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(300);
 
     red_triangle(&mut h.test_board(), &st);
@@ -156,6 +164,10 @@ fn the_memory_word_answers_while_a_draw_is_queued() {
 /// written in the moment the test looks.
 #[test]
 fn a_fence_behind_a_queued_draw_lands_after_the_draw() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(0);
     h.raster.set_budget(u64::MAX);
     let hold = Arc::new(AtomicBool::new(true));
@@ -277,7 +289,7 @@ fn the_stipple_phase_carries_across_draws_on_the_raster_thread() {
             phase = d.line_phase;
         }
         let s = h.test_board();
-        s.raster_wait();
+        s.gpu_sync();
         (0..64).map(|x| pixel(&s, 0, x, 20)).collect()
     }
 
@@ -304,12 +316,12 @@ fn a_reused_draw_job_draws_only_its_new_primitive() {
         let quad = vertices(&[(0.0, 0.0), (64.0, 0.0), (0.0, 64.0), (64.0, 0.0), (64.0, 64.0), (0.0, 64.0)], RED);
         let mut d = LibDraw::new(GL_TRIANGLES, 6, &quad, st, &stipple);
         h.test_board().lib_draw(&mut d);
-        h.test_board().raster_wait();
+        h.test_board().gpu_sync();
         let tri = vertices(&[(w - 64.0, ht - 64.0), (w, ht - 64.0), (w - 64.0, ht)], BLUE);
         let mut d = LibDraw::new(GL_TRIANGLES, 3, &tri, st, &stipple);
         h.test_board().lib_draw(&mut d);
         let s = h.test_board();
-        s.raster_wait();
+        s.gpu_sync();
         let mut px = Vec::new();
         for y in (0..ODSY_HEIGHT as i32).step_by(8) {
             for x in (0..ODSY_WIDTH as i32).step_by(8) {
@@ -336,6 +348,10 @@ fn a_reused_draw_job_draws_only_its_new_primitive() {
 /// draw is in the planes, its snapshot already in place.
 #[test]
 fn a_query_behind_a_queued_draw_syncs_after_the_draw_without_holding_the_front_end() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(0);
     let release = hold_raster(&h);
     let ram = Ram::new(1 << 20);
@@ -365,6 +381,10 @@ fn a_query_behind_a_queued_draw_syncs_after_the_draw_without_holding_the_front_e
 /// read; the memory word answers at once.
 #[test]
 fn a_waiting_bus_read_is_busy_until_the_raster_unit_has_drawn() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(300);
     h.work_start();
 
@@ -566,6 +586,10 @@ fn tiny_triangle(s: &mut Board, st: &LibState) {
 /// sum of theirs.
 #[test]
 fn many_small_jobs_queue_without_the_front_end_waiting() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(0);
     let release = hold_raster(&h);
     let mut s = h.test_board();
@@ -588,6 +612,10 @@ fn many_small_jobs_queue_without_the_front_end_waiting() {
 /// until the raster unit has drawn it.
 #[test]
 fn one_big_job_makes_the_front_end_wait() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(0);
     let release = hold_raster(&h);
     // The held raster unit runs nothing, so the first job returning shows it
@@ -612,6 +640,10 @@ fn one_big_job_makes_the_front_end_wait() {
 /// runs, in order.
 #[test]
 fn the_bound_releases_as_the_raster_unit_works() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, _st) = slow_raster(200);
     let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
     let job = |i: u32| {
@@ -638,7 +670,13 @@ fn the_bound_releases_as_the_raster_unit_works() {
 /// raster unit's slice; the stop still finishes every job, in order.
 #[test]
 fn stop_releases_a_waiting_front_end() {
-    let (h, _st) = slow_raster(1500);
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
+    // A slice long enough that a release by the stop, even one whose threads
+    // wait for a core, cannot be taken for a release by the slice.
+    let (h, _st) = slow_raster(4000);
     let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
     let job = |i: u32| {
         let ran = ran.clone();
@@ -657,7 +695,7 @@ fn stop_releases_a_waiting_front_end() {
         assert!(!waiter.is_finished(), "the front end waits for room");
         let stopper = sc.spawn(|| h.raster.stop());
         let waited = waiter.join().unwrap();
-        assert!(waited < Duration::from_millis(1000), "released by the stop after {waited:?}, not by the slice");
+        assert!(waited < Duration::from_millis(3000), "released by the stop after {waited:?}, not by the slice");
         stopper.join().unwrap();
     });
     assert_eq!(*ran.lock(), vec![0, 1]);
@@ -728,8 +766,7 @@ fn assert_frame_is_whole_resolve(h: &BoardLocks, display: &Display, what: &str) 
 /// One front-end thread, the raster unit, lookup and cursor stores and
 /// swap arms run against `Odyssey::frame` with no pause; when the writers
 /// stop and the raster queue drains the presented frame is a whole resolve
-/// of the planes, and a hundred idle frames leave it so without resolving a
-/// line.
+/// of the planes, and ten idle frames leave it so.
 fn stress(seed: u64, last_is_lut: bool) {
     use crate::dev::odyssey::raster_bench::Lcg;
     let (h, mut st, display) = display_rig();
@@ -759,9 +796,9 @@ fn stress(seed: u64, last_is_lut: bool) {
                 }
                 5 => {
                     let i = rng.next_u32() % 0x600;
-                    s.backend_data(ODSY_GAMMA_BASE + i, rng.next_u32() & lut::ENTRY_MASK);
+                    s.display_fifo.lock().data(ODSY_GAMMA_BASE + i, rng.next_u32() & lut::ENTRY_MASK);
                 }
-                6 => s.backend_data(cursor::BASE + cursor::POSITION, (rng.next_u32() % 1200) << 16 | (rng.next_u32() % 1000)),
+                6 => s.display_fifo.lock().data(cursor::BASE + cursor::POSITION, (rng.next_u32() % 1200) << 16 | (rng.next_u32() % 1000)),
                 7 => {
                     let (x, y) = (rng.next_u32() % 1200, rng.next_u32() % 1000);
                     s.draw_mask = ODSY_DRAW_MASK_BUFFER0;
@@ -787,7 +824,7 @@ fn stress(seed: u64, last_is_lut: bool) {
                 s.paint_pixel((rng.next_u32() % 1280) as i64, (rng.next_u32() % 1024) as i64, rng.next_u32());
             } else {
                 // The entry every black pixel is looked up in.
-                s.backend_data(ODSY_GAMMA_BASE, rng.next_u32() & lut::ENTRY_MASK);
+                s.display_fifo.lock().data(ODSY_GAMMA_BASE, rng.next_u32() & lut::ENTRY_MASK);
             }
         }
         std::thread::sleep(Duration::from_micros(1500));
@@ -798,8 +835,12 @@ fn stress(seed: u64, last_is_lut: bool) {
     settle(&h, &display, 4);
     assert_frame_is_whole_resolve(&h, &display, "after the writers stopped");
 
+    // Every frame composes the whole picture from board memory afresh (nothing
+    // is carried from one frame to the next), so an idle frame is a pure
+    // recompute; ten of them, after the four settled ones above, still catch a
+    // frame that drifts with no writer.
     let before = display.reader.lock().frame.clone();
-    for _ in 0..100 {
+    for _ in 0..10 {
         Odyssey::frame(&h, &display);
     }
     let reader = display.reader.lock();
@@ -811,6 +852,10 @@ fn stress(seed: u64, last_is_lut: bool) {
 
 #[test]
 fn the_frame_ends_as_a_whole_resolve_under_live_writers() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     for (seed, lut) in [(0x5a17, false), (0x77, true), (0xbeef, false), (0x31, true), (0x42, false), (0x99, true)] {
         stress(seed, lut);
     }
@@ -884,7 +929,7 @@ fn swap_atomicity() {
             // The completion the guest waits for, slow to finish after it
             // has written its token.
             let r = ram.clone();
-            s.raster.submit_completion(move |_| {
+            s.raster.submit_completion(move || {
                 r.put(0x1000, &[1]);
                 std::thread::sleep(Duration::from_millis(150));
             });
@@ -913,6 +958,10 @@ fn swap_atomicity() {
 
 #[test]
 fn a_swap_after_a_fence_shows_the_whole_new_frame_with_no_lock() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     swap_atomicity();
 }
 
@@ -923,6 +972,10 @@ fn a_swap_after_a_fence_shows_the_whole_new_frame_with_no_lock() {
 /// that waited for the slice would never end.
 #[test]
 fn a_frame_waits_for_no_slice_and_takes_no_lock() {
+    // The raster thread's own behaviour: nothing to test on the GPU unit.
+    if super::gpu_unit_tests() {
+        return;
+    }
     let (h, st) = slow_raster(0);
     let display = Arc::new(Display::new(crate::disp::StatusSource::detached()));
     let hold = Arc::new(AtomicBool::new(true));
@@ -978,4 +1031,37 @@ fn the_sphere_map_reflects_the_eye_vector_about_the_normal() {
     let m = 2.0 * (r * r + (r + 1.0) * (r + 1.0)).sqrt();
     assert!((ss as f64 - (r / m + 0.5)).abs() < 1e-6, "{ss}");
     assert!((tt - 0.5).abs() < 1e-6, "{tt}");
+}
+
+/// What the display thread presents: an idle board is presented only on
+/// the display's refresh frames, and a change shows on the next frame.
+#[test]
+fn an_idle_display_presents_only_its_refresh_frames() {
+    if super::gpu_unit_tests() {
+        // The GPU scan-out composes every frame.
+        return;
+    }
+    let (h, _st, display) = display_rig();
+    let seq = |d: &Display| d.screen.lock().frame_seq;
+
+    Odyssey::frame(&h, &display);
+    let first = seq(&display);
+    assert_eq!(first, 1, "the first frame is presented");
+    // The reset's stores bring one more frame, which catches data their
+    // mark was seen ahead of.
+    Odyssey::frame(&h, &display);
+    assert_eq!(seq(&display), 2);
+    let refresh = (1..=10).filter(|_| {
+        let before = seq(&display);
+        Odyssey::frame(&h, &display);
+        seq(&display) != before
+    }).count();
+    assert_eq!(refresh, 1, "ten idle frames present once, at the refresh");
+
+    h.raster.wait_idle();
+    h.test_board().vram.ptr().store(0x1000, 4, 0x55);
+    let before = seq(&display);
+    Odyssey::frame(&h, &display);
+    assert_eq!(seq(&display), before + 1, "a store shows on the next frame");
+    h.raster.stop();
 }

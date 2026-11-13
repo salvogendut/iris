@@ -1,10 +1,12 @@
 //! What the display thread reads of the board, and nothing else.
 //!
-//! Each frame the display composes the whole screen from board memory as
-//! the scan-out registers describe it (frame.rs), reading memory the
-//! raster unit and the front end may be writing, without a lock, as the
-//! real scan-out does. The rest of what a frame reads is shared the same
-//! way:
+//! When anything it reads has changed, the display composes the whole
+//! screen from board memory as the scan-out registers describe it
+//! (frame.rs), reading memory the raster unit and the front end may be
+//! writing, without a lock, as the real scan-out does. A store to the
+//! memory (`VramPtr::take_written`) or a move of a register generation
+//! below marks the next frame; with neither, the frame on show stays.
+//! The rest of what a frame reads is shared the same way:
 //!
 //! - the lookup RAM, the display modes, the cursor and the scan-out
 //!   geometry (`SharedRegs`), one atomic word an entry, with a generation
@@ -203,6 +205,11 @@ impl SharedRegs {
         self.gen.fetch_add(1, Release);
     }
 
+    /// Scan-out entry 0x2800 + index (frame::pbj).
+    pub fn pbj(&self, index: usize) -> u32 {
+        self.pbj[index].load(Relaxed)
+    }
+
     pub fn set_pbj(&self, index: usize, value: u32) {
         self.pbj[index].store(value, Relaxed);
         self.gen.fetch_add(1, Release);
@@ -338,6 +345,16 @@ pub(super) struct DisplayShared {
     mode: ModeCell,
     /// The board's memory, set when the board allocates it.
     pub vram: OnceLock<VramPtr>,
+    /// The scan-out on the GPU, set with the GPU raster unit: the display
+    /// composes there from the memory the unit draws into, instead of
+    /// from the mirror.
+    pub gpu_scanout: OnceLock<Mutex<super::gpu_unit::GpuScanout>>,
+    /// The command stream position (`CommandFifo::retired`) the raster
+    /// unit's submitted work covers: a flip armed after it waits
+    /// (`HostInterface::retrace`). The GPU unit publishes it
+    /// (`GpuRaster::tick`); the CPU unit leaves it at the maximum, so flips
+    /// latch at once as before.
+    pub covered: Arc<AtomicU64>,
     pub front: Arc<Mutex<HostInterface>>,
     /// Swaps latched at a retrace.
     pub swaps: AtomicU64,
@@ -349,6 +366,8 @@ impl DisplayShared {
             regs: SharedRegs::default(),
             mode: ModeCell::new(),
             vram: OnceLock::new(),
+            gpu_scanout: OnceLock::new(),
+            covered: Arc::new(AtomicU64::new(u64::MAX)),
             front,
             swaps: AtomicU64::new(0),
         }
@@ -375,7 +394,7 @@ impl DisplayShared {
     /// A vertical retrace: the host interface latches the swaps armed and
     /// raises the retrace source (HostInterface::retrace()).
     pub fn retrace(&self) {
-        if self.front.lock().retrace() {
+        if self.front.lock().retrace(self.covered.load(Ordering::Acquire)) {
             self.swaps.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -398,6 +417,15 @@ pub(super) struct ScanoutReader {
     /// The registers of the frame in progress.
     snap: DisplayRegs,
     snap_gen: u64,
+    /// What `frame` was composed from: the mode, the registers and the
+    /// displayed-buffer bits. None before the first.
+    composed: Option<(u64, u64, u32)>,
+    /// The last frame was composed for a store to board memory. The store's
+    /// mark is not ordered against its data, so the frame may have missed
+    /// the data; one more is composed to catch it.
+    settling: bool,
+    /// The GPU scan-out failed once (reported), and the CPU composes.
+    gpu_failed: bool,
 }
 
 impl ScanoutReader {
@@ -410,6 +438,8 @@ impl ScanoutReader {
         self.mode_gen = 0;
         self.restart_gen = 0;
         self.snap_gen = u64::MAX;
+        self.composed = None;
+        self.settling = false;
         self.frame = Vec::new();
         self.frame_width = 0;
         self.frame_height = 0;
@@ -457,11 +487,54 @@ impl ScanoutReader {
         }
     }
 
-    /// Compose the whole frame from board memory as the scan-out registers
-    /// describe it (frame.rs); black while they describe none. False with
-    /// no scanout mode, when there is no frame.
+    /// As `update`, on the GPU scan-out with no readback: the frame stays
+    /// in the scan-out's buffer, returned with its size, for a renderer on
+    /// the same device. None when there is no GPU scan-out, no frame, or it
+    /// fails (the caller then takes the `update` path).
+    #[cfg(feature = "wgpu")]
+    pub fn update_on_gpu(&mut self) -> Option<(wgpu::Buffer, u32, u32)> {
+        let shared = self.shared();
+        let scanout = shared.gpu_scanout.get()?;
+        if self.gpu_failed {
+            return None;
+        }
+        self.sync(&shared);
+        if self.frame.is_empty() {
+            return None;
+        }
+        let displayed = shared.front.lock().displayed_buffer;
+        self.snap_gen = shared.regs.snapshot(&mut self.snap, self.snap_gen);
+        let frame = Frame::snapshot(&self.snap, displayed)?;
+        let (w, h) = (frame.width.min(self.frame_width), frame.height.min(self.frame_height));
+        let composed = scanout.lock().compose(&frame, &self.snap, w, h);
+        match composed {
+            Ok(buffer) => Some((buffer, w, h)),
+            Err(e) => {
+                self.gpu_failed = true;
+                crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu scanout: {e}; composing on the CPU");
+                None
+            }
+        }
+    }
+
+    /// Compose the frame again if anything the scan-out reads has changed
+    /// since the last one: a store to board memory, a register (lookup RAM,
+    /// display modes, cursor, scan-out geometry), the mode, or the
+    /// displayed-buffer bits. It is composed from board memory as the
+    /// scan-out registers describe it (frame.rs); black while they describe
+    /// none. False when `frame` is as it was, or there is no scanout mode
+    /// and so no frame.
+    ///
+    /// A frame composed for a store is followed by one more, since a store's
+    /// mark can be seen before its data.
+    ///
+    /// The scan-out on the GPU draws into memory with no store the CPU
+    /// sees, so there every frame is composed.
     pub fn update(&mut self) -> bool {
         let shared = self.shared();
+        // Taken before anything is read: a store that lands from here on
+        // marks the next frame.
+        let stored = shared.vram.get().is_none_or(|mem| mem.take_written());
 
         self.sync(&shared);
         if self.frame.is_empty() {
@@ -469,12 +542,40 @@ impl ScanoutReader {
         }
         let displayed = shared.front.lock().displayed_buffer;
         self.snap_gen = shared.regs.snapshot(&mut self.snap, self.snap_gen);
+        let now = Some((self.mode_gen, self.snap_gen, displayed));
+        if !stored && !self.settling && self.composed == now && shared.gpu_scanout.get().is_none() {
+            return false;
+        }
+        self.composed = now;
+        self.settling = stored;
         let (Some(frame), Some(mem)) = (Frame::snapshot(&self.snap, displayed), shared.vram.get()) else {
             // No scan-out programmed (out of reset, before the PROM sets
             // it up): nothing is shown.
             self.frame.fill(0);
             return true;
         };
+        if let Some(scanout) = shared.gpu_scanout.get() {
+            let (w, h) = (frame.width.min(self.frame_width), frame.height.min(self.frame_height));
+            let stride = self.frame_width as usize;
+            // The kernel writes rows of w; a narrower frame is spread over
+            // the presented rows after.
+            match scanout.lock().run(&frame, &self.snap, w, h, &mut self.frame) {
+                Ok(()) => {
+                    if w as usize != stride {
+                        for y in (1..h as usize).rev() {
+                            self.frame.copy_within(y * w as usize..(y + 1) * w as usize, y * stride);
+                        }
+                    }
+                    return true;
+                }
+                Err(e) => {
+                    if !self.gpu_failed {
+                        self.gpu_failed = true;
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu scanout: {e}; composing on the CPU");
+                    }
+                }
+            }
+        }
         // The memory lives as long as the board; the display reads it while
         // the board's units write it, as the scan-out does.
         frame.compose(*mem, &self.snap, &mut self.frame, self.frame_width as usize, self.frame_height as usize);

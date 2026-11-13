@@ -1,5 +1,9 @@
 # Empty O2/Octane PROM paths select embedded bytes directly
 
+Status: superseded by the shared `dev::prom_image` loader in the 2026-11-13
+upstream integration. Empty `prom` remains an embedded-firmware alias;
+explicit unreadable overrides remain errors. Arrays are now packed PROMs.
+
 The Prismatic fork embeds O2 4.18 (`prombinip32`) and Octane 4.9
 (`prombinip30`). Both arrays are byte-identical to the user-supplied files;
 their source filenames, sizes and SHA-1 hashes are in the generated headers.

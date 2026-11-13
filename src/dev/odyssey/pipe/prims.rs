@@ -107,21 +107,23 @@ pub(crate) fn dimension(requested: f32) -> Option<u32> {
     Some(n.max(1.0) as u32)
 }
 
-/// Whether pixel (px, py) is on the segment a to b under the centre-sampled
-/// rule. Exact on the snapped grid: with the minor coordinate at the centre
-/// v = n + t / den, the pixel is ceil(v / 2^sub) - 1. Coordinate differences
-/// are at most 2^29, so t fits, and the minor base shifted by the width
-/// stays below 2^43.
-fn centre_covers(a: &RasterVertex, b: &RasterVertex, px: i64, py: i64) -> bool {
+/// The minor-axis pixel the segment a to b covers in major-axis pixel
+/// `major` under the centre-sampled rule, or None when the pixel centre is
+/// outside the segment's span; an aliased segment covers no other pixel
+/// there. Exact on the snapped grid: with the minor coordinate at the
+/// centre v = n + t / den, the pixel is ceil(v / 2^sub) - 1. Coordinate
+/// differences are at most 2^29, so t fits, and the minor base shifted by
+/// the width stays below 2^43.
+fn centre_minor(a: &RasterVertex, b: &RasterVertex, major: i64) -> Option<i64> {
     let one = SUB;
     let half = one >> 1;
     let x_major = b.x.wrapping_sub(a.x).wrapping_abs() >= b.y.wrapping_sub(a.y).wrapping_abs();
     let (la, lb, na, nb) = if x_major { (a.x, b.x, a.y, b.y) } else { (a.y, b.y, a.x, b.x) };
-    let c = (if x_major { px } else { py }).wrapping_mul(one).wrapping_add(half);
+    let c = major.wrapping_mul(one).wrapping_add(half);
     let mut den = lb.wrapping_sub(la);
 
     if if den > 0 { c < la || c >= lb } else { c > la || c <= lb } {
-        return false;
+        return None;
     }
     let mut t = nb.wrapping_sub(na).wrapping_mul(c.wrapping_sub(la));
     if den < 0 {
@@ -130,8 +132,7 @@ fn centre_covers(a: &RasterVertex, b: &RasterVertex, px: i64, py: i64) -> bool {
     }
     // v = na + floor(t / den) plus a fraction that is zero or not.
     let v = na.wrapping_add(t.div_euclid(den));
-    let minor = if t % den != 0 { v.div_euclid(one) } else { v.wrapping_neg().div_euclid(one).wrapping_neg().wrapping_sub(1) };
-    (if x_major { py } else { px }) == minor
+    Some(if t % den != 0 { v.div_euclid(one) } else { v.wrapping_neg().div_euclid(one).wrapping_neg().wrapping_sub(1) })
 }
 
 #[derive(Clone, Copy, Default)]
@@ -173,47 +174,7 @@ fn clip_edge(in_: &[Point2], n: usize, out: &mut [Point2], axis: u32, bound: f64
     count
 }
 
-/// The area of pixel square (x, y) a convex polygon covers.
-fn square_area(polygon: &[Point2], n: usize, x: i32, y: i32) -> f64 {
-    let mut a = [Point2::default(); 12];
-    let mut b = [Point2::default(); 12];
-    let mut area = 0.0f64;
-    let mut n = n;
 
-    a[..n].copy_from_slice(&polygon[..n]);
-    n = clip_edge(&a, n, &mut b, 0, x as f64, true);
-    n = clip_edge(&b, n, &mut a, 0, (x + 1) as f64, false);
-    n = clip_edge(&a, n, &mut b, 1, y as f64, true);
-    n = clip_edge(&b, n, &mut a, 1, (y + 1) as f64, false);
-    for i in 0..n {
-        let p = &a[i];
-        let q = &a[(i + 1) % n];
-
-        area += p.x * q.y - p.y * q.x;
-    }
-    (area.abs() * 0.5).min(1.0)
-}
-
-/// The coverage of pixel (x, y) by a smoothed line from a to b of width
-/// `width`, in pixels: the rectangle about it.
-fn line_coverage(ax: f64, ay: f64, bx: f64, by: f64, width: f64, x: i32, y: i32) -> f64 {
-    let dx = bx - ax;
-    let dy = by - ay;
-    let length = dx.hypot(dy);
-
-    if !(length > 0.0) || !(width > 0.0) {
-        return 0.0;
-    }
-    let nx = -dy * width / (2.0 * length);
-    let ny = dx * width / (2.0 * length);
-    let rectangle = [
-        Point2 { x: ax + nx, y: ay + ny },
-        Point2 { x: bx + nx, y: by + ny },
-        Point2 { x: bx - nx, y: by - ny },
-        Point2 { x: ax - nx, y: ay - ny },
-    ];
-    square_area(&rectangle, 4, x, y)
-}
 
 fn circle_integral(x: f64, radius: f64) -> f64 {
     let y = (radius * radius - x * x).max(0.0).sqrt();
@@ -451,6 +412,10 @@ impl Draw<'_> {
     #[allow(clippy::too_many_arguments, reason = "a segment and how it is drawn")]
     fn line_projected(&self, a: &RasterVertex, b: &RasterVertex, provoking: &[f32], steps: i64, width: u32, stipple: Option<&mut LineStipple>, user_clip: bool) {
         let mut stipple = stipple;
+        // A segment with both ends inside every enabled user plane has
+        // every fragment inside (Transform::user_side()). One outside a
+        // plane still walks, for its stipple count.
+        let user_clip = user_clip && self.xf.user_side(&[a.clip, b.clip]) != super::setup::PlaneSide::Inside;
         let smooth = !self.pipe.raster.flat;
         let line_smooth = self.pipe.prims.line_smooth;
         let smooth_width = self.pipe.prims.line_width as f64;
@@ -532,9 +497,79 @@ impl Draw<'_> {
             major0 = major0.max(if x_major { bx0 } else { by0 });
             major1 = major1.min(if x_major { bx1 } else { by1 });
         }
-        let (lo, hi) = if major(&a) <= major(&b) { (&sa, &sb) } else { (&sb, &sa) };
-        let (l0, l1) = (major(lo) as f64, major(hi) as f64);
-        let (n0, n1) = (minor(lo) as f64, minor(hi) as f64);
+        // An aliased segment's pixels are shaded as the triangle (a, b, a)
+        // at barycentrics (t, 0), t the pixel centre's place along the
+        // major axis: (c - a) / (b - a), formed as a triangle's
+        // barycentrics are (an integer times a reciprocal, in single).
+        let aliased = (!line_smooth).then(|| (self.line_tri(&a, &b, provoking), (1.0 / (major(&b) - major(&a)) as f64) as f32));
+        // An aliased segment with no stipple pattern goes whole to the GPU
+        // unit, whose kernels walk and shade it as they do a triangle when
+        // they cover the draw's state (no fog, no user planes, its texture
+        // on the unit), or else to the ring's tiles, whose workers walk it
+        // (line_pixels()). A disabled stipple's count stays here.
+        if let (Some((lt, inv)), true, true) = (&aliased, stipple.as_ref().is_none_or(|s| !s.enabled), visible) {
+            let p = self.pipe;
+            let rst = &p.raster;
+            let tex = p.gpu_tex.as_deref().filter(|_| self.textured);
+            let gpu = self.pipe.gpu_unit().filter(|_| !p.shader.fog && (!user_clip || self.xf.user_planes() == 0) && (tex.is_some() || !self.textured) && rst.depth32);
+            let ring = match (self.live, p.ring.as_ref().filter(|_| p.shade)) {
+                (Some(live), Some(ring)) if gpu.is_none() && p.gpu.is_null() => Some((live, ring)),
+                _ => None,
+            };
+            if gpu.is_some() || ring.is_some() {
+                let (m0, m1) = if x_major { (bx0, bx1) } else { (by0, by1) };
+                let (n0, n1) = if x_major { (by0, by1) } else { (bx0, bx1) };
+                let lo = (minor(&sa).min(minor(&sb)) >> SUBPIXEL_SHIFT) as i32 - 1;
+                let hi = (minor(&sa).max(minor(&sb)) >> SUBPIXEL_SHIFT) as i32 + width as i32 + 1;
+                let words = super::super::gpu_unit::LineWords {
+                    x_major,
+                    la: major(&a) as i32,
+                    na: minor(&sa) as i32,
+                    du: (major(&b) - major(&a)) as i32,
+                    dn: (minor(&sb) - minor(&sa)) as i32,
+                    major: (major0.min(major1).max(m0), major0.max(major1).min(m1)),
+                    minor: (n0, n1),
+                    width: width as i32,
+                    inv: *inv,
+                };
+                // The pixels the walk can reach, within the scissor, in
+                // plane pixels.
+                let (mut x0, mut y0, mut x1, mut y1) = if x_major {
+                    (words.major.0, lo.max(n0), words.major.1, hi.min(n1))
+                } else {
+                    (lo.max(n0), words.major.0, hi.min(n1), words.major.1)
+                };
+                if let Some((sx0, sy0, sx1, sy1)) = rst.scissor {
+                    (x0, y0, x1, y1) = (x0.max(sx0), y0.max(sy0), x1.min(sx1), y1.min(sy1));
+                }
+                if x0 <= x1 && y0 <= y1 {
+                    let (px0, py0, px1, py1) = (rst.ox.wrapping_add(x0), rst.oy.wrapping_add(y0), rst.ox.wrapping_add(x1), rst.oy.wrapping_add(y1));
+                    if let Some(g) = gpu {
+                        g.push_line(lt, &words, rst.ox, rst.oy, (px0, py0, px1, py1), steps, rst.depth_range, rst.depth_slack, p.gpu_words.0, p.gpu_words.1, p.gpu_slot.as_ref().expect("a slot with the unit"), tex, p.shader.specular);
+                    } else if let Some((live, ring)) = ring {
+                        live.capture(self);
+                        let lp = live.push_line(super::setup::LiveLine { tri: *lt, words, steps, user_clip });
+                        live.used.set(true);
+                        p.used.set(true);
+                        ring.push_line(lp, px0, py0, px1, py1);
+                    }
+                }
+                // A disabled stipple counts every covered column, as the
+                // walk's step() would.
+                if let Some(s) = stipple {
+                    let covered = (major0.min(major1)..=major0.max(major1)).filter(|&m| centre_minor(&sa, &sb, m as i64).is_some()).count() as u32;
+                    if covered != 0 {
+                        let period = 16u32.wrapping_mul(s.repeat);
+                        s.counter = ((s.counter as u64 + covered as u64) % period as u64) as u32;
+                        s.consumed = true;
+                    }
+                }
+                return;
+            }
+        }
+        // A smoothed segment's columns are an aliased one's; its slope
+        // picks the coverage profile (line_aa).
+        let slope = if major(&b) != major(&a) { ((minor(&b) - minor(&a)) as f64 / (major(&b) - major(&a)) as f64).abs() } else { 0.0 };
         let mut mm = major0;
         loop {
             if !(if step > 0 { mm <= major1 } else { mm >= major1 }) {
@@ -542,33 +577,39 @@ impl Draw<'_> {
             }
             let m = mm;
             mm += step;
-            let mut e0 = (m as f64 * one).max(l0);
-            let mut e1 = ((m + 1) as f64 * one).min(l1);
-            let (f0, f1) = if l1 > l0 {
-                e0 = e0.min(l1);
-                e1 = e1.max(l0);
-                (n0 + (n1 - n0) * (e0 - l0) / (l1 - l0), n0 + (n1 - n0) * (e1 - l0) / (l1 - l0))
+            // A smoothed segment covers the pixels of a column whose centre
+            // is on it (as an aliased one does) that are near enough the
+            // line there, the minor coordinate at the column centre `v`;
+            // an aliased one covers one minor pixel here at most, the one
+            // centre_minor() gives, which is exact integer arithmetic on
+            // the snapped grid.
+            let mut v = 0.0f64;
+            let (minor0, minor1) = if line_smooth {
+                let c = m as i64 * SUB + SUB / 2;
+                let (la, lb) = (major(&a), major(&b));
+                if !(if lb > la { c >= la && c < lb } else { c > lb && c <= la }) {
+                    (1, 0)
+                } else {
+                    v = minor(&a) as f64 + (minor(&b) - minor(&a)) as f64 * (c - la) as f64 / (lb - la) as f64;
+                    let reach = super::line_aa::reach(smooth_width);
+                    ((v / one - reach).floor() as i64 - 1, (v / one + reach).ceil() as i64 + 1)
+                }
             } else {
-                (n0, n1)
+                match centre_minor(&sa, &sb, m as i64) {
+                    Some(n) => (n, n),
+                    None => (1, 0),
+                }
             };
-            let mut minor0 = (f0.min(f1) / one).floor() as i64 - 1;
-            let mut minor1 = (f0.max(f1) / one).floor() as i64 + 1;
-            if line_smooth {
-                let (q0, q1) = (minor(&a) as f64, minor(&b) as f64);
-
-                minor0 = (q0.min(q1) / one - pad).floor() as i64 - 1;
-                minor1 = (q0.max(q1) / one + pad).ceil() as i64 + 1;
-            }
             for n in minor0..=minor1 {
                 let (base_x, base_y) = if x_major { (m as i64, n) } else { (n, m as i64) };
                 let replica0 = n.max((if x_major { by0 } else { bx0 }) as i64);
                 let replica1 = if line_smooth { replica0 } else { (n + width as i64 - 1).min((if x_major { by1 } else { bx1 }) as i64) };
                 let coverage = if line_smooth {
-                    line_coverage(a.x as f64 / one, a.y as f64 / one, b.x as f64 / one, b.y as f64 / one, smooth_width, base_x as i32, base_y as i32)
-                } else if centre_covers(&sa, &sb, base_x, base_y) {
-                    1.0
+                    // The distance in 64ths of a pixel (subpixels are 256ths).
+                    super::line_aa::coverage(smooth_width, slope, ((n * SUB + SUB / 2) as f64 - v) / 4.0)
                 } else {
-                    0.0
+                    // The one pixel centre_minor() found.
+                    1.0
                 };
 
                 if !(coverage > 0.0) {
@@ -581,6 +622,23 @@ impl Draw<'_> {
                 // Visit only the replicas the window can show.
                 for rep in replica0..=replica1 {
                     let (px, py) = if x_major { (m, rep as i32) } else { (rep as i32, m) };
+                    if let Some((lt, inv)) = &aliased {
+                        let num = m as i64 * SUB + SUB / 2 - major(&a);
+                        let t = (num as f32 * inv).clamp(0.0, 1.0);
+                        // The parameter one pixel on along the major axis,
+                        // for the texture's level of detail.
+                        let on = (num + SUB) as f32 * inv;
+                        if user_clip && self.xf.user_planes() != 0 {
+                            let (wa, wb) = ((1.0 - t as f64) * a.inv_w, t as f64 * b.inv_w);
+                            let d: [f64; CLIP_PLANES as usize] = std::array::from_fn(|i| (wa * a.clip[i] + wb * b.clip[i]) / (wa + wb));
+                            if self.xf.user_clipped(&d) {
+                                continue;
+                            }
+                        }
+                        let lanes = if x_major { [t, on, t, on] } else { [t, t, on, on] };
+                        self.line_pixel(lt, px, py, lanes, steps);
+                        continue;
+                    }
                     let cx = (px as f64 + 0.5) * one;
                     let cy = (py as f64 + 0.5) * one;
                     // Approximation: the ends' values, not extrapolated.
@@ -608,6 +666,45 @@ impl Draw<'_> {
                         if x_major { frag.dx = step } else { frag.dy = step }
                     }
                     self.fragment(px, py, a.z + t * (b.z - a.z), (1.0 - t) * a.depth_w + t * b.depth_w, steps, &frag, coverage);
+                }
+            }
+        }
+    }
+
+    /// The pixels of aliased line l within window rectangle `within`
+    /// (inclusive), shaded and handed to `store`: the walk of
+    /// line_projected() for one of the ring's tiles.
+    pub(crate) fn line_pixels(&self, l: &super::setup::LiveLine, within: (i32, i32, i32, i32), mut store: impl FnMut(super::ring::BackQuad)) {
+        let w = &l.words;
+        let t = &l.tri;
+        let (major_lo, major_hi, minor_lo, minor_hi) = if w.x_major { (within.0, within.2, within.1, within.3) } else { (within.1, within.3, within.0, within.2) };
+        let at = |major: i64, minor: i64| {
+            let (x, y) = if w.x_major { (major, minor) } else { (minor, major) };
+            RasterVertex { x, y, ..RasterVertex::default() }
+        };
+        let sa = at(w.la as i64, w.na as i64);
+        let sb = at(w.la as i64 + w.du as i64, w.na as i64 + w.dn as i64);
+        for m in w.major.0.max(major_lo)..=w.major.1.min(major_hi) {
+            let Some(n) = centre_minor(&sa, &sb, m as i64) else {
+                continue;
+            };
+            let num = m as i64 * SUB + SUB / 2 - w.la as i64;
+            let tt = (num as f32 * w.inv).clamp(0.0, 1.0);
+            let on = (num + SUB) as f32 * w.inv;
+            if l.user_clip && self.xf.user_planes() != 0 {
+                let (wa, wb) = ((1.0 - tt as f64) * t.inv_w[0], tt as f64 * t.inv_w[1]);
+                let d: [f64; CLIP_PLANES as usize] = std::array::from_fn(|i| (wa * t.clip[0][i] + wb * t.clip[1][i]) / (wa + wb));
+                if self.xf.user_clipped(&d) {
+                    continue;
+                }
+            }
+            let lanes = if w.x_major { [tt, on, tt, on] } else { [tt, tt, on, on] };
+            let r0 = (n as i32).max(w.minor.0).max(minor_lo);
+            let r1 = (n as i32 + w.width - 1).min(w.minor.1).min(minor_hi);
+            for r in r0..=r1 {
+                let (px, py) = if w.x_major { (m, r) } else { (r, m) };
+                if let Some(q) = self.line_pixel_quad(t, px, py, lanes, l.steps) {
+                    store(q);
                 }
             }
         }

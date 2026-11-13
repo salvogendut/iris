@@ -11,7 +11,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::config::{
-        Cli, CpuModel, GraphicsBoard, MachineConfig, MachineProfile,
+        Cli, GraphicsBoard, MachineConfig, MachineProfile,
     };
     use crate::dev::eeprom_93c56::Eeprom93c56;
     use crate::dev::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
@@ -42,11 +42,6 @@ mod tests {
     fn virtio_cfg(profile: MachineProfile) -> MachineConfig {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = profile;
-        cfg.machine.cpu = match profile {
-            MachineProfile::OctaneIp30 => CpuModel::R10000,
-            MachineProfile::O2Ip32 => CpuModel::R5000,
-            _ => CpuModel::R4400,
-        };
         cfg.virtio_serial.enabled = true;
         cfg
     }

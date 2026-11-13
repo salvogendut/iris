@@ -32,6 +32,7 @@ What you can inspect depends on how iris was built:
 | `lightning` (official releases) | Strips breakpoint checks and the traceback buffer for speed: breakpoints and `dt` do nothing. Inspection commands still work. |
 | `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`debug`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
 | `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras/vpro trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. `vpro rec` needs no feature. |
+| `--features rex-gpu` | Experimental REX3 wgpu/WGSL recording replay; implies `gputrace` and `rex-dirty-upload`, remains replay-only, and does not replace the live CPU renderer. |
 | `--features jitv2` | The `j2` commands. `jitv2_lockstep` checks every JIT instruction against the interpreter. |
 | `--features perfetto` | Perfetto timeline traces ([docs/perfetto.md](docs/perfetto.md)). |
 
@@ -43,8 +44,8 @@ I$: L1I hit rate, UC: uncached fetches, cs: step count).
 ## The monitor console
 
 The monitor listens on **127.0.0.1:8888** (`monitor_port` in the config or
-`--monitor-port`; give each iris running at once its own port). It is also
-available on the terminal iris was started from.
+`--monitor-port`; give each iris running at once its own port). Without `--ci`
+it is also available on the terminal iris was started from.
 
 ```sh
 nc localhost 8888            # or: telnet 127.0.0.1 8888
@@ -308,8 +309,9 @@ take effect after `j2 flush`.
 | `j2 min-instrs [N]` / `j2 max-instrs [N]` | Minimum / maximum instructions walked per compile | `0` / `1024` |
 | `j2 min-calls [N]` | Legacy setting; stored and reported but not used by whole-page dispatch | `0` |
 | `j2 intrun [N]` | Instructions sharing one pending-interrupt check; 1 = every instruction (forced under lockstep) | `1` |
+| `j2 gprcache [N]` | Guest registers a compiled function with a loop keeps in host registers (the N its loops use most); 0 = none (forced under lockstep). New compiles only: `stop`, `j2 flush`, `start` to rebuild existing code | `6` (`10` on AArch64) |
 | `j2 fallback [on\|off]` | Keep an unsupported instruction inside a region as an interpreter call instead of ending the region | `off` |
-| `j2 entrypre [on\|off]` | Check for interrupts at an externally dispatched entry word too | `off` |
+| `j2 entrypre [on\|off]` | Check for interrupts at an externally dispatched entry word (off: not until the next instruction head, which a retried bus access never reaches); takes effect after `j2 flush` | `on` |
 | `j2 inline_mem [on\|off]` | Inline L1D loads and stores (forced off under lockstep) | `on` |
 | `j2 memhelpers [on\|off]` | Call shared memory-helper functions instead of inlining the cache probe | — |
 | `j2 pagewb [on\|off]` | Write back dirty L1D/L2 lines covering a code page when a fetch crosses onto it (diagnostic) | `off` |
@@ -330,7 +332,7 @@ instructions interpreter-only and through real JIT dispatch, steps past the
 first `skip` divergences and stops at the next one.
 
 Verification tools, cheapest first: the `jitv2/equiv_test.rs` unit tests, the
-cpu-tests matrix (`cpu-tests/run/matrix.sh`), `jitcheck`,
+cpu-tests on both CPUs (`cargo test --release --features jitv2 --test cpu_tests -- --ignored`), `jitcheck`,
 `--features jitv2_lockstep` (every instruction checked against the
 interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 `--features fetchverify` (stale code both engines would agree on).
@@ -351,6 +353,7 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 | `scsi wdt [N]` / `scsi wdt file <path>` | WD33C93A transaction ring: last `N` / all to a file **[DEV]** |
 | `scsi debug <on\|off>` | Per-command trace **[DEV]** |
 | `scsi0 ...` / `scsi1 ...` | The same, for controller 0 / controller 1 (Indigo2 and O2) |
+| `scsi2 ...` / `cow2 ...` | The same, for the Fibre Channel adapter's loop (its disks are by loop ID); `scsi2 notes` lists what the driver did that the model does not decode |
 | `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays (`cow1 ...` on the O2's second controller) |
 
 On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
@@ -369,6 +372,13 @@ shows the command total and anything odd the driver did; `regs`, `wdt`,
 widget's link, refused Crossbow accesses, and accesses to physical addresses
 nothing is mapped at, with the PC; a device's own refusal is not listed). The
 `phys` commands work on the Octane as well.
+
+On the Fuel the one controller is a two-channel ISP12160: `scsi` (or
+`scsi0`) and `cow` act on channel 0, `scsi1` and `cow1` on channel 1, and
+ids run 0 to 15 on each (`[scsi.17]` is id 1 on channel 1). `scsi notes`
+shows the whole chip's command total and anything odd the driver did, and
+has no `scsi1` form; `regs`, `wdt`, `defer`, `debug` and `dayna` are not
+there.
 
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
 change reaches IRIX as a Unit Attention ("medium changed") on its next
@@ -389,7 +399,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
 | `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |
-| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); replay with `REX3_REPLAY=<file> cargo test --release rex3_replay_file` |
+| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `rex debug <on\|off>` | REX3 register trace **[DEV]** |
@@ -402,6 +412,12 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
 | `block debug <on\|off>` | Block/span draw logging to `block.log` **[DEV]** |
 | `draw debug <on\|off>` | Draw a debug overlay on the framebuffer **[DEV]** |
+
+GPU replay also accepts `REX3_GPU_BACKEND=auto|vulkan|metal|dx12`. It prints
+the selected adapter and coverage/transfer counters, synchronizes before every
+CPU fallback, and rejects a run that submits no draw on the GPU. The current
+subset and standalone hardware-probe command are documented in
+[FEATURES.md](FEATURES.md).
 
 Build with `--features rex-dirty-upload` to make Newport framebuffer snapshot
 copies and GL source-texture uploads use conservative 64x32 RGB/auxiliary
@@ -447,7 +463,7 @@ upload, composition, and readback slices and byte/tile/rectangle counters; see
 | `mgras cmap [start] [n] [0\|1]` | Colormap entries |
 | `mgras dac` | DAC registers and gamma |
 | `mgras pix <x> <y>` | One pixel through the compositor (y = 0 is the top) |
-| `mgras stats` | Command, primitive and DMA counters |
+| `mgras stats` | Command, primitive and DMA counters; with the GPU raster unit (`raster = "wgpu"`), its records, batches, uploads and readbacks, and the scan-out's frames presented on the GPU and read back |
 | `mgras jit` | Raster JIT (`gr4-jit`) state |
 | `mgras fbdump [dir]` | Planes and the screen as PNG and raw files |
 | `mgras shot <file.png>` / `mgras dump <file>` | Screenshot / the board state image that replay checkpoints hash (waits for the board to go idle) |
@@ -485,12 +501,27 @@ guest. `y = 0` is the top display line throughout.
 | `vpro fbdump [dir]` | The composed screen as `screen.png`, all of board memory as `board.bin` (offset = address x 16), and `layout.txt` with the pixel mode, the scan-out registers and the display modes (default `vprodump/`) |
 | `vpro hash` | The hash of board memory a replay checkpoint takes (`golden/replay.rs`), to compare a live board with a recording |
 | `vpro unimp` | Offsets and command words the board reported as not modelled |
-| `vpro refusals [reset]` | Bus accesses answered busy, by reason, offset and width |
+| `vpro refusals [reset]` | Bus accesses answered busy, by reason, offset and width, with the longest time one access was kept retrying |
+| `vpro gpu [trace on\|off]` | With `[graphics] raster = "wgpu"`: the GPU raster unit's counters (records and batches, how the batches were submitted, bytes uploaded and read back, waits, readbacks and copies the copy kernel took) and the GPU scan-out's (frames composed, bytes read back; with `renderer = "wgpu"` frames are presented from the GPU and only screenshots, frame requests and VNC read them back); `trace on` counts readbacks by the board function that caused them from then on, shown under the counters. The same lines appear in `vpro status`. On the GPU unit the commands that read board memory (`pix`, `raw`, `peek`, `shot`, `fbdump`, `hash`, `mem` and the state commands) first read the unit's memory back into the board's copy, when the board can be quiesced |
 | `vpro trace <file> [fifo,draw,cpu,dma\|all]` / `vpro trace flush\|off` / `vpro trace` | Annotated trace (`gputrace` builds; also `IRIS_ODSY_TRACE=<file>` from power-on): `FIFO` lines are command words as the parser completes them, named, with their operands as words and as floats where the word carries floats, plus copy rects, pattern and matrix loads, image boxes and bursts, queries and unknown words; `DRAW` lines each assembled primitive sent to the raster unit (`draw TRIANGLES n=3 ctx=1 textured depth queued cost 96`) and each clear; `CPU` lines every bus access that is not a command store, repeats collapsed; `DMA` lines the page-table descriptors. `flush` writes the buffer out (it is written at most twice a second otherwise); alone, the trace's state |
 | `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; also `IRIS_ODSY_REC=<file>` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
 
+**InfiniteReality (KONA)**
+
+| Command | Description |
+|---|---|
+| `kona status` | The pipe the back end draws for: raster managers, texture memory per manager, board set, managed area, the most words a pixel's record may take, whether the display handle is attached, the pixel store's allocated word arrays, buffer configurations laid out and refused by reason, and the last layout, the textport's colour, raster position and draw count, the X state of the context the last job ran under (graphics context, position, clip list, scissor, stipple, fills drawn and refused) with how many contexts have loaded any, the X pixel commands taken (setups, writes by data run and by DMA, copies, reads, finishes) with what was refused and why (context or setup not understood, target with no store, destination too wide, window copies, reads answered with zeros, frame-buffer word reads, rows that arrived short or with no write waiting, read brackets refused or left with no completion), the kernel's memory-region commands counted with the bytes the swaps name, the raster stage (triangles set up, with no area or off the target, clears, workers and tile size), the GL path (commands taken, vertices and primitives, draws handed over, clipped, culled and cut by the window, and the tokens and enable caps it did not take), the display tables (display-ID entries and how many the model does not read, mode words, whether gamma is loaded, the cursor's mode and address, entries dropped), and the fill rule |
+| `kona pix <x> <y>` | The words of one pixel's record that have an array in the pixel store, as the planes hold them. Reads the store without waiting for the command stream, so it can show a pixel mid-draw |
+| `kona shot <file.png>` | The frame the display would compose from the store and the display tables now (the textport colour map for a window with no table entry; the X colour map, gamma and cursor otherwise), written as a PNG |
+| `kona hash` | The hash of the pixel store, to compare a live board with a replay. Like `pix` and `shot` it does not wait for the command stream: a hash taken from a running board can be taken mid-draw. `status` and `counters` read the back end's state and wait for it at most half a second, then answer `kona: board busy` |
+| `kona gl [census\|clear]` | What the GL path counted: commands, begins by mode, vertices and primitives, the texture-coordinate forms, clipping, culling and window cuts, what was handed over, and the tokens and enable caps not taken. `census` makes every vertex also be measured against the window (an extra divide each), counted as inside, outside the window, outside the volume or behind the eye; `clear` zeroes the counts |
+| `kona counters` | Jobs the back end has taken, by kind, with the words the command framers dropped |
+
 `iris-ci screenshot` captures the composed screen from any board, also
-headless.
+headless. `iris-ci screen-wait GOLDEN.png` takes screenshots until one
+matches a PNG and, on a timeout, leaves the last one and a diff image behind.
+The `screenshot` reply carries `"fresh": false` when the display had not
+composed a new frame in time, so the PNG shows the previous one.
 
 **Screen, pointer and keyboard (any board)**
 
@@ -541,8 +572,9 @@ to learn the cursor's hotspot exactly.
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `hal2 status` | HAL2 audio state |
+| `ice1724 status` | The Tezro's ICE1724 audio controller (`[tezro] audio`): frames each engine moved, converter writes, accesses nothing establishes |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
-| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot) |
+| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000 these, `ps2 key` and `ps2 mouse` go to the I-brick's USB keyboard and mouse, and `ps2 status` still shows the unused PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
 | `ps2 mouse <dx> <dy> [buttons]` | Relative mouse motion with an optional button mask (1 left, 2 right, 4 middle) |
 | `serial status` | SCC channel A/B registers and FIFOs |
@@ -569,7 +601,7 @@ a forced termination; a normal stop saves them automatically.
 |---|---|
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
-| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane) |
+| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane, Fuel) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses |
 | `phys error <on\|off>` | Stop on bus errors |
 | `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
@@ -588,9 +620,24 @@ Per-module logging; all of it needs a developer build to produce output.
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
-xmap bt445 scc ps2 rtc eeprom l1i l1d l2c`. Mask categories: `pdma` —
+xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock hub module pci bridge heart nvme l1 usb ice1724`. `hub`
+logs the SN0 Hub's unsupported register accesses and accesses to unfitted
+node memory. `module` logs the module controller's refused commands and
+protocol surprises (the Origin 200's ELSC and the Origin 2000 module's
+controller, with their NVRAM and I2C controller). `pci` logs every
+configuration cycle on a PCI bus (MACE's, the Octane Bridge's) and
+whether a function answered it. `bridge` logs the Octane Bridge's
+register and translation-table accesses by name, and any transfer a PCI
+function started that reached no memory, and each interrupt pin's edges
+and the HEART vector it sets or clears. `heart` logs HEART's register
+accesses, one counter read in 256 with the host's clock, and every
+interrupt vector raised or lowered. Mask categories: `pdma` —
 `hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
-miss op`; every module also takes `on`/`all`, `off`/`none` or a hex mask.
+miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
+every module also takes `on`/`all`, `off`/`none` or a hex mask.
+`bedrock` covers the Fuel's devices on its Bedrock hub, `l1` its system
+controller and `usb` its USB host controller. `ice1724` logs the Tezro's audio
+controller's accesses and values nothing establishes.
 `IRIS_DEBUG_LOG` or `[debug] debug_log` set the same thing at startup.
 
 ### Performance and locks
@@ -626,7 +673,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `re dither [on\|off]` | Show or set whether the engine dithers, to compare renderings; on by default |
 | `gbe status` | GBE display engine: timing, frame buffer, tiles |
 | `isa status` | MACE ISA interrupts |
-| `pci status` / `pci config <slot>` | MACE PCI bridge / a function's configuration space |
+| `pci status` / `pci config <slot>` | The PCI bus (on the O2 with MACE's registers; the Octane has it too) / a function's configuration space |
 | `mec status` | MACE Ethernet: rings, receive buffers, frame counts |
 | `sdma status` | MACE serial DMA |
 | `maceps2 status` / `maceps2 traffic` | PS/2 ports / recent bytes each way |

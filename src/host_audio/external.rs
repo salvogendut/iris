@@ -81,6 +81,8 @@ pub(super) fn open(
         return None;
     }
     Some(HostOut {
+        channels: 2,
+        _file: None,
         stream_rate: 48_000,
         producer,
         underruns,

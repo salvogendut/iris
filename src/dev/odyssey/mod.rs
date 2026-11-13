@@ -20,8 +20,9 @@
 //! - `fifo`: the command FIFO between the processor and the board's thread.
 //! - `worker`: the board's thread, which runs the queued stores.
 //! - `raster_unit`: the raster unit's thread and the queue that feeds it.
-//! - `registers`: identity, the board NIC, the cursor and the back end's
-//!   register file.
+//! - `registers`: identity, the board NIC and the widget registers.
+//! - `display_fifo`: the display FIFO, PB&J's register file (cursor, lookup
+//!   RAM, display modes, scan-out size, I2C), with its own lock.
 //! - `command`: the command-FIFO interpreter.
 //! - `context`: graphics context save and switch.
 //! - `draw`: buffers, integer drawing and the image path.
@@ -66,6 +67,7 @@ mod depth_word;
 mod display;
 #[cfg(test)]
 mod display_bench;
+mod display_fifo;
 mod dma;
 mod draw;
 mod field;
@@ -75,6 +77,7 @@ mod frame;
 mod golden;
 mod geometry;
 mod gl;
+mod gpu_unit;
 mod assembly;
 mod interface;
 mod clip;
@@ -93,6 +96,8 @@ mod scanout;
 mod trace;
 mod view;
 mod vram;
+#[cfg(feature = "wgpu")]
+mod wgpu;
 mod worker;
 #[cfg(test)]
 mod tests;
@@ -120,17 +125,35 @@ use scanout::monotonic_ns;
 /// The VPro board on widget `slot`: a `BusDevice` for the widget's
 /// windows.
 pub struct Odyssey {
-    small: u64,
-    large: u64,
+    aperture: Aperture,
     state: BoardLocks,
     display: Arc<Display>,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Carries a board interrupt packet into a machine's crosstalk fabric: the
+/// destination widget, the address within it, the vector, and whether the
+/// source rose or fell. False when nothing at the destination takes it.
+pub type PacketSender = Arc<dyn Fn(u8, u64, u8, bool) -> bool + Send + Sync>;
+
+/// How the processor's addresses reach the board, chosen when it is built.
+#[derive(Clone, Copy)]
+enum Aperture {
+    /// The Octane's: the widget's small and large IP30 windows.
+    Ip30Windows { small: u64, large: u64 },
+    /// Every address is already an aperture offset, as a machine whose I/O
+    /// interface hands widgets offsets (Bedrock) presents it.
+    Offsets,
+}
+
 impl Odyssey {
-    /// A board of `product` (v12, v10, v8, v6) at `widget`: its interrupt
-    /// packets reach `irq` (HEART), its DMA reaches `mem`.
+    /// A board of `product` (v12, v10, v8, v6) at `widget` on the Octane:
+    /// the processor reaches it through the IP30 widget windows, its
+    /// interrupt packets reach `irq` (HEART), its DMA reaches `mem`. `pool`
+    /// is the CPU raster unit's workers and tile size, `raster` which unit
+    /// draws and, for the GPU, the wgpu backend (`[graphics]`).
+    #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
     pub fn new(
         widget: u8,
         product: &str,
@@ -138,10 +161,48 @@ impl Odyssey {
         mem: Arc<dyn BusDevice>,
         status: Arc<crate::disp::StatusSource>,
         pool: (usize, u32),
+        raster: (crate::config::RasterUnit, &str),
+    ) -> Result<Arc<Self>, String> {
+        let aperture = Aperture::Ip30Windows { small: widget_small_base(widget), large: widget_large_base(widget) };
+        Self::build(widget, product, interface::heart_sender(irq), aperture, mem, status, pool, raster)
+    }
+
+    /// A board of `product` at `widget` on a machine that hands the board
+    /// widget-relative addresses, as Bedrock's I/O interface does, and
+    /// carries its interrupt packets through `packets`.
+    #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
+    pub fn new_widget_relative(
+        widget: u8,
+        product: &str,
+        packets: PacketSender,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+        pool: (usize, u32),
+        raster: (crate::config::RasterUnit, &str),
+    ) -> Result<Arc<Self>, String> {
+        Self::build(widget, product, packets, Aperture::Offsets, mem, status, pool, raster)
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
+    fn build(
+        widget: u8,
+        product: &str,
+        packets: PacketSender,
+        aperture: Aperture,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+        pool: (usize, u32),
+        raster: (crate::config::RasterUnit, &str),
     ) -> Result<Arc<Self>, String> {
         let mut s = Board::new(product, widget as u32)?;
         // The fragment pipeline's workers and tile size (`[graphics]`).
         s.raster.set_pool(pool.0, pool.1);
+        if raster.0 == crate::config::RasterUnit::Wgpu {
+            #[cfg(feature = "wgpu")]
+            s.enable_gpu(&crate::wgpu::GpuOptions { backend: raster.1.to_string(), ..Default::default() })?;
+            #[cfg(not(feature = "wgpu"))]
+            return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
+        }
         // The recorder's slot is there whether or not a recording runs, so
         // the monitor can start one (`vpro rec`); the DMA path records
         // through it.
@@ -151,15 +212,14 @@ impl Odyssey {
         });
         let mem: Arc<dyn BusDevice> = Arc::new(record::RecordingMem { inner: mem, rec: rec.clone() });
         s.guest = Some(mem);
-        s.front.lock().irq = Some(irq);
+        s.front.lock().packets = Some(packets);
         if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
             s.trace.start(&path, trace::TRACE_ALL).map_err(|e| format!("IRIS_ODSY_TRACE {path}: {e}"))?;
         }
         let mut state = BoardLocks::new(s);
         state.rec = rec;
         Ok(Arc::new(Self {
-            small: widget_small_base(widget),
-            large: widget_large_base(widget),
+            aperture,
             state,
             display: Arc::new(Display::new(status)),
             running: Arc::new(AtomicBool::new(false)),
@@ -175,7 +235,10 @@ impl Odyssey {
 
     /// The aperture offset of `addr`, in either window.
     fn offset(&self, addr: u64) -> Option<u64> {
-        let off = if addr >= self.large { addr - self.large } else { addr.wrapping_sub(self.small) };
+        let off = match self.aperture {
+            Aperture::Ip30Windows { small, large } => if addr >= large { addr - large } else { addr.wrapping_sub(small) },
+            Aperture::Offsets => addr,
+        };
         (off < ODSY_APERTURE).then_some(off)
     }
 
@@ -202,28 +265,50 @@ impl Odyssey {
         }
     }
 
-    /// One display frame: the retrace if it is due, then the whole frame
-    /// composed from board memory as the scan-out registers describe it
-    /// (frame.rs), and presented. The display takes no board lock and waits
-    /// for no drawing: it reads memory while the raster unit and the front
-    /// end write it, as the board's own scan-out does.
+    /// One display frame: the retrace if it is due, then, if anything the
+    /// scan-out reads has changed, the whole frame composed from board
+    /// memory as the scan-out registers describe it (frame.rs), and
+    /// presented; an unchanged frame is presented only at the idle
+    /// refresh. The display takes no board lock and waits for no drawing:
+    /// it reads memory while the raster unit and the front end write it,
+    /// as the board's own scan-out does.
     fn frame(state: &BoardLocks, display: &Display) {
         crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
         state.trace.flush(false);
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
         reader.poll(monotonic_ns());
+        // On the GPU raster unit with the wgpu renderer on the same device,
+        // the frame is composed and presented there with no readback.
+        #[cfg(feature = "wgpu")]
+        if display.gpu_frames_wanted() {
+            crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
+            let composed = reader.update_on_gpu();
+            crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
+            if let Some((buffer, w, h)) = composed {
+                set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
+                crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+                drop(reader);
+                if display.due(true) {
+                    crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
+                    display.present_gpu(&buffer, w, h);
+                    crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
+                }
+                return;
+            }
+        }
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let composed = reader.update();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-        if !composed || w == 0 || h == 0 || !display.due(true) {
+        if w == 0 || h == 0 || !display.due(composed) {
             return;
         }
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-        display.present(&reader.frame[..w * h], w, h, 0);
+        // An unchanged frame is presented from the screen as it is.
+        display.present(if composed { &reader.frame[..w * h] } else { &[] }, w, h, 0);
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
     }
 }
@@ -268,7 +353,7 @@ impl Device for Odyssey {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![(
             "vpro".to_string(),
-            "VPro (Odyssey) graphics: status|regs|fifo|state|geom|tex|win|mem|backend|lut|dispmode|cursor|pix|raw|peek|shot|fbdump|hash|unimp|refusals|trace|rec (vpro help)".to_string(),
+            "VPro (Odyssey) graphics: status|regs|fifo|state|geom|tex|win|mem|backend|lut|dispmode|cursor|pix|raw|peek|shot|fbdump|hash|unimp|refusals|gpu|trace|rec (vpro help)".to_string(),
         )]
     }
 

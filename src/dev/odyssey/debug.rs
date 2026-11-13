@@ -47,18 +47,27 @@ pub(super) fn memory_hash(b: &Board) -> String {
 }
 
 /// `memory_hash` as bytes: what a recording's mark holds.
+///
+/// The stream is the memory in address order, the lowest address the highest
+/// byte of each word (`VramPtr::address_bytes`). It is read as slices of the
+/// array and byte-swapped a block at a time: a call per word is the cost of
+/// the hash in an unoptimised build, and the replay and fill checks take it
+/// many times over 128 MB.
 pub(super) fn memory_hash_bytes(b: &Board) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
+    const BLOCK_WORDS: usize = 1 << 13;
     let mem = b.vram.ptr_shared();
-    let mut buf = Vec::with_capacity(1 << 16);
-    for byte in mem.address_bytes() {
-        buf.push(byte);
-        if buf.len() == buf.capacity() {
-            h.update(&buf);
-            buf.clear();
+    let words = mem.words_at(0, mem.size());
+    let mut h = blake3::Hasher::new();
+    let mut block = [0u64; BLOCK_WORDS];
+    for chunk in words.chunks(BLOCK_WORDS) {
+        let out = &mut block[..chunk.len()];
+        for (o, w) in out.iter_mut().zip(chunk) {
+            *o = w.to_be();
         }
+        // SAFETY: any u64 is eight initialised bytes, and u8 needs no alignment.
+        let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), out.len() * 8) };
+        h.update(bytes);
     }
-    h.update(&buf);
     *h.finalize().as_bytes()
 }
 
@@ -83,6 +92,7 @@ pub(super) const HELP: &[&str] = &[
     "vpro hash                       the memory hash a replay checkpoint takes",
     "vpro unimp                      offsets and command words reported as not modelled",
     "vpro refusals [reset]           bus refusals by reason and register",
+    "vpro gpu [trace on|off]         the GPU raster unit's counters; trace counts readbacks by cause",
     "vpro trace <file> [fifo,draw,cpu,dma|all]   annotated trace (gputrace builds); alone: its state",
     "vpro trace flush|off            write the trace out / close it",
     "vpro rec [<file>|mark|off]      replayable recording: start, mark, stop; alone: its state",
@@ -164,6 +174,16 @@ fn write_png(path: &Path, width: usize, height: usize, data: &[u8], color: png::
 impl Odyssey {
     /// The frame the scan-out registers describe now, and board memory.
     fn screen(&self) -> Result<(Frame, VramPtr, DisplayRegs), String> {
+        // The GPU unit's mirror is current only after a readback: take one
+        // when the board can be quiesced, else read it as it is. The CPU
+        // unit's memory is the board's own, read lock-free as the display
+        // reads it.
+        #[cfg(feature = "wgpu")]
+        if self.state.shared.gpu_scanout.get().is_some() {
+            if let Some(g) = self.state.quiesce(QUIESCE) {
+                g.gpu_sync();
+            }
+        }
         let regs = self.state.shared.regs.read();
         let frame = Frame::snapshot(&regs, self.displayed()).ok_or_else(|| "vpro: the scan-out is not set up (PB&J 0x2800-0x2809)".to_string())?;
         let mem = self.state.shared.vram.get().ok_or_else(|| "vpro: board memory is not allocated".to_string())?;
@@ -175,9 +195,14 @@ impl Odyssey {
         self.state.front.lock().displayed_buffer
     }
 
-    /// A state command's view of the board, or the busy answer.
+    /// A state command's view of the board, or the busy answer. On the GPU
+    /// raster unit the mirror is brought current first, so commands that
+    /// read board memory read what the unit drew.
     fn quiesced(&self) -> Result<super::mmio::BoardGuard<'_>, String> {
-        self.state.quiesce(QUIESCE).ok_or_else(|| {
+        self.state.quiesce(QUIESCE).map(|g| {
+            g.gpu_sync();
+            g
+        }).ok_or_else(|| {
             format!(
                 "vpro: board busy for {} ms (FIFO {} words in {} stores, raster {} jobs); try again",
                 QUIESCE.as_millis(),
@@ -249,6 +274,12 @@ impl Odyssey {
                 format!("{}\n", memory_hash(&g))
             }
             ["unimp"] => self.unimp_text()?,
+            ["gpu"] => self.gpu_text().unwrap_or_else(|| "the raster unit is the CPU's (gpu off)\n".to_string()),
+            ["gpu", "trace", on @ ("on" | "off")] => {
+                let on = *on == "on";
+                self.gpu_run(|g| g.trace_waits(on)).ok_or("the raster unit is the CPU's (gpu off)")?;
+                format!("gpu readback tracing {}\n", if on { "on" } else { "off" })
+            }
             ["refusals"] => {
                 let mut v = Vec::new();
                 self.state.refusals.report(&mut v).map_err(|e| e.to_string())?;
@@ -264,6 +295,28 @@ impl Odyssey {
     }
 
     // ── state commands ───────────────────────────────────────────────────────
+
+    /// Run `f` on the GPU raster unit, if the board draws on one.
+    fn gpu_run<T>(&self, f: impl FnOnce(&mut super::gpu_unit::GpuRaster) -> T) -> Option<T> {
+        if self.state.raster.threaded() {
+            return None;
+        }
+        self.state.raster.run_now(|ctx| ctx.gpu.as_mut().map(|g| f(g)))
+    }
+
+    /// The GPU unit's counters (`GpuRaster::report`) and the GPU scan-out's
+    /// (frames composed, bytes read back: a frame the window presents from
+    /// the GPU is not read back), None on the CPU unit.
+    fn gpu_text(&self) -> Option<String> {
+        #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
+        let mut out = self.gpu_run(|g| g.report())?;
+        #[cfg(feature = "wgpu")]
+        if let Some(s) = self.state.shared.gpu_scanout.get() {
+            let (frames, bytes) = s.lock().counts();
+            out.push_str(&format!("  gpu scanout: {frames} frames composed, {} MiB read back\n", bytes >> 20));
+        }
+        Some(out)
+    }
 
     fn status_text(&self) -> Result<String, String> {
         let mut out = String::new();
@@ -299,6 +352,9 @@ impl Odyssey {
             raster.queued(),
             if raster.threaded() { "running" } else { "stopped" }
         );
+        if let Some(g) = self.gpu_text() {
+            out.push_str(&g);
+        }
         {
             let r = self.display.reader.lock();
             let _ = writeln!(out, "  display: frame {}x{}, {} retraces", r.frame_width, r.frame_height, r.clock.frames);
@@ -317,11 +373,8 @@ impl Odyssey {
                     "  board: {} revision {:#x} at widget {}, {} MB in {} banks, identity {:#010x}, back end version {}",
                     g.widget.product, g.widget.revision, g.slot, g.widget.memory_size, g.widget.memory_banks, id, g.widget.backend_version
                 );
-                let _ = writeln!(
-                    out,
-                    "  scanout {}x{}, {} clocks a frame at {} Hz",
-                    g.scanout.mode.width, g.scanout.mode.height, g.scanout.mode.frame_clocks, g.scanout.mode.clock_hz
-                );
+                let mode = g.scanout_mode();
+                let _ = writeln!(out, "  scanout {}x{}, {} clocks a frame at {} Hz", mode.width, mode.height, mode.frame_clocks, mode.clock_hz);
                 let _ = writeln!(
                     out,
                     "  drawing: draw mask {:#x} draw word {:#010x} read word {:#010x} dest {:#010x} plane write mask {:#010x}",
@@ -419,7 +472,7 @@ impl Odyssey {
                 f.route_dest_upper, f.route_dest_lower, f.route_vectors, (f.route_vectors >> 24) & 0xff, (f.route_vectors >> 16) & 0xff, (f.route_vectors >> 8) & 0xff, f.route_vectors & 0xff, f.routed());
             let _ = writeln!(out, "  swap arm {:#x} pending {:#x} control {:#x} companion {:#x} set {:#x} clear {:#x}  displayed {:#010x}{}",
                 f.swap_arm, f.swap_pending, f.swap_control, f.swap_control_companion, f.swap_set, f.swap_clear, f.displayed_buffer, if f.displayed_written { " (written, repaint pending)" } else { "" });
-            let _ = writeln!(out, "  sw token {:#x}  flow-control target {:#x}  heart widget {}", f.sw_token, f.flctl_target, f.heart_widget);
+            let _ = writeln!(out, "  sw token {:#x}  flow-control target {:#x}", f.sw_token, f.flctl_target);
         }
         let g = self.quiesced()?;
         let wg = &g.widget;
@@ -428,8 +481,10 @@ impl Odyssey {
         let _ = writeln!(out, "  fifo setup 0x6b0-0x6b3,0x7b5: {:x?}  0x7f0 {:#x}", wg.fifo_setup, wg.setup_7f0);
         let _ = writeln!(out, "  host write addr {:#x}:{:#x}  stats addr {:#x}:{:#x} control {:#x}  ctx shadow {:#x}:{:#x}",
             wg.host_write_addr_upper, wg.host_write_addr_lower, wg.stats_addr_upper, wg.stats_addr_lower, wg.stats_control, wg.ctx_shadow_addr_upper, wg.ctx_shadow_addr_lower);
-        let _ = writeln!(out, "  buzz {:x?}  nic {:#x} (serial {:#x})  i2c main {:#x} opt {:#x}", wg.buzz, wg.nic, wg.nic_serial, wg.i2c_main_cmd, wg.i2c_opt_cmd);
-        let _ = writeln!(out, "  back end: index {:#x} count {}  version {}  selftest progress {} ready {}", wg.backend_index, wg.backend_count, wg.backend_version, wg.selftest_progress, wg.cfifo_selftest_ready);
+        let df = g.display_fifo.lock();
+        let _ = writeln!(out, "  buzz {:x?}  nic {:#x} (serial {:#x})  i2c main {:#x} opt {:#x}", wg.buzz, wg.nic, wg.nic_serial, df.i2c_main_cmd, df.i2c_opt_cmd);
+        let _ = writeln!(out, "  back end: index {:#x} count {}  version {}  selftest progress {} ready {}", df.index, df.count, wg.backend_version, wg.selftest_progress, wg.cfifo_selftest_ready);
+        drop(df);
         let _ = writeln!(out, "  product record: {}", if wg.nic_record.is_empty() { &wg.product_record } else { &wg.nic_record });
         Ok(out)
     }
@@ -578,11 +633,14 @@ impl Odyssey {
         let _ = writeln!(out, "  FB_DEPTH {} bytes, WIN_DEPTH {} bytes, PIXEL_FMT {}, FIELD_FMT {}, index {}, scratch {}", 1u32 << f.fb_log2, 1u32 << f.win_log2, f.pixel_fmt, f.field_fmt, f.index, f.scratch);
         let _ = writeln!(out, "  fields: A {:?}  B {:?}  depth {:?}  stencil {:?}", d.colour[0].kind, d.colour[1].kind, d.depth.kind, d.stencil.kind);
         let _ = writeln!(out, "buffer select (0x024) {:#x}, draw word {:#010x}, read word {:#010x}", b.draw_mask, b.draw_word, b.read_word);
-        let ctl = |i: u32| b.widget.backend_ctl[(i - backend::CTL_BASE) as usize];
+        let df = b.display_fifo.lock();
+        let ctl = |i: u32| df.ctl[(i - backend::CTL_BASE) as usize];
         let _ = writeln!(out, "scan-out (PB&J): window-id base {:#x}, pixel base {:#x}, {}x{}, stride {} tiles, depth code {} ({} bytes)",
             ctl(0x2800), ctl(0x2801), ctl(0x2802), ctl(0x2803), ctl(0x2807), ctl(0x2809), 2u32 << (ctl(0x2809) & 7));
+        let mode = df.scanout.mode;
+        drop(df);
         let _ = writeln!(out, "scanout {}x{}, {} clocks a frame at {} Hz; displayed-buffer bits {:#010x}",
-            b.scanout.mode.width, b.scanout.mode.height, b.scanout.mode.frame_clocks, b.scanout.mode.clock_hz, b.front.lock().displayed_buffer);
+            mode.width, mode.height, mode.frame_clocks, mode.clock_hz, b.front.lock().displayed_buffer);
         out
     }
 
@@ -593,11 +651,12 @@ impl Odyssey {
 
     fn backend_text(&self, start: u32, n: u32) -> Result<String, String> {
         let g = self.quiesced()?;
-        let ctl = &g.widget.backend_ctl;
+        let df = g.display_fifo.lock();
+        let ctl = &df.ctl;
         let first = start.saturating_sub(backend::CTL_BASE).min(backend::CTL_ENTRIES) as usize;
         let last = (first + n as usize).min(ctl.len());
         let mut out = String::new();
-        let _ = writeln!(out, "back-end register file (PB&J), index {:#x} count {}; entries {:#x}..{:#x} that are set:", g.widget.backend_index, g.widget.backend_count, backend::CTL_BASE + first as u32, backend::CTL_BASE + last as u32);
+        let _ = writeln!(out, "back-end register file (PB&J), index {:#x} count {}; entries {:#x}..{:#x} that are set:", df.index, df.count, backend::CTL_BASE + first as u32, backend::CTL_BASE + last as u32);
         let mut shown = 0;
         for i in first..last {
             if ctl[i] == 0 {
@@ -829,4 +888,25 @@ impl Odyssey {
 pub(super) fn dump_memory(mem: VramPtr, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("board.bin"), mem.address_bytes().collect::<Vec<u8>>())
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    /// The memory hash is the byte stream `address_bytes` gives, whatever
+    /// the block it is read in: the digests recordings and replay hashes
+    /// files hold do not move.
+    #[test]
+    fn the_memory_hash_is_the_address_byte_stream() {
+        let b = Board::new("v12", 0).unwrap();
+        let mem = b.vram_ptr();
+        // Distinct bytes in every lane, some words past the first block.
+        for w in [0u64, 1, 7, 8191, 8192, 8193, 100_000, mem.size() / 8 - 1] {
+            mem.store(w * 8, 8, 0x0102_0304_0506_0708u64.wrapping_mul(w + 1));
+        }
+        let mut want = blake3::Hasher::new();
+        want.update(&mem.address_bytes().collect::<Vec<u8>>());
+        assert_eq!(memory_hash_bytes(&b), *want.finalize().as_bytes());
+    }
 }

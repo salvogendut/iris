@@ -1,5 +1,9 @@
 # Cache native GPR values explicitly and RTC conversion once per tick
 
+Status: historical measurements. The 2026-11-13 integration replaces the
+all-register integer cache with upstream selective loop caching, still gated
+by the per-machine opt-in. RTC caching and policy-isolation tests remain.
+
 Status: integrated into `xiri`, 2026-11-03. `perf/sgiemu-port` is retired.
 Both caches now require `[perf] sgiemu_optimizations = true` (default false).
 Historical measurements below were made with the caches enabled. See

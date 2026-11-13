@@ -4,9 +4,9 @@ The Octane is SGI's 1997 workstation: one or two R10000s on HEART (the memory
 controller and interrupt hub), a Crossbow switch joining the widgets, the
 onboard Bridge (XIO to PCI) carrying two QLogic ISP1040 SCSI controllers, the
 IOC3 I/O chip (serial ports, keyboard and mouse, the clock, Ethernet) and RAD
-audio, and a graphics board on one of the XIO ports. IRIS offers one or two
-R10000, R12000 or R14000 processors; the default remains a 195 MHz R10000.
-The IRIX boot results below were obtained with the R10000.
+audio, and a graphics board on one of the XIO ports. IRIS emulates an
+Octane with one or two R10000, R12000 or R14000 processors ([two processors](octane-ip30-multiprocessor.md)). The Bridge's PCI bus, its
+wiring and reset are described in [pci.md](pci.md).
 
 With the stock IP30 PROM (the 879,312-byte image, SHA-256 `ee4722ca6f9b821f…`)
 and an installed IRIX 6.5.30 disk, the machine boots to a serial login.
@@ -32,7 +32,7 @@ An Octane is set up with the shared keys; `[octane]` holds what only an
 Octane has.
 
 ```toml
-prom  = ""                   # embedded Octane 4.9; or a path to an external IP30 PROM
+prom  = "IP30prom.bin"        # optional override of the embedded 6.5.30 PROM
 nvram = "nvram.bin"           # the DS1685 clock's NVRAM: the PROM's settings
 banks = [128]                 # MB in each HEART bank
 headless = true               # no window; console=d in the NVRAM for a serial console
@@ -60,54 +60,11 @@ overlay = true
 ```
 
 Paths are relative to the directory iris runs in. Every key is listed in
-[FEATURES.md](../FEATURES.md). Octane accepts these `machine.cpu` values:
-
-| CPU | Nominal clock | CP0 Count | PRId / FIR | Secondary cache |
-| --- | --- | --- | --- | --- |
-| `r10000` (default) | 195 MHz | 97.5 MHz | `0x0927` / `0x0900` | 1 MB |
-| `r12000` | 300 MHz | 150 MHz | `0x0e23` / `0x0e00` | 2 MB |
-| `r14000` (R14000A) | 600 MHz | 300 MHz | `0x0f24` / `0x0f00` | 2 MB |
-
-`machine.cpus = 2` fits two identical processors. `[clock] fixed_mhz`
-overrides **Count**, which ticks at half the processor clock on these CPUs.
-It does not set the host's emulation throughput. Selecting R14000 also
-selects the Octane2 Crossbow/Bridge revisions, independently of graphics.
-
-All three use the existing MIPS IV executor, 64-entry TLB, 44-bit virtual
-and 40-bit physical addresses, 32 KB two-way instruction/data caches, and
-the R10000 family's CACHE operations. The secondary cache uses two ways
-and 128-byte lines. The larger shadow arrays and CP0 Config size agree;
-PRId and FIR survive reset, and snapshots distinguish the newer models.
-R12000/R14000 are currently accepted only for Octane, not O2 or IP28.
-
-This is functional emulation: it does not simulate out-of-order execution,
-branch prediction, speculative cache fills, silicon errata, or model-specific
-performance-counter events and pipeline timing. The existing shadow-cache
-limitations still apply. New CPU validation covers register/cache behavior
-and bundled-PROM startup; it does not establish a NetBSD or IRIX boot.
-The bundled 4.9 PROM displays the V12 console with both new CPUs. Serial
-`hinv -v` also reports two 300 MHz R12000s or two 600 MHz R14000s, with 2 MB
-secondary cache each and ODYSSEY graphics. Reproduce without host sockets:
-
-```sh
-cargo run --example odyssey-prom-smoke --features pcap,idle-pause,perfetto,jitv2 -- \
-  v12 /tmp/new-r14000-probe 60 r14000 2 serial
-```
-
-Use a new output directory; `serial-a.log` records the inventory. Without
-any disks the PROM reports SCSI diagnostics, which the probe acknowledges
-before entering the command monitor.
-
-Hardware references: [SGI Octane2 datasheet](https://ftp.jurassic.nl/pub/irix/press/2679.pdf)
-(R14000A clocks and 2 MB cache),
-[SGI desktop periodic table](https://nekofiles.irixnet.org/Documents/Periodic_Tables/SGIPeriodTabJun2001.pdf)
-(Octane R12000 modules),
-[NetBSD CP0 definitions](https://github.com/NetBSD/src/blob/trunk/sys/arch/mips/include/cpuregs.h)
-(processor implementation codes), and
-[Linux cache probing](https://github.com/torvalds/linux/blob/master/arch/mips/mm/c-r4k.c)
-(`setup_scache`: 512 KB shifted by Config.SS, two ways, 64/128-byte lines).
-The minor PRId revisions are representative profile choices, not a claim
-that every Octane module uses the same silicon revision.
+[FEATURES.md](../FEATURES.md). `machine.cpu` is `r10000` (revision 2.7),
+`r12000` (revision 3.5, 2 MB secondary cache) or `r14000` (revision 2.4, 2 MB).
+`[clock] fixed_mhz` sets CP0 Count, half the pipeline clock. Unset it is
+97.5 MHz for the 195 MHz R10000, 180 MHz for a 360 MHz R12000 and 300 MHz for a
+600 MHz R14000.
 
 ## PROM and flash
 
@@ -134,8 +91,8 @@ that OS path has not been revalidated with bundled 4.9.
 ## Memory
 
 `banks` lists the megabytes in each of HEART's four banks (each a matched
-pair of DIMMs). Valid sizes are 64, 128, 256 and 512; fill the banks from the
-first with no gap, 2 GB at most. The shared default `[128, 128]` is 256 MB.
+pair of DIMMs). Valid sizes are 64, 128, 256, 512, 1024 and 2048; fill the
+banks from the first with no gap, 8 GB at most. The shared default `[128, 128]` is 256 MB.
 The PROM sizes the banks itself; IRIX has been booted with 128 MB.
 
 ## NVRAM
@@ -168,7 +125,7 @@ A PS/2 keyboard and mouse are always plugged into IOC3's two PS/2 ports;
 the iris window (or iris-gui) and the monitor's `ps2` commands type and
 move them. The PROM and IRIX run the keyboard in scan code set 3. How the
 controller works and what each driver does with it is in
-[Octane/ioc3-ps2.md](Octane/ioc3-ps2.md).
+[ioc3-ps2.md](dev/ioc3-ps2.md).
 
 The front lightbar is two IOC3 general-purpose pins: pin 0 the white power
 LED, pin 1 the red fault LED. The GUI's front LED shows them, green for white
@@ -238,8 +195,8 @@ The monitor (`monitor_port`) has, besides the usual CPU and device commands:
   `heart unsupported`: HEART registers a guest touched that are not modelled.
 - `scsi notes`: what the ISP1040 driver did that the model noted.
 
-`IRIS_IP30_TRACE=1` prints failed accesses, unsupported HEART registers and
-HEART's bank mapping as they happen.
+`IRIS_IP30_TRACE=1` prints failed accesses and unsupported HEART registers as
+they happen.
 
 ## Threads
 
@@ -250,13 +207,14 @@ interrupt, the NVRAM flush) as `hptimer` one-shots, so they fire without the
 guest touching the chip. RAD audio is paced by `hptimer` too and
 has no thread of its own. Each ISP1040 runs a request-ring thread, started
 with the machine and joined when it stops. The Ethernet has a receive pump
-and the network backend (`ip30-eth-rx`, `ip30-eth-net`). A power-off from the
+and the network backend (`ioc3-eth-rx`, `ioc3-eth-net`). A power-off from the
 guest (the DS1685 clock powering the machine down) reaches the machine
 through its event channel. `HACKING.md` lists the thread names.
 
 ## What is approximated or not modelled
 
-- One processor only.
+- Two processors at most, with the limits in
+  [octane-ip30-multiprocessor.md](octane-ip30-multiprocessor.md).
 - HEART: the answer to the PROM's bank-size probe is an approximation; ECC
   error injection is not modelled (a mode write that asks for it is
   recorded); the 16 KiB at physical 0 are the first 16 KiB of SDRAM,
@@ -264,6 +222,22 @@ through its event channel. `HACKING.md` lists the thread names.
   0x2000_0000..+16 KiB is a bus error, as the stock IDE memory diagnostics
   expect; cached accesses are the next item). Whether bus masters reach
   that range is not known; the DMA view does.
+- HEART's timer: the compare register is stored but not compared, so ISR
+  bit 50 is never raised. IRIX takes its clock from the processor's own
+  Count and Compare.
+- HEART's error interrupts, ISR bits 51 to 63 (widget errors, the Crossbow,
+  processor bus errors and HEART's own), are never raised, and the bus and
+  memory error address registers read zero. Which event sets which bit of
+  HEART's cause register (0x10040), and what the error registers capture, is
+  not documented, so nothing here raises them. A DMA write that
+  reaches no memory is the case that would: the Bridge posts it and records
+  nothing, and HEART does not record it either; `ip30 bridge` counts it.
+- PCI Interrupt Disable (command register bit 10, from PCI 2.3) is not
+  modelled. The onboard functions (the ISP1040Bs, the IOC3, RAD1) predate it.
+  The NVMe card is a later function that has it: iris stores the bit and
+  keeps driving the pin, so a guest that masks INTx this way still sees the
+  interrupt. The Bridge itself has no such bit; its interrupt enable
+  register masks its pins.
 - A cached access to 0x2000_0000..+16 KiB reaches the bytes. On an Octane2
   (HEART rev F) cached and uncached reads there both take a data bus
   error; here only uncached accesses do, because the processor's cache
@@ -285,10 +259,16 @@ through its event channel. `HACKING.md` lists the thread names.
 - Board identity records carry made-up barcodes and serial numbers.
 - Snapshots (the monitor's `save` and `load`, iris-ci's `save`, `restore` and
   `rollback`) cover a one-processor Octane without a graphics board; a
-  two-processor Octane and an IMPACT or VPro board are refused with the
-  reason.
+  two-processor Octane, an IMPACT or VPro board and virtio-serial are
+  refused with the reason.
   Restoring also rewrites the configured flash and NVRAM files, and the
   guest's clocks resume from the time they showed at the save.
+
+## Chips
+
+- [The IOC3 and its children](dev/ioc3.md)
+- [IOC3 PS/2 keyboard and mouse](dev/ioc3-ps2.md)
+- [QLogic ISP1040 SCSI controllers](dev/isp1040.md)
 
 ## Sources
 
@@ -297,5 +277,5 @@ The device models are ported from the author's QEMU models in
 [sgi-origami branch](https://github.com/jamesbraid/qemu-sgi-origami)). The boot flash (`src/dev/sflash.rs`)
 derives from MAME's
 [intelfsh](https://github.com/mamedev/mame/blob/master/src/devices/machine/intelfsh.cpp).
-The physical map is in [Octane/ip30-address-map.md](Octane/ip30-address-map.md);
-the Bridge, Xbridge and Crossbow specifications are in [Octane/](Octane/).
+The physical map is in [octane-ip30-address-map.md](octane-ip30-address-map.md);
+the Bridge, Xbridge and Crossbow specifications are in [datasheets/octane](datasheets/octane/).

@@ -57,6 +57,13 @@ fn display_identity(s: &mut Board, did: u32) {
 /// The display's pixel at (x, y) as 0x00RRGGBB, the frame composed.
 fn shown(s: &mut Board, x: i32, y: i32) -> u32 {
     s.scanout_update();
+    in_frame(s, x, y)
+}
+
+/// The pixel at (x, y) of the frame last composed, as 0x00RRGGBB. Composing
+/// is the whole frame each time, so a run of reads with nothing changed in
+/// between composes once (`s.scanout_update()`) and reads with this.
+fn in_frame(s: &Board, x: i32, y: i32) -> u32 {
     s.reader.frame[(y * s.reader.frame_width as i32 + x) as usize] & 0xff_ffff
 }
 
@@ -164,6 +171,42 @@ fn an_armed_swap_toggles_the_displayed_buffer_at_the_retrace() {
     reg_write(&mut s, swap::ARM, 0x5);
     retrace(&mut s);
     assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), 0x5);
+}
+
+/// A flip armed after command stores the raster unit has not submitted
+/// yet waits: the retrace leaves it armed until the unit's submissions
+/// cover the stream up to the arm (`DisplayShared::covered`, published by
+/// the GPU unit's tick), so the buffer shown holds the drawing issued
+/// before the swap. The CPU unit leaves the position at its maximum and
+/// flips latch at once, as the tests above see.
+#[test]
+fn a_flip_waits_until_the_raster_unit_covers_the_stores_before_its_arm() {
+    use std::sync::atomic::Ordering::SeqCst;
+    const ARM_BIT: u32 = 0x0100_0000;
+    let (mut s, _rec) = board("v12");
+    route_to_heart(&mut s);
+
+    // Two stores queued in the command stream, not yet run.
+    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_A as u64) << 32 | 0x8000_2000, 8));
+    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_B as u64) << 32 | 0x8000_2000, 8));
+    assert_eq!(s.fifo.pushed(), 2);
+    assert_eq!(s.fifo.retired(), 0);
+
+    // The unit has submitted the drawing from the first store only.
+    s.display.covered.store(1, SeqCst);
+    reg_write(&mut s, swap::ARM, ARM_BIT);
+    retrace(&mut s);
+    assert_eq!(reg_read(&mut s, swap::ARM), ARM_BIT, "the flip stays armed");
+    assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), 0, "nothing flips before the stores before the arm are drawn");
+
+    s.display.covered.store(2, SeqCst);
+    retrace(&mut s);
+    assert_eq!(reg_read(&mut s, swap::ARM), 0);
+    assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), ARM_BIT, "the flip latches once they are");
+
+    // The queued stores run; the stream positions meet.
+    s.work_drain(0);
+    assert_eq!(s.fifo.retired(), 2);
 }
 
 /// Arm writes between two retraces accumulate: separate windows issued
@@ -335,8 +378,9 @@ fn a_swap_shows_only_complete_frames() {
         assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), 1 - back);
         retrace(&mut s);
         assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), back);
-        assert_eq!(shown(&mut s, 10, 10), colour, "frame {i}: swapped");
-        assert_eq!(shown(&mut s, 10, 40), colour);
+        s.scanout_update();
+        assert_eq!(in_frame(&s, 10, 10), colour, "frame {i}: swapped");
+        assert_eq!(in_frame(&s, 10, 40), colour);
 
         retrace(&mut s);
         assert_eq!(shown(&mut s, 10, 40), colour, "an idle retrace keeps the frame");
@@ -472,7 +516,7 @@ fn a_plane_pixel_reaches_the_display_without_its_alpha() {
 #[test]
 fn the_display_channel_size_sets_the_scanout_mode() {
     let (mut s, _) = board("v12");
-    let size = |s: &Board| (s.scanout.mode.width, s.scanout.mode.height);
+    let size = |s: &Board| (s.scanout_mode().width, s.scanout_mode().height);
     assert_eq!(size(&s), (1280, 1024));
 
     backend(&mut s, 0x3000_0000 | 0x2802 << 14 | 5);
@@ -629,32 +673,36 @@ fn the_cursor_position_is_signed_and_clipped_to_the_raster() {
     cursor_load(&mut s, 2, 3);
     let bg = shown(&mut s, 11, 7);
     cursor_entry(&mut s, cursor::CONTROL, 1);
-    assert_eq!(shown(&mut s, 2, 3), WORD1_RGB);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 2, 3), WORD1_RGB);
 
     // x = -1: column 0 of the glyph is off the left edge.
     cursor_entry(&mut s, cursor::POSITION, 0xffff_0005);
-    assert_eq!(shown(&mut s, 0, 5), WORD2_RGB);
-    assert_eq!(shown(&mut s, 1, 5), WORD0_RGB);
-    assert_eq!(shown(&mut s, 2, 5), bg);
-    assert_eq!(shown(&mut s, 2, 3), bg, "the old place is repainted");
-    assert_eq!(shown(&mut s, 3, 3), bg);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 0, 5), WORD2_RGB);
+    assert_eq!(in_frame(&s, 1, 5), WORD0_RGB);
+    assert_eq!(in_frame(&s, 2, 5), bg);
+    assert_eq!(in_frame(&s, 2, 3), bg, "the old place is repainted");
+    assert_eq!(in_frame(&s, 3, 3), bg);
 
     // y = -2: glyph row 2 lands on line 0. Read unsigned, 0xfffe would put
     // the whole cursor below the raster and draw nothing.
     cursor_entry(&mut s, cursor::GLYPH + 2 * 4, 0x1);
     cursor_entry(&mut s, cursor::PLANE + 2 * 2, 0x3);
     cursor_entry(&mut s, cursor::POSITION, 0x0002_fffe);
-    assert_eq!(shown(&mut s, 2, 0), WORD1_RGB);
-    assert_eq!(shown(&mut s, 3, 0), bg);
-    assert_eq!(shown(&mut s, 2, 1), bg);
-    assert_eq!(shown(&mut s, 0, 5), bg);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 2, 0), WORD1_RGB);
+    assert_eq!(in_frame(&s, 3, 0), bg);
+    assert_eq!(in_frame(&s, 2, 1), bg);
+    assert_eq!(in_frame(&s, 0, 5), bg);
 
     // The PROM's first position after its enable, x 1280 y 0, is the first
     // column right of the raster and draws nothing.
     cursor_entry(&mut s, cursor::POSITION, 0x0500_0000);
-    assert_eq!(shown(&mut s, 0, 5), bg);
-    assert_eq!(shown(&mut s, 2, 0), bg);
-    assert_eq!(shown(&mut s, 1279, 0), 0);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 0, 5), bg);
+    assert_eq!(in_frame(&s, 2, 0), bg);
+    assert_eq!(in_frame(&s, 1279, 0), 0);
 }
 
 /// The cursor request writes the position through a type 7 header when it
@@ -726,7 +774,7 @@ fn the_host_reads_the_cursor_glyph_and_position_from_the_registers() {
 
     let (mut s, _) = board("v12");
     let display = Display::new(crate::disp::StatusSource::detached());
-    display.attach_registers(s.scanout.shared.clone());
+    display.attach_registers(s.display.clone());
     assert_eq!(display.hw_cursor(), None, "out of reset the cursor is off");
 
     cursor_load(&mut s, 2, 3);
@@ -779,3 +827,79 @@ fn a_reset_leaves_the_cursor_off_and_empty() {
     assert_eq!(shown(&mut s, 2, 3), 0);
 }
 
+
+// A frame is composed only when something the scan-out reads has changed.
+
+/// A board with a picture on show and the frame composed once.
+fn composed_board() -> Box<Board> {
+    let (mut s, _) = board("v12");
+    cursor_load(&mut s, 2, 3);
+    cursor_entry(&mut s, cursor::CONTROL, 1);
+    assert!(s.scanout_update(), "the first frame is composed");
+    composes(&mut s);
+    s
+}
+
+/// Frames composed until one is not: a store's frame is followed by one
+/// more, which catches data its mark was seen ahead of.
+fn composes(s: &mut Board) -> usize {
+    let mut n = 0;
+    while s.scanout_update() {
+        n += 1;
+        assert!(n < 4, "frames keep being composed");
+    }
+    n
+}
+
+/// Nothing changed: the frame stays as it is, however often it is asked for.
+#[test]
+fn an_unchanged_frame_is_not_composed_again() {
+    let mut s = composed_board();
+    for _ in 0..3 {
+        assert!(!s.scanout_update());
+    }
+    assert_eq!(in_frame(&s, 2, 3), WORD1_RGB);
+}
+
+/// Every way the scan-out's input changes brings a new frame: a store to
+/// board memory (a draw, a pixel write), the colour lookup RAM and gamma
+/// table, a display mode, the overlay modes, the cursor's entries, the
+/// scan-out geometry, the mode, a buffer swap at the retrace, and a reset.
+#[test]
+fn every_change_to_what_the_scanout_reads_composes_a_new_frame() {
+    type Change = fn(&mut Board);
+    let changes: [(&str, Change); 11] = [
+        ("a draw", |s| rgb_fill(s, 0xff, 0, 0, 100, 100, 110, 110)),
+        ("a pixel write", |s| pixel_write(s, 5, 5, 0x1122_3344)),
+        ("a gamma entry", |s| backend_entry(s, crate::dev::odyssey::consts::ODSY_GAMMA_BASE + 0x100, 0x3ff)),
+        ("a colour-map entry", |s| backend_entry(s, 7, LUT_RED)),
+        ("a display mode", |s| dispmode(s, 3, DISPMODE_GROUP17)),
+        ("an overlay mode", |s| backend_entry(s, crate::dev::odyssey::consts::overlay::MODE_BASE + 1, 1)),
+        ("the cursor position", |s| cursor_entry(s, cursor::POSITION, 9 << 16 | 4)),
+        ("the scan-out geometry", |s| backend_entry(s, 0x2802, 1024)),
+        ("the video mode", |s| s.set_scanout_size(1024, 768)),
+        ("a buffer swap", |s| {
+            reg_write(s, swap::ARM, 0x1);
+            retrace(s);
+        }),
+        ("a reset", |s| s.reset()),
+    ];
+    for (what, change) in changes {
+        let mut s = composed_board();
+        change(&mut s);
+        let stores = ["a draw", "a pixel write", "a reset"].contains(&what);
+        assert_eq!(composes(&mut s), if stores { 2 } else { 1 }, "{what} composes a new frame, once more for a store");
+    }
+}
+
+/// A store through any pointer to the memory counts, including a writer
+/// that uploads what it wrote itself (`untracked`), and a view of the
+/// memory that is cloned or copied around.
+#[test]
+fn a_store_through_any_view_of_the_memory_composes_a_new_frame() {
+    let mut s = composed_board();
+    s.vram.ptr().untracked().store(0x4000, 4, 1);
+    assert_eq!(composes(&mut s), 2);
+    s.vram.ptr_shared().store(0x4000, 4, 2);
+    assert_eq!(composes(&mut s), 2);
+}

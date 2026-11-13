@@ -88,31 +88,13 @@ pub fn prepare_environment(
         Ok(match cfg.machine.profile {
             MachineProfile::IndyIp24 => vec![0; 8192],
             MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => vec![0xff; 256],
-            MachineProfile::O2Ip32 => crate::firmware::load_flash_prom(
-                &cfg.prom,
-                &[
-                    Path::new(crate::config::DEFAULT_PROM),
-                    Path::new(crate::ip32_machine::O2_PROM_FILE),
-                ],
-                &crate::prombinip32::PROM_IP32_REV4_18,
-                "O2",
-            )?,
-            MachineProfile::OctaneIp30 => {
-                let mut image = crate::firmware::load_flash_prom(
-                    &cfg.prom,
-                    &[
-                        Path::new(crate::config::DEFAULT_PROM),
-                        Path::new(crate::ip30_machine::OCTANE_PROM_FILE),
-                    ],
-                    &crate::prombinip30::PROM_IP30_REV4_9,
-                    "Octane",
-                )?;
-                if image.len() > 1 << 20 {
-                    return Err("Octane PROM exceeds flash size".into());
-                }
-                image.resize(1 << 20, 0xff);
+            MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 => {
+                let size = if cfg.machine.profile == MachineProfile::O2Ip32 { 512 << 10 } else { 1 << 20 };
+                let mut image = crate::dev::prom_image::resolve(cfg.machine.profile, &cfg.prom, size)?.bytes;
+                image.resize(size, 0xff);
                 image
             }
+            _ => return Err("PROM presets are not implemented for this machine".into()),
         })
     })?;
     let bytes = &mut state.bytes;
@@ -124,6 +106,7 @@ pub fn prepare_environment(
         MachineProfile::OctaneIp30 => {
             octane_environment(bytes, [values[0], values[1], values[2], None])?
         }
+        _ => return Err("PROM presets are not implemented for this machine".into()),
     }
     pending.push(state);
     save_states(&pending)
@@ -482,7 +465,8 @@ mod tests {
 
     #[test]
     fn o2_console_and_boot_choices_are_independent() {
-        let mut image = crate::prombinip32::PROM_IP32_REV4_18.to_vec();
+        let mut image = crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Ip32).unwrap();
+        image.resize(512 << 10, 0xff);
         let mut values = NETBSD;
         values[3] = Some("d");
         o2_environment(&mut image, values).unwrap();
@@ -621,7 +605,14 @@ mod tests {
 
     #[test]
     fn o2_updates_only_environment_body_and_preserves_unknown_variables() {
-        let mut image = crate::prombinip32::PROM_IP32_REV4_18.to_vec();
+        let mut image = crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Ip32).unwrap();
+        image.resize(512 << 10, 0xff);
+        // The packed release image starts with an empty environment. Seed
+        // unrelated settings as firmware would, then verify their preservation.
+        let records = b"AutoLoad=Yes\0console=g\0xiri_test=keep\0\0";
+        image[0x4040..0x4040 + records.len()].copy_from_slice(records);
+        let checksum = sum32(&image[0x4040..0x43fc]).wrapping_neg();
+        image[0x43fc..0x4400].copy_from_slice(&checksum.to_be_bytes());
         let original = image.clone();
         o2_environment(&mut image, NETBSD).unwrap();
         assert_eq!(&image[..0x4040], &original[..0x4040]);
@@ -633,6 +624,7 @@ mod tests {
             b"OSLoadOptions=auto\0",
             b"AutoLoad=Yes\0",
             b"console=g\0",
+            b"xiri_test=keep\0",
         ] {
             assert!(
                 image[0x4040..0x4400]
@@ -657,7 +649,27 @@ mod tests {
 
     #[test]
     fn octane_preserves_firmware_and_appends_only_changed_variables() {
-        let mut image = crate::prombinip30::PROM_IP30_REV4_9.to_vec();
+        let mut image = crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Ip30).unwrap();
+        image.resize(1 << 20, 0xff);
+        // The release payload has no persistent-data store. Refuse it until
+        // the PROM initializes the region; never silently create firmware state.
+        let blank = image.clone();
+        assert!(octane_environment(&mut image, NETBSD).unwrap_err().contains("Keep existing"));
+        assert_eq!(image, blank);
+        // Synthetic initialized PDS with an unrelated variable and log record.
+        let pds = &mut image[0xf0000..];
+        pds[..24].fill(0);
+        pds[..4].copy_from_slice(b"FPDS");
+        let checksum = !sum16(&pds[..24]);
+        pds[22..24].copy_from_slice(&checksum.to_be_bytes());
+        let mut at = 24;
+        for (kind, record) in [(0x0100u16, b"xiri_test=keep\0".as_slice()), (0x0200, b"test log\0")] {
+            let size = record.len().next_multiple_of(2);
+            pds[at..at + 2].copy_from_slice(&(kind | (size / 2) as u16).to_be_bytes());
+            pds[at + 4..at + 4 + size].fill(0);
+            pds[at + 4..at + 4 + record.len()].copy_from_slice(record);
+            at += 4 + size;
+        }
         let original = image.clone();
         octane_environment(&mut image, NETBSD).unwrap();
         assert_eq!(&image[..0xf0018], &original[..0xf0018]);
