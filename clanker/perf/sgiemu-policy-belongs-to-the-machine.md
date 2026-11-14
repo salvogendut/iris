@@ -28,8 +28,9 @@ Prismatic saves `advanced.expert.sgiemu_optimizations` per machine label and
 detects the optional core API from source. Older cores preserve the preference
 but disable the control. Save/Cancel/Discard reuse its normal restart flow;
 the default is off even in JIT builds. iris-gui exposes the same core setting.
-Developer/lockstep and FPU/fallback exclusions remain in place. The per-pool hot
-queue fix and Newport plane-decoding fix are unconditional.
+Developer and lockstep builds bypass the GPR cache; cache selection and callout
+handling otherwise follow upstream. The per-pool hot queue fix and Newport
+plane-decoding fix are unconditional.
 
 ## Validation
 

@@ -707,11 +707,8 @@ where they differed:
   `[perf] sgiemu_optimizations = true`, or the Performance control in iris-gui
   and Prismatic. Defaults and existing configurations leave them off. A change
   takes effect when the machine restarts; correctness fixes apply in either mode.
-- Keep guest GPR values in compiler SSA variables across native integer JIT
-  regions, reducing repeated loads around interrupt checks and memory calls. Register
-  writes still update architectural state immediately for faults and exits.
-  Regions containing FPU instructions or interpreter fallbacks, developer builds
-  and lockstep builds retain the existing register access path.
+- Apply the per-machine setting to upstream's selective loop GPR cache;
+  developer and lockstep builds bypass it.
 - Cache DS1286/DS1386 calendar conversion for each centisecond. Clock writes,
   command changes and state restoration invalidate the cache, preserving clock
   freeze and snapshot behavior while reducing the cost of repeated RTC reads.
@@ -738,14 +735,11 @@ where they differed:
   complete stereo frames, and reports producer shutdown. An installed factory
   that fails never falls back to a different host backend.
 
-### Bundled O2 and Octane firmware (fork)
+### Embedded firmware selection
 
-- Embed O2 4.18 and Octane 4.9 as Rust byte arrays, with a reproducible
-  `tools/embed-prom.py` converter and source hashes. Both machines now have a
-  firmware fallback when the default files are absent. An empty `prom` selects
-  embedded firmware directly; explicit external paths remain supported and
-  report errors instead of silently substituting firmware. Existing persisted
-  flash and NVRAM are unchanged.
+- Use upstream packed PROMs and the shared loader. Keep an empty `prom` as an
+  alias for `"(embedded)"` for existing frontends. Explicit unreadable overrides
+  remain errors; existing persistent flash and NVRAM remain authoritative.
 
 ## October 2026
 

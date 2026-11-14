@@ -109,7 +109,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | Note | Kind | Title |
 |---|---|---|
 | [frontend-pcm-output.md](devices/frontend-pcm-output.md) | design | Per-machine PCM factory for SDL hosts, bounded stereo ring, no host-backend fallback and pause/stop ownership |
-| [embedded-flash-prom-selection.md](devices/embedded-flash-prom-selection.md) | history | Superseded selection loader: empty path selects embedded bytes, defaults probe local files, explicit override errors never fall back |
+| [embedded-flash-prom-selection.md](devices/embedded-flash-prom-selection.md) | rule | Use upstream packed PROMs and resolver; retain the empty-path alias for embedded frontends |
 | [ip35-board-eeprom-cpu-config.md](devices/ip35-board-eeprom-cpu-config.md) | rule | The IP35 PROM checks its flash CPU record against the node board EEPROM's format-3 extended data (`CpuContext`); the field layout and how it was read out of the PROM |
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
 | [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
@@ -189,7 +189,6 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
 | [nfs-fileid-1-panics-irix53-imon.md](net/nfs-fileid-1-panics-irix53-imon.md) | rule | NFS fileid 1 panics IRIX 5.3 through imon (fam) |
 | [netbsd-fragmented-nfs-upload-corruption.md](net/netbsd-fragmented-nfs-upload-corruption.md) | open | Intermittent NetBSD NFS upload corruption with 8192-byte requests after restore |
-| [nfs-mount-advertise-auth-sys.md](net/nfs-mount-advertise-auth-sys.md) | rule | MOUNT v3 must advertise AUTH_SYS for NetBSD clients |
 | [nfs-readdir-must-respect-count-and-fit-one-datagram.md](net/nfs-readdir-must-respect-count-and-fit-one-datagram.md) | rule | NFS READDIR replies must respect the client's `count` and fit one UDP datagram |
 | [prom-bootp-tftp-boot.md](net/prom-bootp-tftp-boot.md) | rule | PROM `boot -f bootp()file`: what the ARCS PROM demands of BOOTP and TFTP |
 | [rsh-forward-needs-reserved-source-port.md](net/rsh-forward-needs-reserved-source-port.md) | rule | Inbound port-forwards to rsh/rlogin need a reserved source port |
@@ -433,7 +432,6 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [phase3-platform.md](perf/phase3-platform.md) | design | Phase 3 platform notes |
 | [rex3-dirty-uploads-cut-presentation-traffic.md](perf/rex3-dirty-uploads-cut-presentation-traffic.md) | measure | REX3 dirty uploads cut source-plane presentation traffic |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
-| [sgiemu-register-and-rtc-cache.md](perf/sgiemu-register-and-rtc-cache.md) | measure | SGIEmu-inspired GPR caching and centisecond RTC conversion caching |
 | [sgiemu-policy-belongs-to-the-machine.md](perf/sgiemu-policy-belongs-to-the-machine.md) | rule | Opt-in GPR/RTC caches belong to each machine; preserve worker policy and separate persistent code keys |
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
 | [windows-timer-waits-round-to-the-system-tick.md](perf/windows-timer-waits-round-to-the-system-tick.md) | rule | On Windows a timed park rounds up to the 15.6 ms system tick (the guest clock ran at 64-80 Hz, glquake looked hung after a timedemo); the hptimer waits on a high-resolution waitable timer, plans around its 0.5 ms grid, and raises the process timer resolution; never pace below the tick with park_timeout or wait_timeout |
@@ -506,8 +504,6 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 
 ## build/
 
-- [Xiri upstream integration](build/xiri-upstream-integration.md) — howto: preserve embedded firmware, worker lifecycle and reset behavior when merging upstream.
-
 Toolchain, dependency upgrades, platform build issues.
 
 | Note | Kind | Title |
@@ -548,5 +544,3 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |
 | [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules
 | [kona-back-end.md](plans/kona-back-end.md) | design | Design: the InfiniteReality (KONA) board: concrete back end, pipe lock, draw-state table on a tile scheduler, geometry hand-off, ownership, steps and approximations
-
-- [Xiri upstream integration, 2026-11-13](build/xiri-upstream-20261113.md) — history; CPU/PROM/network API resolutions and regression evidence.

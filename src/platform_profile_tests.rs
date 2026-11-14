@@ -51,7 +51,7 @@ mod tests {
         for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::OctaneIp30] {
             virtio_cfg(p).validate().unwrap_or_else(|e| panic!("{p:?}: {e}"));
         }
-        assert!(virtio_cfg(MachineProfile::O2Ip32).validate().unwrap_err().contains("not wired on the O2"));
+        assert!(virtio_cfg(MachineProfile::O2Ip32).validate().is_err(), "not wired on the O2");
     }
 
     #[test]

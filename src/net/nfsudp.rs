@@ -1374,9 +1374,9 @@ pub fn mount_call(call: &RpcCall, args: &mut Cur) -> Vec<u8> {
             } else {
                 x.u32(0); // mountstat3 = MNT3_OK
                 put_fh(&mut x, ROOT_ID); // v3 fhandle3 (opaque)
-                // NetBSD and IRIX 6.5.30 require AUTH_SYS/AUTH_UNIX in
-                // the accepted flavours. Credentials are not checked;
-                // retain AUTH_NULL for existing anonymous clients.
+                // The flavours the client may use. Credentials are not
+                // checked, but IRIX 6.5.30 refuses a server that does not
+                // list AUTH_UNIX.
                 x.u32(2);
                 x.u32(AUTH_UNIX);
                 x.u32(AUTH_NULL);
@@ -2047,9 +2047,9 @@ mod tests {
         assert_eq!(c.u32(), Some(0)); // MNT3_OK
         let fh = c.opaque().unwrap();
         assert_eq!(u64::from_be_bytes(fh.try_into().unwrap()), ROOT_ID);
-        // AUTH_SYS/AUTH_UNIX is required by NetBSD and IRIX 6.5.30.
-        assert_eq!(c.u32(), Some(2)); // accepted auth flavors
-        assert_eq!(c.u32(), Some(AUTH_UNIX));
+        // AUTH_UNIX first: IRIX 6.5.30 refuses a server without it.
+        assert_eq!(c.u32(), Some(2)); // two auth flavors
+        assert_eq!(c.u32(), Some(1)); // AUTH_UNIX
         assert_eq!(c.u32(), Some(0)); // AUTH_NULL
 
         // MOUNT v1 MNT -> fhstatus OK + 32-byte fhandle.

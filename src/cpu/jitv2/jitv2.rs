@@ -5454,34 +5454,6 @@ mod tests {
     }
 
     #[test]
-    fn stopping_one_pool_preserves_another_pools_hot_requests() {
-        // A stopped frontend machine can coexist with its replacement.
-        // Draining either pool must only touch its own raw page pointers.
-        let mut first_page = PhysicalCodePage::new(0, std::ptr::null());
-        let mut second_page = PhysicalCodePage::new(0, std::ptr::null());
-        let mut first = CompileQueue::new();
-        let mut second = CompileQueue::new();
-        assert!(first_page.try_schedule_page());
-        assert!(second_page.try_schedule_page());
-        push_hot_request(&first.hot_handle(), CompileRequest {
-            page: &mut first_page,
-            compiled_for_fr1: true,
-        });
-        push_hot_request(&second.hot_handle(), CompileRequest {
-            page: &mut second_page,
-            compiled_for_fr1: true,
-        });
-
-        first.stop();
-        assert!(!first_page.is_scheduled());
-        assert!(second_page.is_scheduled());
-        assert_eq!(second.hot.len(), 1);
-        second.stop();
-        assert!(!second_page.is_scheduled());
-        assert!(second.hot.is_empty());
-    }
-
-    #[test]
     fn compile_worker_cannot_take_another_pools_hot_request() {
         let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let old_bus: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));

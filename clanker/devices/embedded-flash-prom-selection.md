@@ -1,33 +1,21 @@
-# Empty O2/Octane PROM paths select embedded bytes directly
+# Embedded firmware selection uses the upstream loader
 
-Status: superseded by the shared `dev::prom_image` loader in the 2026-11-13
-upstream integration. Empty `prom` remains an embedded-firmware alias;
-explicit unreadable overrides remain errors. Arrays are now packed PROMs.
+Use upstream `dev::embedded_prom`, `dev::prom_image` and `iris-prom`.
+`data/proms/proms.toml` records source files and hashes; `data/proms/*.deflate`
+contains the decoded, packed payloads. The old generated Rust arrays and their
+converter are obsolete. See [the upstream packing notes](embedded-prom-compression.md).
 
-The Prismatic fork embeds O2 4.18 (`prombinip32`) and Octane 4.9
-(`prombinip30`). Both arrays are byte-identical to the user-supplied files;
-their source filenames, sizes and SHA-1 hashes are in the generated headers.
-`python3 tools/embed-prom.py INPUT OUTPUT SYMBOL` reproduces either array.
+The remaining fork behavior is the empty-string alias for `"(embedded)"`.
+Prismatic uses it when no external override is selected. Both spellings select
+embedded bytes without probing the working directory. The default PROM name
+still probes local defaults; other explicit paths must load or return an error.
 
-`firmware::load_flash_prom` distinguishes three cases:
+Existing flash state remains authoritative. O2 and Octane pad the upstream
+release payload to flash capacity; the Octane release payload has no initialized
+persistent-data store. Let the PROM initialize fresh flash before applying an
+offline boot preset. Do not erase a user's flash to exercise a firmware fallback.
 
-- Empty `prom`: embedded bytes, with no working-directory probes. Prismatic
-  uses this when no external override is selected.
-- `DEFAULT_PROM`: try `prom.bin`, then the model's legacy filename, then
-  embedded bytes only if both files are absent.
-- Other explicit paths: read that file or report the error. Never hide a typo,
-  unreadable file or failed menu override by substituting another ROM.
-
-Existing persistent flash remains authoritative, as before: O2's `nvram` and
-Octane's `octane.flash` may contain a previous image. Use fresh isolated state
-for firmware smoke tests; do not delete a user's flash merely to exercise the
-fallback. This is different from Indigo2's legacy fallback, which still probes
-its local model filename even when the configured path is empty.
-
-Validation: both loader tests pass, and generated arrays match every source
-byte and the recorded hashes. Prismatic diskless checks at 128 MB reach the
-O2 boot-error prompt with R5000/R10000. Octane 4.9 reaches the PROM menu after
-Enter acknowledges internal/external SCSI device/cable diagnostic failures.
-The early nonuniform-frame smoke capture only shows its power-on diagnostics;
-a longer desktop run was needed to inspect POST and the menu. No guest OS was
-booted and no user disks or persistent state were used.
+Validation is through upstream's packed-payload hash/banner and resolver tests,
+plus the fork's `flash_prom_validation_preserves_embedded_and_explicit_selection`
+check. Earlier checks of full-flash Rust arrays are historical, not evidence for
+the current packed payloads.

@@ -68,13 +68,15 @@ Paths are relative to the directory iris runs in. Every key is listed in
 
 ## PROM and flash
 
-This fork embeds the 1 MiB Octane 4.9 PROM in `src/prombinip30.rs`
-(SHA-1 `de250875c608add63749d3f9fb81a82cb58c3586`). An explicit `prom` path
-overrides it and must be readable; images can be at most 1 MiB, including the
-879,312-byte IRIX `IP30prom.bin` used for the OS checks described above.
+The default build carries upstream's packed Octane 4.9 release PROM in
+`data/proms/ip30.deflate`; its source and hash are in `data/proms/proms.toml`.
+An explicit `prom` path overrides it and must be readable; images can be at most
+1 MiB, including the 879,312-byte IRIX `IP30prom.bin` used for the OS checks
+described above.
 Leaving `prom` unset tries `prom.bin`, then `IP30prom.bin`, then embedded 4.9
-if neither file exists. `prom = ""` selects embedded directly without searching
-the working directory. The chosen image is loaded into the boot flash, a 1 MiB
+if neither file exists. `prom = "(embedded)"` (or the fork's empty-string alias)
+selects embedded directly without searching the working directory. The release
+payload is padded to capacity and loaded into the boot flash, a 1 MiB
 part with the Intel/Sharp command set on the Bridge's first chip select,
 where the PROM also keeps its persistent records. `[octane] flash` names a
 file holding the whole flash, so those records survive from run to run; it
@@ -83,10 +85,10 @@ exactly 1 MiB is used as it stands (delete it after changing `prom`). A
 file of any other size is refused with an error and left untouched. Without it the flash starts from
 `prom` every run.
 
-With the bundled 4.9 image, a Prismatic diskless check at 128 MB reaches the
-firmware menu after acknowledging internal/external SCSI device/cable diagnostic
-failures with Enter. The IRIX boot results above used the other external PROM;
-that OS path has not been revalidated with bundled 4.9.
+The upstream release payload does not include initialized persistent records.
+Let the PROM initialize fresh flash before applying an offline boot preset.
+Earlier Prismatic checks used the fork's former full-flash image; they do not
+qualify the currently packed release payload.
 
 ## Memory
 
