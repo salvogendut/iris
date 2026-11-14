@@ -1,14 +1,20 @@
 # Embedded audio factories belong to individual machines
 
-Prismatic uses SDL3, while standalone Iris uses CPAL. Setting `no_audio`
+Prismatic uses SDL3, while standalone Iris uses `iris-audio` host backends. Setting `no_audio`
 disabled the emulated HAL2 device rather than providing a host mute. Keep
 guest devices enabled and install `AudioConfig.output` before construction.
 
 The runtime-only field is an `Arc<dyn host_audio::OutputFactory>`, skipped by
 serde and cloned into the machine's audio devices. `open_output` hands the
-factory a `PcmStream` and never tries CPAL if the factory was installed, even
-if it refuses the stream. This covers HAL2, MACE and RAD with no process-global
+factory a `PcmStream` and never tries another host backend if the factory was installed, even
+if it refuses the stream. This covers HAL2, MACE, RAD and ICE1724 with no process-global
 hook, so machines and tests cannot steal each other's audio.
+
+The upstream `iris-audio` renderer now supplies the handoff through a custom
+backend: it mixes voices, converts rates and maps channels before a bounded
+5 ms pump writes frontend PCM. Dropping the last voice joins that pump; a
+frontend refusal never opens a fallback device. The existing public factory
+and consumer interface is preserved.
 
 The handoff is 48 kHz signed-16-bit interleaved stereo. The lock-free ring is
 capped at 100 ms; its consumer commits whole stereo frames. A frontend must
@@ -23,7 +29,7 @@ caps SDL's queue at 60 ms. Mute/volume are shared desktop preferences and apply
 only after Save; errors report once and retry on mute/unmute or a new machine.
 The screenshot shutter remains a separate SDL stream.
 
-A controlled HAL2 DMA tone verified Indy/IP22 output through SDL's disk
+Before the iris-audio migration, a controlled HAL2 DMA tone verified Indy/IP22 output through SDL's disk
 backend: stereo peaks 12000/6000, then 6000/3000 at saved 50% volume, silence
 while muted, no draft side effects, and successful pause/resume, cold reset
 and label switching. IP28/O2 PROM audio also produced non-silent SDL captures.

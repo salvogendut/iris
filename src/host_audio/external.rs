@@ -1,15 +1,16 @@
-//! A per-machine PCM handoff for frontends that own their audio backend.
+//! Per-machine frontend PCM output, backed by the shared iris-audio renderer.
 
-use super::HostOut;
+use iris_audio::{Backend, DeviceFormat, Error, OutputRequest, Render, RenderInfo, StreamHandle};
 use rtrb::Consumer;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64},
+    atomic::{AtomicBool, Ordering::Relaxed},
     Arc,
 };
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-/// Called on the device/worker thread when an output is opened. Implementations
-/// should hand the stream to their playback thread and return promptly. There
-/// is no fallback to CPAL when a frontend factory is installed, even on error.
+/// Hand the consumer to the frontend's playback thread and return promptly.
+/// A refusal never falls back to another host audio backend.
 pub trait OutputFactory: std::fmt::Debug + Send + Sync {
     fn open(&self, stream: PcmStream) -> Result<(), String>;
 }
@@ -23,6 +24,19 @@ pub struct PcmStream {
 }
 
 impl PcmStream {
+    /// Create a 100 ms stereo queue for an embedded renderer or a frontend
+    /// fixture. The producer must enqueue interleaved pairs of samples.
+    pub fn channel(source: impl Into<String>) -> (rtrb::Producer<i16>, Self) {
+        let (producer, consumer) = rtrb::RingBuffer::new(9_600);
+        (
+            producer,
+            Self {
+                consumer,
+                source: source.into(),
+            },
+        )
+    }
+
     pub fn sample_rate(&self) -> u32 {
         48_000
     }
@@ -63,32 +77,89 @@ impl PcmStream {
     }
 }
 
-pub(super) fn open(
-    factory: &dyn OutputFactory,
-    underruns: Arc<AtomicU64>,
-    playing: Arc<AtomicBool>,
-    ring_samples: impl Fn(u32) -> usize,
-    who: &str,
-) -> Option<HostOut> {
-    // No more than 100 ms can collect while a frontend is not consuming.
-    let (producer, consumer) = rtrb::RingBuffer::new(ring_samples(48_000).clamp(2, 9_600) & !1);
-    let stream = PcmStream {
-        consumer,
-        source: who.to_owned(),
-    };
-    if let Err(error) = factory.open(stream) {
-        crate::diagnostics::stderr(format_args!("{who}: frontend audio unavailable: {error}"));
-        return None;
+pub(super) struct FrontendBackend(pub Arc<dyn OutputFactory>);
+
+struct FrontendStream {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StreamHandle for FrontendStream {
+    fn device(&self) -> String {
+        "frontend PCM".into()
     }
-    Some(HostOut {
-        channels: 2,
-        _file: None,
-        stream_rate: 48_000,
-        producer,
-        underruns,
-        playing,
-        _stream: None,
-    })
+}
+
+impl Drop for FrontendStream {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Backend for FrontendBackend {
+    fn name(&self) -> &'static str {
+        "frontend"
+    }
+
+    fn open_output(
+        &self,
+        request: &OutputRequest,
+        mut render: Box<dyn Render>,
+    ) -> Result<Box<dyn StreamHandle>, Error> {
+        // Preserve the frontend's fixed stereo interface and 100 ms bound.
+        // iris-audio handles device-rate changes, mixing and channel mapping.
+        let (mut producer, stream) = PcmStream::channel(request.name.clone());
+        self.0.open(stream).map_err(|message| Error::Backend {
+            backend: "frontend",
+            message,
+        })?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread =
+            std::thread::Builder::new()
+                .name("frontend PCM".into())
+                .spawn(move || {
+                    render.configure(DeviceFormat {
+                        rate: 48_000,
+                        channels: 2,
+                    });
+                    let start = Instant::now();
+                    let mut played = 0u64;
+                    let mut samples = [0.0f32; 9_600];
+                    while !stopped.load(Relaxed) && !producer.is_abandoned() {
+                        std::thread::sleep(Duration::from_millis(5));
+                        let due = (start.elapsed().as_nanos() * 48_000 / 1_000_000_000) as u64;
+                        let frames = (due - played).min(4_800) as usize;
+                        played = due;
+                        if frames == 0 {
+                            continue;
+                        }
+                        let info = RenderInfo {
+                            device_delay: Some(Duration::from_secs_f64(
+                                (9_600 - producer.slots()) as f64 / 96_000.0,
+                            )),
+                            device_underruns: 0,
+                        };
+                        render.render(&mut samples[..frames * 2], &info);
+                        let count = (frames * 2).min(producer.slots() & !1);
+                        if count != 0 {
+                            producer
+                                .write_chunk_uninit(count)
+                                .expect("single PCM producer")
+                                .fill_from_iter(samples[..count].iter().map(|&v| {
+                                    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+                                }));
+                        }
+                    }
+                })?;
+        Ok(Box::new(FrontendStream {
+            stop,
+            thread: Some(thread),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -112,41 +183,63 @@ mod tests {
     }
 
     #[test]
-    fn frontend_output_is_bounded_preserves_channels_and_reports_close() {
-        let factory = Arc::new(Capture::default());
-        let audio = AudioConfig {
-            output: Some(factory.clone()),
-            ..AudioConfig::default()
-        };
-        let mut out = crate::host_audio::open_output(
-            &audio,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicBool::new(true)),
-            |_| usize::MAX,
-            "test",
-            "IRIS_TEST_NO_CAPTURE",
-        )
-        .unwrap();
-        let mut stream = factory.0.lock().unwrap().take().unwrap();
-        assert_eq!(out.producer.slots(), 9_600);
+    fn bounded_pcm_keeps_stereo_frames_through_wrap_and_discard() {
+        let (mut producer, mut stream) = PcmStream::channel("test");
         for _ in 0..4_800 {
-            out.producer.push(123).unwrap();
-            out.producer.push(-456).unwrap();
+            producer.push(123).unwrap();
+            producer.push(-456).unwrap();
         }
-        assert!(out.producer.push(999).is_err());
+        assert!(producer.push(999).is_err());
         let mut samples = [0; 3];
         assert_eq!(stream.read(&mut samples), 2);
         assert_eq!(samples, [123, -456, 0]);
-        // Wrap the ring, then discard an odd request without losing L/R order.
-        out.producer.push(123).unwrap();
-        out.producer.push(-456).unwrap();
+        producer.push(123).unwrap();
+        producer.push(-456).unwrap();
         stream.discard(3);
         assert_eq!(stream.read(&mut samples), 2);
         assert_eq!(samples, [123, -456, 0]);
         stream.discard(usize::MAX);
         assert_eq!(stream.pending_samples(), 0);
         assert!(!stream.is_closed());
-        drop(out);
+        drop(producer);
+        assert!(stream.is_closed());
+    }
+
+    #[test]
+    fn shared_renderer_reaches_frontend_and_last_voice_drop_closes_it() {
+        let factory = Arc::new(Capture::default());
+        let config = AudioConfig {
+            output: Some(factory.clone()),
+            prebuf_ms: 0,
+            ..Default::default()
+        };
+        let mut voices = crate::host_audio::open_outputs(
+            &config,
+            "test",
+            2,
+            &[48_000, 24_000],
+            "IRIS_TEST_NO_CAPTURE",
+        )
+        .unwrap();
+        let mut stream = factory.0.lock().unwrap().take().unwrap();
+        assert_eq!(stream.sample_rate(), 48_000);
+        assert_eq!(stream.source(), "test");
+        voices[0].write(&[4000i16, -8000].repeat(4000));
+        voices[1].write(&[0i16, 0].repeat(2000));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut heard = false;
+        while Instant::now() < deadline && !heard {
+            let mut samples = [0; 9600];
+            let n = stream.read(&mut samples);
+            heard = samples[..n]
+                .chunks_exact(2)
+                .any(|f| f[0] > 3000 && f[1] < -6000);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(heard, "rendered stereo must reach the frontend");
+        voices.pop();
+        assert!(!stream.is_closed());
+        drop(voices);
         assert!(stream.is_closed());
     }
 
@@ -159,23 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn refused_frontend_does_not_open_cpal_and_factory_is_not_serialized() {
+    fn refusal_never_falls_back_and_factory_is_not_serialized() {
         let config = AudioConfig {
             output: Some(Arc::new(Refuse)),
-            ..AudioConfig::default()
+            host: crate::config::AudioHost::Null,
+            ..Default::default()
         };
-        assert!(crate::host_audio::open_output(
-            &config,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicBool::new(false)),
-            |_| 100,
-            "test",
-            "IRIS_TEST_NO_CAPTURE"
-        )
-        .is_none());
+        assert!(
+            crate::host_audio::open_output(&config, "test", 2, 48_000, "IRIS_TEST_NO_CAPTURE")
+                .is_none()
+        );
         let text = toml::to_string(&config).unwrap();
         assert!(!text.contains("output"));
-        let loaded: AudioConfig = toml::from_str(&text).unwrap();
-        assert!(loaded.output.is_none());
+        assert!(toml::from_str::<AudioConfig>(&text)
+            .unwrap()
+            .output
+            .is_none());
     }
 }
