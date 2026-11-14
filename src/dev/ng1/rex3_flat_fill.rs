@@ -22,7 +22,8 @@ pub(crate) enum FillPlane {
 ///
 /// The rectangle is `min_x..min_x + width`, `min_y..min_y + height`.
 /// Although the planes have 2048 columns, CPU/JIT writes stop at column
-/// 1344. `color` and `write_mask` retain all 32 bits of the framebuffer word.
+/// 1344. `color` and `write_mask` use framebuffer storage order; RGB24
+/// masks are decoded from the physical WRMASK plane order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlatFill {
     pub(crate) plane: FillPlane,
@@ -189,7 +190,14 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     let max_x = x1.min(REX3_SCREEN_WIDTH - 1);
     let min_y = y0.max(0);
     let max_y = y1.min(REX3_SCREEN_HEIGHT - 1);
-    let fill = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
+    // RGB24 WRMASK names physical VRAM planes, while this fill writes the
+    // packed BGR framebuffer, just like the CPU and JIT write stages.
+    let write_mask = if plane == FillPlane::Rgb {
+        super::rex3_generic::rgb24_planes_to_bgr(context.wrmask)
+    } else {
+        context.wrmask
+    };
+    let fill = if min_x > max_x || min_y > max_y || write_mask == 0 {
         None
     } else {
         let raw_color = (context.get_colori() & 0x00FF_FFFF)
@@ -209,7 +217,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
             width: (max_x - min_x + 1) as u32,
             height: (max_y - min_y + 1) as u32,
             color,
-            write_mask: context.wrmask,
+            write_mask,
         })
     };
     let advance = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
@@ -431,7 +439,7 @@ mod tests {
                     width: 2,
                     height: 1,
                     color: 0x7A33_2211,
-                    write_mask: 0xAA00_00FF,
+                    write_mask: 0x00C0_E0E0,
                 })
             );
             assert_eq!(

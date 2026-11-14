@@ -64,6 +64,7 @@ impl Ng1DisplayGenerations {
 pub(crate) struct Ng1DisplaySource<'a> {
     pub(crate) generations: Ng1DisplayGenerations,
     pub(crate) did: &'a [u8],
+    pub(crate) resident_did: &'a Mutex<Option<crate::dev::ng1::wgpu::direct::ResidentDid>>,
     pub(crate) xmap_mode: &'a [u32; 32],
     pub(crate) xmap_config: u8,
     pub(crate) xmap_cursor_cmap: u8,
@@ -143,6 +144,8 @@ pub struct Rex3Screen {
     display_generations: Ng1DisplayGenerations,
     #[cfg(all(test, feature = "wgpu"))]
     display_geometry: (usize, usize, usize, i32),
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_did: Mutex<Option<crate::dev::ng1::wgpu::direct::ResidentDid>>,
 }
 
 impl Rex3Screen {
@@ -181,10 +184,18 @@ impl Rex3Screen {
             display_generations: Ng1DisplayGenerations::new(),
             #[cfg(all(test, feature = "wgpu"))]
             display_geometry: (0, 0, 0, 0),
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_did: Mutex::new(None),
         }
     }
 
-    fn decode_did(&mut self) -> bool {
+    fn decode_did_into(
+        vc2_regs: &[u16; 32],
+        vc2_ram: &[u16],
+        width: usize,
+        height: usize,
+        did_buf: &mut [u8],
+    ) -> bool {
         fn fill(dst: &mut [u8], value: u8) -> bool {
             #[cfg(all(test, feature = "wgpu"))]
             let changed = dst.iter().any(|&old| old != value);
@@ -194,18 +205,15 @@ impl Rex3Screen {
             changed
         }
 
-        let display_ctrl = self.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
+        let display_ctrl = vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
         if (display_ctrl & VC2_CTRL_DID_EN) == 0 {
-            return fill(&mut self.did, 0);
+            return fill(did_buf, 0);
         }
 
         let mut changed = false;
-        let did_ptr  = self.vc2_regs[VC2_REG_DID_ENTRY_PTR as usize];
-        let scan_len = (self.vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize;
-        let width    = self.width;
-        let height   = self.height;
-        let ram      = &self.vc2_ram;
-        let did_buf  = &mut self.did;
+        let did_ptr  = vc2_regs[VC2_REG_DID_ENTRY_PTR as usize];
+        let scan_len = (vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize;
+        let ram      = vc2_ram;
 
         let effective_len = if scan_len > 0 && scan_len <= 2048 { scan_len } else { width };
 
@@ -256,6 +264,29 @@ impl Rex3Screen {
             y += 1; table_idx += 1;
         }
         changed
+    }
+
+    fn decode_did(&mut self) -> bool {
+        Self::decode_did_into(
+            &self.vc2_regs,
+            &self.vc2_ram,
+            self.width,
+            self.height,
+            &mut self.did,
+        )
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn decoded_did_oracle(&self) -> Vec<u8> {
+        let mut did = self.did.clone();
+        Self::decode_did_into(
+            &self.vc2_regs,
+            &self.vc2_ram,
+            self.width,
+            self.height,
+            &mut did,
+        );
+        did
     }
 
     // Returns (width, height, cursor_x_adjust).
@@ -331,13 +362,14 @@ impl Rex3Screen {
 
     /// Snapshot Newport display controls and tables without accessing either
     /// CPU framebuffer. Returns `true` if the display resolution changed.
-    pub(crate) fn refresh_display_state(
+    fn refresh_display_state_inner(
         &mut self,
         vc2: &Mutex<Vc2>,
         xmap: &Mutex<Xmap9>,
         cmap: &Mutex<Cmap>,
         bt445: &Mutex<Bt445>,
         diag: &AtomicU64,
+        decode_did: bool,
     ) -> bool {
         let mut resized = false;
 
@@ -434,17 +466,42 @@ impl Rex3Screen {
             resized = true;
         }
 
-        diag.fetch_or(Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
-        let did_changed = self.decode_did();
-        #[cfg(all(test, feature = "wgpu"))]
-        if did_changed {
-            Ng1DisplayGenerations::bump(&mut self.display_generations.did);
+        if decode_did {
+            diag.fetch_or(Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
+            let did_changed = self.decode_did();
+            #[cfg(all(test, feature = "wgpu"))]
+            if did_changed {
+                Ng1DisplayGenerations::bump(&mut self.display_generations.did);
+            }
+            #[cfg(not(all(test, feature = "wgpu")))]
+            let _ = did_changed;
+            diag.fetch_and(!Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
         }
-        #[cfg(not(all(test, feature = "wgpu")))]
-        let _ = did_changed;
-        diag.fetch_and(!Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
 
         resized
+    }
+
+    pub(crate) fn refresh_display_state(
+        &mut self,
+        vc2: &Mutex<Vc2>,
+        xmap: &Mutex<Xmap9>,
+        cmap: &Mutex<Cmap>,
+        bt445: &Mutex<Bt445>,
+        diag: &AtomicU64,
+    ) -> bool {
+        self.refresh_display_state_inner(vc2, xmap, cmap, bt445, diag, true)
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn refresh_resident_display_state(
+        &mut self,
+        vc2: &Mutex<Vc2>,
+        xmap: &Mutex<Xmap9>,
+        cmap: &Mutex<Cmap>,
+        bt445: &Mutex<Bt445>,
+        diag: &AtomicU64,
+    ) -> bool {
+        self.refresh_display_state_inner(vc2, xmap, cmap, bt445, diag, false)
     }
 
     /// Borrow only display state. Geometry includes externally supplied
@@ -459,6 +516,7 @@ impl Rex3Screen {
         Ng1DisplaySource {
             generations: self.display_generations,
             did: &self.did,
+            resident_did: &self.resident_did,
             xmap_mode: &self.xmap_mode,
             xmap_config: self.xmap_config,
             xmap_cursor_cmap: self.xmap_cursor_cmap,
