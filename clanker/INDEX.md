@@ -45,6 +45,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [nanotlb-asid-mutation-flush.md](cpu/nanotlb-asid-mutation-flush.md) | rule | nanotlb must be flushed on ASID mutation, not just on privilege transition |
 | [nutlb-erl-guard-defeats-permission-test.md](cpu/nutlb-erl-guard-defeats-permission-test.md) | history | nutlb: the ERL guard bit defeats the permission test entirely |
 | [r5000-taglo-is-the-r4400-pstate.md](cpu/r5000-taglo-is-the-r4400-pstate.md) | rule | R5000 L1 TagLo uses the R4400 PState encoding |
+| [r5000-config-cache-lines.md](cpu/r5000-config-cache-lines.md) | rule | R5000 Config IB/DB stay read-only across K0 writes |
 | [r5k-l1i-cache-bugs.md](cpu/r5k-l1i-cache-bugs.md) | open | R5000 secondary cache: no working configuration currently exists |
 | [sc-succeeds-on-llbit-alone.md](cpu/sc-succeeds-on-llbit-alone.md) | rule | `SC` succeeds on the LLbit alone — `LLAddr` is not a gate |
 | [tcache-discards-dirty-data-semantics.md](cpu/tcache-discards-dirty-data-semantics.md) | rule | tcache makes L1-D write-through, so Hit_Invalidate cannot discard |

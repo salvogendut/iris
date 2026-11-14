@@ -2299,6 +2299,14 @@ impl MipsCore {
                 let mask = 0x3F;
                 #[cfg(feature = "r5ksc_triton")]
                 let mask = 0x103F; // adds bit 12 (SE)
+                // R5000 primary lines are fixed at 32 bytes: Config IB/DB
+                // are read-only (VR5000 UM 6.5.8, pp.129-131). NetBSD writes
+                // K0 without copying these fields; R4400 permits resizing.
+                let mask = if self.cp0_prid & 0xff00 == 0x2300 {
+                    mask & !0x30
+                } else {
+                    mask
+                };
                 let old = self.cp0_config;
                 let new = (old & !mask) | ((value as u32) & mask);
                 if new != old {

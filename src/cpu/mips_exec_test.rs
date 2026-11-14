@@ -263,6 +263,30 @@ mod tests {
         assert_eq!(core.fpu_fir,  0x0000_2300, "R5000 FIR after reset");
     }
 
+    /// R5000 Config IB/DB describe fixed 32-byte lines (VR5000 UM 6.5.8).
+    /// NetBSD writes K0 without copying those read-only fields back.
+    #[test]
+    fn config_writes_preserve_r5000_fixed_cache_lines() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(prid: u32, fixed: bool) {
+            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let cfg = MipsCpuConfig::indy().with_prid(prid);
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg);
+            let before = exec.core.read_cp0(16);
+            if fixed { assert_eq!(before & 0x30, 0x30); }
+            for value in [0u64, 3, 0x30, 7] {
+                exec.core.write_gpr(8, value);
+                assert_eq!(exec.exec(0x4088_8000), EXEC_COMPLETE); // mtc0 t0, Config
+                let after = exec.core.read_cp0(16);
+                assert_eq!(after & 7, value & 7, "K0 remains writable");
+                assert_eq!(after & 0x30, if fixed { 0x30 } else { value & 0x30 });
+                assert_eq!(after & !0x3f, before & !0x3f, "cache sizes and other fields stay intact");
+            }
+        }
+        check::<R4400Cache>(0x0450, false);
+        check::<crate::cpu::mips_cache_v2::R5000Cache>(0x2310, true);
+        check::<crate::cpu::mips_cache_v2::R5000Cache>(0x2321, true);
+    }
+
     /// IP28's play_hello_tune returns before touching HAL2 on pre-2.0 CPUs.
     /// Check both cache models and the live CP0 value after construction/reset.
     #[test]

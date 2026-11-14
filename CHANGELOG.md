@@ -21,6 +21,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### R5000 cache configuration
+
+- R5000 Config writes retain its fixed primary cache-line size, avoiding
+  NetBSD's early cache-geometry panic. R4400 cache-line selection is unchanged.
+
 ### Bench rig
 
 - The bare-metal bench rig (`[testdev]`) takes `cpu = "r14000_500"`, the
