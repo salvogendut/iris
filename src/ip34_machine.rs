@@ -337,6 +337,9 @@ impl Workstation for FuelMachine {
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.cpu.fasttick_count()
     }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        vec![(self.cpu.cycles_ptr(), self.cpu.fasttick_count())]
+    }
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
         self.ci_serial.clone()
     }
@@ -362,6 +365,10 @@ impl Workstation for FuelMachine {
     fn pending_chd_sync_count(&self) -> usize {
         (0..2).map(|channel| self.board.scsi.bus_for_channel(channel).unwrap().pending_chd_sync_count()).sum()
     }
+    fn frontend_scsi_bus(&self, controller: u8) -> Option<&crate::scsi::ScsiBus> {
+        self.board.scsi.bus_for_channel(controller)
+    }
+
     fn flush_disks(&self) -> std::io::Result<()> {
         self.board.flush_disks()
     }

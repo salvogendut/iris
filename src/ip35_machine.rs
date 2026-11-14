@@ -599,6 +599,9 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.cpu().fasttick_count()
     }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.units.iter().map(|u| (u.cpu.cycles_ptr(), u.cpu.fasttick_count())).collect()
+    }
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
         self.ci_serial.clone()
     }
@@ -625,6 +628,11 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
     fn pending_chd_sync_count(&self) -> usize {
         self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()
     }
+    fn frontend_fibre_bus(&self) -> Option<&crate::scsi::ScsiBus> {
+        use crate::scsi_monitor::ScsiTargets;
+        self.io.fibre.as_ref().map(|card| card.scsi_bus())
+    }
+
     fn flush_disks(&self) -> std::io::Result<()> {
         self.disk_buses().iter().try_for_each(|b| b.flush())
     }

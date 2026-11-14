@@ -100,6 +100,13 @@ it. The router releases its own lock before invoking or dropping a sink.
 Changing routing affects reporting only; bus exceptions and cache writes still
 occur normally. `set_sink(None)` restores the standalone console behavior.
 
+Embedding frontends can obtain the newer platforms' onboard SCSI buses with
+`Workstation::frontend_scsi_bus`, or the IP35 Fibre Channel loop with
+`frontend_fibre_bus`. Attach and detach targets only while the machine is stopped
+and its machine-slot lock is held. The borrowed bus never outlives the workstation;
+a target callback must not acquire its controller lock. These optional methods
+return `None` on a machine without that bus.
+
 SCSI storage follows the same pattern one level down. `ScsiTarget` is what
 varies on a bus (a `ScsiDevice` disk or CD-ROM, a `DaynaPort`): `request`,
 the lifecycle, and optional behaviour with do-nothing defaults (a
@@ -269,6 +276,8 @@ back, so a backend keeps at most a byte or two per client.
 
 Embedded frontends can supply `MachineConfig.serial_backends.a`/`.b` as
 `Arc<dyn SerialBackend>` transports before constructing any supported machine.
+Fuel, Tezro and IP35 brick machines also accept `serial_backends.l1`, and
+Tezro accepts `.c` and `.d`. Their IOC3/IOC4 A/B ports honour the same overrides.
 These runtime-only fields are skipped by serde. An override replaces that
 channel's TCP/Unix endpoints; log tees and CI fanout remain active. `None`
 preserves standalone behavior. Both callbacks run on device threads and must
@@ -1122,3 +1131,8 @@ what CI runs and how to read its results.
 - [SGI driver programmer's guide — address spaces](https://tqd1.physik.uni-freiburg.de/library/SGI_bookshelves/SGI_Developer/books/DevDriver_PG/sgi_html/ch01.html)
 - MAME's `newport.cpp` for the REX3 drawing engine; MAME's R4000 core for TLB
   behaviour.
+
+Embedding frontends should use `Workstation::cpu_counters()` for processor activity,
+including serial-only IP27/IP35/Fuel machines. Its counters enumerate the actual
+processors and do not require a graphics display. Read them only while the
+workstation is alive.

@@ -276,6 +276,18 @@ pub trait Workstation: Send {
 
     // ---- optional facilities ----
 
+    /// Storage buses exposed to an embedding frontend. Attach/detach only
+    /// while stopped, under the machine slot lock; bus callbacks must not
+    /// re-enter a controller. The frontend may wrap nodes for activity LEDs.
+    fn frontend_scsi_bus(&self, _controller: u8) -> Option<&crate::scsi::ScsiBus> {
+        None
+    }
+    /// Fibre Channel loop, separate from the onboard SCSI controllers.
+    fn frontend_fibre_bus(&self) -> Option<&crate::scsi::ScsiBus> {
+        None
+    }
+
+
     /// Load an ELF into RAM before the CPU starts (`--load-elf`).
     fn load_elf(&self, _path: &str) -> Result<String, String> {
         Err(NOT_HERE.into())

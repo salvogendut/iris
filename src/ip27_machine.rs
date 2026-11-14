@@ -760,6 +760,9 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.units[0].cpu.fasttick_count()
     }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.units.iter().map(|u| (u.cpu.cycles_ptr(), u.cpu.fasttick_count())).collect()
+    }
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
         self.io.console.clone()
     }
@@ -787,6 +790,10 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
     fn pending_chd_sync_count(&self) -> usize {
         self.io.scsi.iter().map(|c| c.bus().pending_chd_sync_count()).sum()
     }
+    fn frontend_scsi_bus(&self, controller: u8) -> Option<&crate::scsi::ScsiBus> {
+        self.io.scsi.get(usize::from(controller)).map(|scsi| scsi.bus())
+    }
+
     fn flush_disks(&self) -> std::io::Result<()> {
         self.io.scsi.iter().try_for_each(|c| c.bus().flush())
     }

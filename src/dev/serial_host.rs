@@ -45,6 +45,10 @@ pub trait SerialBackend: Send + Sync {
 pub struct HostBackends {
     pub a: Option<Arc<dyn SerialBackend>>,
     pub b: Option<Arc<dyn SerialBackend>>,
+    /// Extra platform serial lines; runtime-only, like A and B.
+    pub l1: Option<Arc<dyn SerialBackend>>,
+    pub c: Option<Arc<dyn SerialBackend>>,
+    pub d: Option<Arc<dyn SerialBackend>>,
 }
 
 impl std::fmt::Debug for HostBackends {
@@ -52,6 +56,9 @@ impl std::fmt::Debug for HostBackends {
         f.debug_struct("HostBackends")
             .field("a", &self.a.is_some())
             .field("b", &self.b.is_some())
+            .field("l1", &self.l1.is_some())
+            .field("c", &self.c.is_some())
+            .field("d", &self.d.is_some())
             .finish()
     }
 }

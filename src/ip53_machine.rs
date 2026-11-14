@@ -842,6 +842,10 @@ impl Workstation for TezroMachine {
     fn pending_chd_sync_count(&self) -> usize {
         self.scsi_buses().iter().map(|bus| bus.pending_chd_sync_count()).sum()
     }
+    fn frontend_scsi_bus(&self, controller: u8) -> Option<&crate::scsi::ScsiBus> {
+        self.board.scsi.bus_for_channel(controller)
+    }
+
     fn flush_disks(&self) -> std::io::Result<()> {
         self.board.flush_disks()
     }

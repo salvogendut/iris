@@ -347,6 +347,8 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 
 ## gui/
 
+- [frontend-platform-ports-and-counters.md](gui/frontend-platform-ports-and-counters.md) — rule: inject platform serial transports and enumerate CPUs independently of graphics.
+
 `iris-gui` and the standalone window: threading, input capture, keyboards, platform crashes.
 
 | Note | Kind | Title |
