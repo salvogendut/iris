@@ -634,6 +634,9 @@ straight through.
   in both address modes: a 32-bit user access must not match a 64-bit kernel
   mapping that shares its low address bits. Refill-vector selection still
   follows the current mode.
+- O2 CPU translation preserves the MACE PCI interval at physical 4–12 GB
+  before legacy RAM folding and the no-ECC alias. The physical bus maps the
+  low and wide PCI windows separately, including published BAR runs.
 - Three access paths: `fetch_instr()` (I-cache), `read_data()` /
   `write_data()` (D-cache), and `debug_read()` / `debug_write()`, which use
   kernel privilege, never change CP0 and ignore breakpoints.

@@ -85,7 +85,7 @@ impl Mace {
 
     /// Whether MACE answers `addr`: its own 8 MB or a PCI window.
     pub fn contains(addr: u32) -> bool {
-        (MACE_BASE..MACE_BASE + MACE_SIZE).contains(&addr) || MacePci::in_window(addr)
+        (MACE_BASE..MACE_BASE + MACE_SIZE).contains(&addr) || MacePci::in_window(addr as u64)
     }
 
     /// Plug in PS/2 devices: a keyboard on port 0 and, with `mouse`, a mouse
@@ -290,10 +290,12 @@ impl Mace {
     }
 }
 
-// MACE decodes 32 bits: `a` is the address its decode helpers take, and the
-// full bus address goes on to the block that answers.
+// Decode PCI windows at full width before narrowing onboard register offsets.
 impl BusDevice for Mace {
     fn read8(&self, addr: u64) -> BusRead8 {
+        if MacePci::in_window(addr) {
+            return BusRead8::ok(self.pci.window_read(addr, 1) as u8);
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::read8(&*self.mec, addr);
@@ -306,9 +308,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.read8(addr);
-        }
-        if MacePci::in_window(a) {
-            return BusRead8::ok(self.pci.window_read(a, 1) as u8);
         }
         if Self::in_ps2(a) {
             return BusDevice::read8(&self.ps2, addr);
@@ -331,6 +330,9 @@ impl BusDevice for Mace {
     }
 
     fn read16(&self, addr: u64) -> BusRead16 {
+        if MacePci::in_window(addr) {
+            return BusRead16::ok(self.pci.window_read(addr, 2) as u16);
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::read16(&*self.mec, addr);
@@ -340,9 +342,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.read16(addr);
-        }
-        if MacePci::in_window(a) {
-            return BusRead16::ok(self.pci.window_read(a, 2) as u16);
         }
         if Self::in_ps2(a) {
             return BusDevice::read16(&self.ps2, addr);
@@ -365,6 +364,9 @@ impl BusDevice for Mace {
     }
 
     fn read32(&self, addr: u64) -> BusRead32 {
+        if MacePci::in_window(addr) {
+            return BusRead32::ok(self.pci.window_read(addr, 4) as u32);
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::read32(&*self.mec, addr);
@@ -384,9 +386,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.read32(addr);
-        }
-        if MacePci::in_window(a) {
-            return BusRead32::ok(self.pci.window_read(a, 4) as u32);
         }
         if Self::in_ps2(a) {
             return BusDevice::read32(&self.ps2, addr);
@@ -411,6 +410,9 @@ impl BusDevice for Mace {
     }
 
     fn read64(&self, addr: u64) -> BusRead64 {
+        if MacePci::in_window(addr) {
+            return BusRead64::ok(self.pci.window_read(addr, 8));
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::read64(&*self.mec, addr);
@@ -429,9 +431,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.read64(addr);
-        }
-        if MacePci::in_window(a) {
-            return BusRead64::ok(self.pci.window_read(a, 8));
         }
         if Self::in_ps2(a) {
             return BusDevice::read64(&self.ps2, addr);
@@ -454,6 +453,10 @@ impl BusDevice for Mace {
     }
 
     fn write8(&self, addr: u64, val: u8) -> u32 {
+        if MacePci::in_window(addr) {
+            self.pci.window_write(addr, val as u64, 1);
+            return BUS_OK;
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::write8(&*self.mec, addr, val);
@@ -467,10 +470,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.write8(addr, val);
-        }
-        if MacePci::in_window(a) {
-            self.pci.window_write(a, val as u64, 1);
-            return BUS_OK;
         }
         if Self::in_ps2(a) {
             return BusDevice::write8(&self.ps2, addr, val);
@@ -498,6 +497,10 @@ impl BusDevice for Mace {
     }
 
     fn write16(&self, addr: u64, val: u16) -> u32 {
+        if MacePci::in_window(addr) {
+            self.pci.window_write(addr, val as u64, 2);
+            return BUS_OK;
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::write16(&*self.mec, addr, val);
@@ -507,10 +510,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.write16(addr, val);
-        }
-        if MacePci::in_window(a) {
-            self.pci.window_write(a, val as u64, 2);
-            return BUS_OK;
         }
         if Self::in_ps2(a) {
             return BusDevice::write16(&self.ps2, addr, val);
@@ -538,6 +537,10 @@ impl BusDevice for Mace {
     }
 
     fn write32(&self, addr: u64, val: u32) -> u32 {
+        if MacePci::in_window(addr) {
+            self.pci.window_write(addr, val as u64, 4);
+            return BUS_OK;
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::write32(&*self.mec, addr, val);
@@ -560,10 +563,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.write32(addr, val);
-        }
-        if MacePci::in_window(a) {
-            self.pci.window_write(a, val as u64, 4);
-            return BUS_OK;
         }
         if Self::in_ps2(a) {
             return BusDevice::write32(&self.ps2, addr, val);
@@ -591,6 +590,10 @@ impl BusDevice for Mace {
     }
 
     fn write64(&self, addr: u64, val: u64) -> u32 {
+        if MacePci::in_window(addr) {
+            self.pci.window_write(addr, val, 8);
+            return BUS_OK;
+        }
         let a = addr as u32;
         if Self::in_mec(a) {
             return BusDevice::write64(&*self.mec, addr, val);
@@ -611,10 +614,6 @@ impl BusDevice for Mace {
         }
         if let Some(c) = self.com_for(a) {
             return c.write64(addr, val);
-        }
-        if MacePci::in_window(a) {
-            self.pci.window_write(a, val, 8);
-            return BUS_OK;
         }
         if Self::in_ps2(a) {
             return BusDevice::write64(&self.ps2, addr, val);

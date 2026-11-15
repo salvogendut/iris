@@ -57,13 +57,10 @@ pub const PCI_MEM_PCI_BASE: u32 = 0x8000_0000;
 pub const PCI_IO_BASE: u32 = 0x1800_0000;
 pub const PCI_IO_SIZE: u32 = 0x0200_0000;
 
-/// PCI memory's second, one-to-one window, from physical 0x2_8000_0000. A
-/// 64-bit kernel (OpenBSD's) reaches devices there; the PROM and NetBSD use
-/// the low window above. Physical addresses reach this bus as 32 bits, so it
-/// arrives as 0x8000_0000 and up. CRIME's no-ECC memory alias has the same
-/// low 32 bits (0x00_8000_0000); the CPU folds that one onto memory before it
-/// gets here ([`crate::ip32::NO_ECC_BASE`]).
-pub const PCI_HI_MEM_BASE: u32 = 0x8000_0000;
+/// Full PCI windows from the MACE specification, section 9.3.
+/// Keep them distinct from CRIME's no-ECC RAM alias at 0x8000_0000.
+pub const PCI_HI_MEM_BASE: u64 = 0x2_8000_0000;
+pub const PCI_HI_IO_BASE: u64 = 0x1_0000_0000;
 
 /// Host memory on the PCI bus, as bus masters see it (MACE spec 9.3.1): the
 /// low gigabyte is the "byte-swapped view", the next the "native view",
@@ -206,33 +203,36 @@ impl MacePci {
         &self.bus
     }
 
-    /// The CPU's three windows onto PCI: I/O, memory low and memory high.
+    /// The low KSEG1 windows and the full-width PCI windows.
     fn windows() -> Vec<CpuWindow> {
-        let w = |space, cpu: u32, pci: u32, len: u64| CpuWindow { space, cpu: cpu as u64, pci, len, mask: 0xffff_ffff };
+        let w = |space, cpu: u64, pci: u32, len: u64| CpuWindow { space, cpu, pci, len, mask: u64::MAX };
         vec![
-            w(Space::Io, PCI_IO_BASE, 0, PCI_IO_SIZE as u64),
-            w(Space::Mem, PCI_MEM_BASE, PCI_MEM_PCI_BASE, PCI_MEM_SIZE as u64),
-            w(Space::Mem, PCI_HI_MEM_BASE, PCI_HI_MEM_BASE, (1u64 << 32) - PCI_HI_MEM_BASE as u64),
+            w(Space::Io, PCI_IO_BASE as u64, 0, PCI_IO_SIZE as u64),
+            w(Space::Mem, PCI_MEM_BASE as u64, PCI_MEM_PCI_BASE, PCI_MEM_SIZE as u64),
+            w(Space::Io, PCI_HI_IO_BASE, 0, 1 << 32),
+            w(Space::Mem, PCI_HI_MEM_BASE, PCI_MEM_PCI_BASE, 1 << 31),
         ]
     }
 
-    /// Whether `addr` is in one of the CPU's windows onto PCI memory.
-    pub fn in_window(addr: u32) -> bool {
-        (PCI_MEM_BASE..PCI_MEM_BASE + PCI_MEM_SIZE).contains(&addr)
-            || Self::in_io_window(addr)
-            || addr >= PCI_HI_MEM_BASE
+    pub fn in_window(addr: u64) -> bool {
+        (addr.wrapping_sub(PCI_MEM_BASE as u64) < PCI_MEM_SIZE as u64)
+            || Self::io_addr_of(addr).is_some()
+            || (addr.wrapping_sub(PCI_HI_MEM_BASE) < (1 << 31))
     }
 
-    fn in_io_window(addr: u32) -> bool {
-        (PCI_IO_BASE..PCI_IO_BASE + PCI_IO_SIZE).contains(&addr)
-    }
-
-    /// The PCI address a CPU address in a window reaches.
-    fn pci_addr_of(addr: u32) -> u32 {
-        if addr >= PCI_HI_MEM_BASE {
-            return addr;
+    fn io_addr_of(addr: u64) -> Option<u32> {
+        if addr.wrapping_sub(PCI_IO_BASE as u64) < PCI_IO_SIZE as u64 {
+            Some((addr - PCI_IO_BASE as u64) as u32)
+        } else if addr.wrapping_sub(PCI_HI_IO_BASE) < (1 << 32) {
+            Some((addr - PCI_HI_IO_BASE) as u32)
+        } else {
+            None
         }
-        PCI_MEM_PCI_BASE.wrapping_add(addr.wrapping_sub(PCI_MEM_BASE))
+    }
+
+    fn pci_addr_of(addr: u64) -> u32 {
+        if addr >= PCI_HI_MEM_BASE { return addr as u32; }
+        PCI_MEM_PCI_BASE.wrapping_add((addr as u32).wrapping_sub(PCI_MEM_BASE))
     }
 
     /// The bridge swaps byte order: an 8-bit access at CPU offset `A` reaches
@@ -248,9 +248,10 @@ impl MacePci {
     /// A CPU read of `width` bytes in a PCI window. A doubleword is two
     /// word cycles, the high word first. Nobody claims it: the bus floats
     /// high.
-    pub fn window_read(&self, addr: u32, width: usize) -> u64 {
-        let target = if Self::in_io_window(addr) {
-            self.bus.decode(Space::Io, addr - PCI_IO_BASE)
+    pub fn window_read(&self, addr: impl Into<u64>, width: usize) -> u64 {
+        let addr = addr.into();
+        let target = if let Some(port) = Self::io_addr_of(addr) {
+            self.bus.decode(Space::Io, port)
         } else {
             self.bus.decode(Space::Mem, Self::pci_addr_of(addr))
         };
@@ -261,9 +262,10 @@ impl MacePci {
         }
     }
 
-    pub fn window_write(&self, addr: u32, val: u64, width: usize) {
-        let target = if Self::in_io_window(addr) {
-            self.bus.decode(Space::Io, addr - PCI_IO_BASE)
+    pub fn window_write(&self, addr: impl Into<u64>, val: u64, width: usize) {
+        let addr = addr.into();
+        let target = if let Some(port) = Self::io_addr_of(addr) {
+            self.bus.decode(Space::Io, port)
         } else {
             self.bus.decode(Space::Mem, Self::pci_addr_of(addr))
         };
@@ -480,12 +482,34 @@ mod tests {
         assert_eq!(f.calls(), vec![(0x84, 4)]);
         pci.window_write(PCI_MEM_BASE + 0x1084, 0, 1);
         assert_eq!(f.calls()[1], (0x87, 1), "HCNTRL, by its little-endian lane");
-        pci.window_read(0x8000_1084, 2);
+        pci.window_read(PCI_HI_MEM_BASE + 0x1084, 2);
         assert_eq!(f.calls()[2], (0x86, 2), "and the one-to-one high window");
 
         // Pin A of slot 1 is CRIME input 8.
         f.state().irq().expect("wired at attach").set(true);
         assert_eq!(*crime.0.lock().unwrap(), vec![(8, true)]);
+    }
+
+    #[test]
+    fn high_pci_windows_do_not_claim_ram_alias_or_reserved_addresses() {
+        for a in [0x8000_0000, 0x8000_1084, 0x2_0000_0000, 0x2_7fff_ffff, 0x3_0000_0000] {
+            assert!(!MacePci::in_window(a), "not PCI: {a:x}");
+        }
+        for a in [PCI_HI_IO_BASE, 0x1_ffff_ffff, PCI_HI_MEM_BASE, 0x2_ffff_ffff] {
+            assert!(MacePci::in_window(a), "PCI: {a:x}");
+        }
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = bridge_with(&crime);
+        let f = TestCard::new(bars(), PCI_INTA);
+        pci.bus().attach(at(IP32_SCSI_SLOT), f.clone());
+        let slot = (IP32_SCSI_SLOT as u32) << 11;
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(slot, 4));
+        pci.write32(bridge(macepci_reg::CONFIG_DATA), 0x1001);
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(slot, 1));
+        pci.write32(bridge(macepci_reg::CONFIG_DATA), PCI_COMMAND_IO);
+        pci.window_write(PCI_HI_IO_BASE + 0x1084, 0, 1);
+        pci.window_read(PCI_IO_BASE + 0x1084, 2);
+        assert_eq!(f.calls(), vec![(0x87, 1), (0x86, 2)]);
     }
 
     /// Once a memory BAR is placed and enabled, the pages it decodes in both
@@ -511,14 +535,14 @@ mod tests {
         let got = runs.lock().unwrap().clone();
         let spans: Vec<_> = got.iter().map(|r| (r.cpu, r.cpu + r.len)).collect();
         let low = (PCI_MEM_BASE + 0x1000) as u64;
-        assert_eq!(spans, vec![(low, low + 0x1000), (0x8000_1000, 0x8000_2000)], "the I/O BAR is under a page");
+        assert_eq!(spans, vec![(low, low + 0x1000), (PCI_HI_MEM_BASE + 0x1000, PCI_HI_MEM_BASE + 0x2000)], "the I/O BAR is under a page");
         // The machine builds a BarDevice from each run.
-        let bar = |r: &BarMapping| BarDevice::new(r.function.clone(), r.bar, r.cpu.wrapping_sub(r.off as u64), 0xffff_ffff, ByteOrder::values(4));
+        let bar = |r: &BarMapping| BarDevice::new(r.function.clone(), r.bar, r.cpu.wrapping_sub(r.off as u64), u64::MAX, ByteOrder::values(4));
         assert_eq!(bar(&got[0]).read32(low + 0x84).data, 0);
         assert_eq!(f.calls(), vec![(0x84, 4)]);
         assert_eq!(bar(&got[0]).write8(low + 0x84, 0), BUS_OK);
         assert_eq!(f.calls()[1], (0x87, 1), "HCNTRL, by its little-endian lane");
-        bar(&got[1]).read16(0x8000_1084);
+        bar(&got[1]).read16(PCI_HI_MEM_BASE + 0x1084);
         assert_eq!(f.calls()[2], (0x86, 2));
     }
 

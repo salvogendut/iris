@@ -1307,17 +1307,20 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// A window of physical addresses that reaches memory at another address,
     /// `(base, size, target)`, applied to mapped and XKPHYS translations
     /// after [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
-    /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
-    /// there. None on the other machines.
+    /// 0x8000_0000. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
     /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
-    /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
+    /// CPU drives 36 or 40 bits, but the Indy and Indigo2 decode 32 and
     /// alias the rest away, and IRIX relies on it: its page-table entries keep
     /// software bits (the PFN lock among them) just above the PFN, so they
     /// reach EntryLo and come out as physical address bits 32 and up. All
-    /// ones (no fold) by default; each machine sets its own.
+    /// ones (no fold) by default; each machine sets its own. O2 preserves its
+    /// wide PCI interval with `phys_io_range` before applying this mask.
     pub phys_mask: u64,
+    /// A board's wide I/O interval (base, size), decoded before RAM aliases
+    /// and physical masking. O2 MACE PCI windows must not fold into RAM.
+    pub phys_io_range: Option<(u64, u64)>,
     /// A window of physical addresses the board decodes differently for an
     /// uncached instruction fetch, `(base, size, target)`: the fetch is
     /// presented to the bus at `target` plus the offset into the window. The
@@ -2989,6 +2992,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             batch_hook: None,
             phys_alias: None,
             phys_mask: u64::MAX,
+            phys_io_range: None,
             uncached_fetch_alias: None,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
@@ -5220,8 +5224,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// A CPU physical address as the board decodes it: cut to
     /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
+    /// A wide I/O interval is preserved before either RAM transformation.
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
+        if let Some((base, size)) = self.phys_io_range {
+            if pa.wrapping_sub(base) < size { return pa; }
+        }
         // Cut first: the PTE software bits above the PFN are not part of the
         // address the alias window sees. Window and target lie within the mask.
         let pa = pa & self.phys_mask;

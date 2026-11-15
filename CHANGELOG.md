@@ -21,6 +21,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### O2 native NetBSD boot
+
+- N64 NetBSD on O2 reaches a native single-user shell instead of trapping
+  during SCSI attachment. Both Adaptec controllers now attach correctly.
+
 ### R5000 cache configuration
 
 - R5000 Config writes retain its fixed primary cache-line size, avoiding

@@ -4778,6 +4778,21 @@ mod tests {
         assert_eq!(exec.debug_translate(va).phys, 0x2040_44d4);
     }
 
+    #[test]
+    fn wide_io_precedes_ram_folding_and_aliases() {
+        let (mut exec, _mem) = create_executor();
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_KX;
+        exec.resync_privilege_state();
+        exec.phys_mask = u32::MAX as u64;
+        exec.phys_alias = Some((0x8000_0000, 0x4000_0000, 0x4000_0000));
+        exec.phys_io_range = Some((0x1_0000_0000, 0x2_0000_0000));
+        for pa in [0x1_0000_1084, 0x1_ffff_ffff, 0x2_0000_0000, 0x2_8000_0084, 0x2_ffff_ffff] {
+            assert_eq!(exec.debug_translate(0x9000_0000_0000_0000 | pa).phys, pa);
+        }
+        assert_eq!(exec.debug_translate(0x9000_0000_8000_0084).phys, 0x4000_0084);
+        assert_eq!(exec.debug_translate(0x9000_0006_2040_44d4).phys, 0x2040_44d4);
+    }
+
     /// The other half: SC must still FAIL when the LLbit is clear (an
     /// intervening exception/ERET, or no LL at all). Guards against "fixing"
     /// the LLAddr check by making SC unconditionally succeed.

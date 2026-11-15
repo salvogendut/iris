@@ -397,10 +397,12 @@ impl O2Machine {
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
         exec.core.set_count_hz(count_hz.max(1));
-        // The no-ECC alias of memory reaches memory, not the PCI window the
-        // bus decodes at the same low 32 bits.
+        // CRIME's no-ECC alias reaches the same RAM backing as its normal view.
         exec.phys_alias = Some((NO_ECC_BASE, RAM_WINDOW_SIZE as u64, RAM_BASE as u64));
-        // CRIME's decode, like the MC's, is modelled on the low 32 bits.
+        // MACE's wide PCI windows precede the legacy RAM folding below.
+        // The intervening reserved range must not alias RAM either.
+        exec.phys_io_range = Some((0x1_0000_0000, 0x2_0000_0000));
+        // Preserve the existing folding of addresses outside that interval.
         exec.phys_mask = u32::MAX as u64;
         exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             let pc = exec.core.pc as u32;

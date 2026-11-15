@@ -1,6 +1,11 @@
-# The Indy, Indigo2 and O2 decode only 32 physical address bits
+# The Indy/Indigo2 fold high physical bits; O2 PCI is an exception
 
-Status: rule (2026-10-26).
+Status: rule, corrected 2026-11-15 for O2.
+
+The original O2 generalization was incorrect: MACE has wide PCI windows.
+See [O2 wide PCI decode](o2-wide-pci-must-not-alias-ram.md). The observations
+below concern the IP28 stack; O2 retains legacy folding outside its wide I/O
+interval, but high PCI addresses are decoded before folding and RAM aliasing.
 
 **Symptom.** After the bus and `TranslateResult.phys` went 64-bit, the IP28
 (R10000) guest flooded stderr with `MC: CPU Error at 20404000` and never got

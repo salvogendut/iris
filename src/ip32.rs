@@ -593,9 +593,9 @@ impl Ip32Bus {
             unsafe { self.phys.map_borrowed(start, end, &self.mace, "mace") };
         }
         for r in &new {
-            // MACE's three windows share one set of order, so a run needs
+            // MACE's four windows share one byte order, so a run needs
             // nothing from the window it lies in.
-            self.phys.map(r.cpu, r.cpu + r.len, self.bar_devices.get(r, 0xffff_ffff, ByteOrder::values(4)), "pci bar");
+            self.phys.map(r.cpu, r.cpu + r.len, self.bar_devices.get(r, u64::MAX, ByteOrder::values(4)), "pci bar");
         }
         *runs = new.iter().map(|r| (r.cpu, r.cpu + r.len)).collect();
     }
@@ -604,7 +604,7 @@ impl Ip32Bus {
     /// of this bus, which is in its `Arc` and keeps them as long as the
     /// physical bus is used.
     fn map(&self) {
-        use crate::dev::mace_pci::{PCI_HI_MEM_BASE, PCI_IO_BASE, PCI_IO_SIZE, PCI_MEM_BASE, PCI_MEM_SIZE};
+        use crate::dev::mace_pci::{PCI_HI_MEM_BASE, PCI_HI_IO_BASE, PCI_IO_BASE, PCI_IO_SIZE, PCI_MEM_BASE, PCI_MEM_SIZE};
         use crate::ppmem::devmap::Entry;
         let phys = &*self.phys;
         // Whatever nothing claims reads as zero and logs. That covers every
@@ -623,8 +623,11 @@ impl Ip32Bus {
         set(MACE_BASE, MACE_SIZE, &self.mace, "mace");
         set(PCI_IO_BASE, PCI_IO_SIZE, &self.mace, "mace (pci i/o)");
         set(PCI_MEM_BASE, PCI_MEM_SIZE, &self.mace, "mace (pci memory)");
-        // PCI memory's one-to-one window: 0x2_8000_0000 as 32 bits.
-        unsafe { phys.map_borrowed(PCI_HI_MEM_BASE as u64, 1 << 32, &self.mace, "mace (pci memory)") };
+        // Wide PCI windows must remain distinct from CRIME's RAM aliases.
+        unsafe {
+            phys.map_borrowed(PCI_HI_IO_BASE, 2 << 32, &self.mace, "mace (pci i/o)");
+            phys.map_borrowed(PCI_HI_MEM_BASE, 3 << 32, &self.mace, "mace (pci memory)");
+        }
         set(PROM_BASE, PROM_SIZE, &self.flash, "flash");
         self.ram.rebuild();
     }
