@@ -100,6 +100,17 @@ it. The router releases its own lock before invoking or dropping a sink.
 Changing routing affects reporting only; bus exceptions and cache writes still
 occur normally. `set_sink(None)` restores the standalone console behavior.
 
+`workstation::build_headless` constructs serial-console hardware: no optional
+graphics board, USB keyboard/mouse, or PS/2 peripherals. Integrated controllers
+such as O2 GBE remain on the motherboard. `MachineConfig::prepare_headless`
+normalizes the configuration before validation; the constructor applies it again
+and disconnects PS/2 peripherals before any CPU starts. The PS/2 controller
+continues to answer controller commands, but absent devices do not ACK commands
+or generate input. The wiring survives guest resets; it is host configuration,
+not snapshot state. Frontends still select the PROM serial console and install
+the appropriate serial backend before construction. An Onyx 3000 can omit its
+graphics brick in this mode while retaining its C-bricks and I-brick.
+
 Embedding frontends can obtain the newer platforms' onboard SCSI buses with
 `Workstation::frontend_scsi_bus`, or the IP35 Fibre Channel loop with
 `frontend_fibre_bus`. Attach and detach targets only while the machine is stopped

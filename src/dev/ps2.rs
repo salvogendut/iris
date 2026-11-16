@@ -78,6 +78,7 @@ pub struct Ps2Controller {
     /// Host keyboard shape (`KeyboardLayout as u8`). Host config, not guest
     /// state, so it is not in snapshots.
     layout: AtomicU8,
+    devices_present: AtomicBool,
 }
 
 impl Ps2Controller {
@@ -107,12 +108,28 @@ impl Ps2Controller {
             irq,
             running: AtomicBool::new(false),
             layout: AtomicU8::new(KeyboardLayout::Ansi as u8),
+            devices_present: AtomicBool::new(true),
         }
     }
 
     /// Send the host's keys and pointer to `sink` from now on. Once, at build.
     pub fn redirect_input(&self, sink: Arc<dyn InputSink>) {
         assert!(self.sink.set(sink).is_ok(), "input redirected twice");
+    }
+
+    /// Connect or unplug both physical devices before starting a machine.
+    /// The controller remains accessible; absent devices do not ACK commands.
+    /// This host wiring survives controller resets and is not snapshot state.
+    pub fn set_devices_present(&self, present: bool) {
+        self.devices_present.store(present, Ordering::Relaxed);
+        if !present {
+            let mut state = self.state.lock();
+            state.rx_queue.clear();
+            state.mouse_queue_bytes = 0;
+            state.held_keys.fill(false);
+            state.last_read = 0;
+        }
+        self.update_interrupt();
     }
 
     /// Set the host keyboard's physical shape; see [`KeyboardLayout`].
@@ -158,6 +175,13 @@ impl Ps2Controller {
             state.command_state = CommandState::Idle;
             drop(state);
             self.update_interrupt();
+            return;
+        }
+        if !self.devices_present.load(Ordering::Relaxed)
+            && state.command_state != CommandState::WriteConfig
+        {
+            state.next_write_is_mouse = false;
+            state.command_state = CommandState::Idle;
             return;
         }
         if state.next_write_is_mouse {
@@ -567,6 +591,7 @@ impl Ps2Controller {
 
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
+        if !self.devices_present.load(Ordering::Relaxed) { return; }
         if let Some(sink) = self.sink.get() {
             return sink.key(key, pressed);
         }
@@ -1009,6 +1034,7 @@ impl Ps2Controller {
     /// - `dx`, `dy`: signed X/Y delta (Y is screen-down-positive; flipped here)
     /// - `dz`: scroll wheel delta (positive = scroll up/away from user)
     pub fn push_mouse_input(&self, buttons: u8, dx: i32, dy: i32, dz: i32) {
+        if !self.devices_present.load(Ordering::Relaxed) { return; }
         if let Some(sink) = self.sink.get() {
             return sink.mouse(buttons, dx, dy, dz);
         }
@@ -2122,4 +2148,29 @@ pub enum ScancodeSet3 {
     LGUI = 0x8B,
     RGUI = 0x8C,
     Apps = 0x8D,
+}
+
+#[cfg(test)]
+mod disconnected_tests {
+    use super::*;
+    #[test]
+    fn absent_devices_do_not_reply_but_controller_keeps_working() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.set_devices_present(false);
+        for _ in 0..2 {
+            for command in [0xff, 0xf2, 0xf4] {
+                for mouse in [false, true] {
+                    ps2.write_to(command, mouse);
+                    assert_eq!(ps2.pop_from(mouse), None);
+                }
+            }
+            ps2.write_command(0xaa);
+            assert_eq!(ps2.read_data(), 0x55);
+            ps2.power_on();
+        }
+        ps2.set_devices_present(true);
+        ps2.write_to(0xff, false);
+        assert_eq!(ps2.pop_from(false), Some(0xfa));
+        assert_eq!(ps2.pop_from(false), Some(0xaa));
+    }
 }

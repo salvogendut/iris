@@ -44,6 +44,16 @@ pub fn set_exit_on_guest_poweroff(enabled: bool) {
     EXIT_ON_GUEST_POWEROFF.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Build a serial-console machine without a display, keyboard or mouse.
+/// Integrated graphics controllers (such as O2 GBE) remain part of the board;
+/// no removable graphics board or USB input device is fitted.
+pub fn build_headless(mut cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+    cfg.prepare_headless();
+    let machine = build(cfg)?;
+    machine.get_ps2().set_devices_present(false);
+    Ok(machine)
+}
+
 /// Build the machine `cfg` describes, or say why it cannot be built.
 ///
 /// Construction can put more than a megabyte on the stack, so call this from

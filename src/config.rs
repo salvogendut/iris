@@ -3428,6 +3428,19 @@ impl MachineConfig {
         self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
     }
 
+    /// Select serial-only physical wiring while retaining integrated chips.
+    /// Embedders should pair this with `workstation::build_headless` so no
+    /// keyboard or mouse is connected to the controller either.
+    pub fn prepare_headless(&mut self) {
+        self.headless = true;
+        self.graphics.board = Some(GraphicsBoard::None);
+        self.graphics.heads = 1;
+        self.graphics.resolution = Default::default();
+        self.graphics.raster = Default::default();
+        self.fuel.ps2_input = false;
+        self.fuel.usb_input = false;
+    }
+
     /// Newport's authoritative GPU raster is not selectable until M3.
     /// Keep this separate so checked machine construction also enforces it
     /// when a caller has not run the full configuration validation.
@@ -3523,7 +3536,7 @@ impl MachineConfig {
                     "graphics.board \"extreme\" is only valid on Indigo2 (machine.profile = indigo2_ip22)".into(),
                 );
             }
-            if !board.supports(self.machine.profile) {
+            if !board.supports(self.machine.profile) && !(self.headless && board == GraphicsBoard::None) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
                     format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
                 } else if self.machine.profile == MachineProfile::Origin3200Ip35 {
@@ -3679,7 +3692,7 @@ impl MachineConfig {
                 return Err(format!("origin3200.c_bricks {} is invalid (valid: 1, 2)", section.c_bricks));
             }
             self.origin3200_banks()?;
-            if !board.supports(self.machine.profile) {
+            if !board.supports(self.machine.profile) && !(self.headless && board == GraphicsBoard::None) {
                 return Err(if onyx {
                     format!("graphics.board \"{}\" is not modelled on the Onyx 3000 (valid: ir3, v12)", board.as_str())
                 } else {

@@ -270,10 +270,12 @@ pub(super) fn wire_ibrick(nodes: &[&Node], cfg: &MachineConfig, port_reset: Opti
     let usb = usb.ok_or("the I-brick's row has no USB controller")?;
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
     // Keyboard on root port 1 and mouse on port 2 is inferred.
-    let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
-    usb.attach(0, keyboard.clone())?;
-    usb.attach(1, mouse.clone())?;
-    ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    if !cfg.headless {
+        let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
+        usb.attach(0, keyboard.clone())?;
+        usb.attach(1, mouse.clone())?;
+        ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    }
     let eth = ioc3.eth().expect("the IO7's IOC3 fits Ethernet").clone();
     ioc3.set_serial_backend(0, serial[1].clone());
     ioc3.set_serial_backend(1, serial[2].clone());

@@ -149,6 +149,9 @@ impl Ip35Board for Onyx3000 {
     const NAME: &'static str = "Onyx 3000";
 
     fn specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
+        if cfg.headless && cfg.graphics_board() == crate::config::GraphicsBoard::None {
+            return c_bricks(cfg, 1, I_BRICK, None);
+        }
         if cfg.graphics_board().is_vpro() {
             c_bricks(cfg, 2, I_BRICK, Some(V_BRICK))
         } else {
@@ -157,6 +160,9 @@ impl Ip35Board for Onyx3000 {
     }
 
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
+        if cfg.headless && cfg.graphics_board() == crate::config::GraphicsBoard::None {
+            return wire_ibrick(nodes, cfg, None).map(|(io, _)| io);
+        }
         if cfg.graphics_board().is_vpro() {
             let (mut io, _) = wire_ibrick(nodes, cfg, None)?;
             let v_node = nodes.get(1).ok_or("the V-brick needs a C-brick of its own")?;

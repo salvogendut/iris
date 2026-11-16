@@ -21,6 +21,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Headless embedding
+
+- Frontends can build serial-only machines without keyboard/mouse devices or
+  optional graphics, including an Onyx 3000 without a graphics brick.
+
 ### O2 native NetBSD boot
 
 - N64 NetBSD on O2 reaches a native single-user shell instead of trapping
