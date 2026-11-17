@@ -62,3 +62,17 @@ Validation: 183 Newport tests pass with `--features rex-jit` (5 benchmark
 tests ignored), including 1,044 expected-value draws in each of the interpreter
 and compiled regressions. Guest XAA and software controls are tracked in the
 Xiri framed-console/acceleration lab; physical hardware remains untested.
+
+## Resident command integration (2026-11-17)
+
+The resident command path added upstream captures WRMASK into each GPU state
+slot. Copying the raw register there bypasses the fork's physical RGB24 plane
+conversion, even when flat-fill descriptors are corrected. Use the shared
+`framebuffer_write_mask` for generic writes, prepared fills/lines and every
+GPU state slot, including HostW and screen copies. MMIO/context values remain
+raw; the GPU state slot is normalized framebuffer state. Fast-clear source
+colours already pass through `fastclear_color` when commands are captured.
+
+The command regression checks independent red/green/blue plane masks and
+unchanged register values. CPU/JIT comparisons and resident GPU comparisons
+remain separate checks.

@@ -175,6 +175,7 @@ fn prepare_multi_entry_compile(
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
+    let bus = page.uncached.as_ref().unwrap_or(bus);
     let phys_base = page.pfn as u64 * PAGE_SIZE as u64;
 
     // Dirty-cache gate. The seqlock snapshot below reads RAM off the bus; the
@@ -456,7 +457,7 @@ fn prepare_multi_entry_compile(
 }
 
 /// §13.3 compile-from-snapshot protocol, multi-entry (§13.10 build-order
-/// step 2): the request carries no offset — see [`prepare_multi_entry_compile`]
+/// step 2): the request carries no offset — see `prepare_multi_entry_compile`
 /// for the shared front half (snapshot/candidates/walk/instruction-floor
 /// check); this function is the immediate-finalize back half: compile,
 /// finalize right away, publish the union, clear the covered `requested`

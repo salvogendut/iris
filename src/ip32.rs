@@ -462,7 +462,7 @@ pub struct Ip32Bus {
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
     /// The NVMe card in the "PCI option" slot (`[nvme]`), set once when
-    /// the machine fits it.
+    /// the machine attaches it.
     pub nvme: std::sync::OnceLock<Arc<crate::dev::nvme::Nvme>>,
 }
 
@@ -648,6 +648,12 @@ impl Ip32Bus {
         self.gbe.render_from(&self.ram, out)
     }
 
+    /// GBE's programmed timing: pixels a line, lines a frame and the dot
+    /// clock in Hz. See [`crate::dev::o2gfx::Gbe::video_totals`].
+    pub fn video_totals(&self) -> Option<(u32, u32, u64)> {
+        self.gbe.video_totals()
+    }
+
     /// Where CRIME's output goes: the CPU's IP2, for a machine whose CPU
     /// runs on its own thread. Without it (the harness) nothing is pushed.
     pub fn connect_cpu_irq(&self, line: crate::irq::IrqLine) {
@@ -828,6 +834,10 @@ impl crate::traits::Device for Ip32Bus {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         self.devices().iter().flat_map(|d| d.register_commands()).collect()
+    }
+
+    fn audio_report(&self) -> Option<String> {
+        self.devices().iter().find_map(|d| d.audio_report())
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {

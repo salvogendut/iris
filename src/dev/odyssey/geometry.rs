@@ -215,7 +215,7 @@ pub(super) fn gl_lit_record(e: &[u32; 3]) -> bool {
 
 /// The precompiled lit programs the GL library runs from the per-context
 /// program window. The library holds the geometry engine's whole shipped
-/// program image, 12 bytes an entry; the table below fits only the 2,794
+/// program image, 12 bytes an entry; the table below covers only the 2,794
 /// entry image of the IP30 library, SHA-256
 /// a0201d88cf23752cd35ac60c25f2c1b05cfab3253e5991db09006bd1b85b0375. For a
 /// record it takes the lowest address b among the record's entries and list
@@ -818,14 +818,14 @@ impl Board {
     /// fallback, which divides by a constant.
     ///
     /// The depth reaches the shared rasterizer as its rules' depth row,
-    /// row2 / (2S block16[3]), and depth divisor, block16 / block16[3], each
+    /// row2 / (2S block16\[3\]), and depth divisor, block16 / block16\[3\], each
     /// applied to the object coordinates and interpolated with perspective
     /// correction (Board::gl_operation_rules()). Under perspective the shared
     /// projection's z row is 0, so no depth is carried as a difference from w,
     /// which a float row could not resolve; a fragment outside depth [0, 1] by
     /// more than the rounding slack (gl_cmd::DEPTH_SLACK) is dropped, which is
     /// the near and far clip. Under an orthographic matrix the z row stays
-    /// row2 / (block16[3] S) - row3, whose window depth is the same. The plane
+    /// row2 / (block16\[3\] S) - row3, whose window depth is the same. The plane
     /// holds the board's 24-bit float depth word of 2S times that depth
     /// (depth_word.rs). The word's layout is
     /// ESTABLISHED as the library's reading; that the plane stores exactly it is
@@ -847,7 +847,7 @@ impl Board {
     /// Where the board puts a perspective raster position's depth is UNKNOWN.
     ///
     /// A non-default glDepthRange changes the row in a way this rule does not
-    /// fit: it is drawn with the default [0, 1] range, and the near and far clip
+    /// cover: it is drawn with the default [0, 1] range, and the near and far clip
     /// planes the library adds for it are reported as a program stage
     /// (Board::gl_program()).
     ///

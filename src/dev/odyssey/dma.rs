@@ -164,12 +164,17 @@ impl Board {
         #[cfg(feature = "wgpu")]
         if self.gpu_unit() {
             // A blit into the put's own surface, in order, no wait.
-            if let Ok(view) = super::gpu_unit::Slot::own_view(to) {
-                let key = super::gpu_unit::BlitKey { view: super::gpu_unit::BlitView::Own(view), ..super::gpu_unit::BlitKey::store(0, u32::MAX) };
-                let slot = super::gpu_unit::Slot::none();
-                self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, word));
-                return;
+            match super::gpu_unit::Slot::own_view(to) {
+                Ok(view) => {
+                    let key = super::gpu_unit::BlitKey { view: super::gpu_unit::BlitView::Own(view), ..super::gpu_unit::BlitKey::store(0, u32::MAX) };
+                    let slot = super::gpu_unit::Slot::none();
+                    self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, word));
+                }
+                Err(error) => {
+                    self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").reject("GPU DMA destination", error.0));
+                }
             }
+            return;
         }
         to.store_word(x as i32, y as i32, word);
     }
@@ -977,12 +982,16 @@ pub(super) fn field_value(word: u32, chan: u32, width: u32) -> u32 {
 
 impl Board {
     /// Pack the read's rectangle into out, host row by host row, rowbytes each.
-    /// A colour-index byte is the plane word itself, taken only where scanout
-    /// would take that word as an index: a colour-buffer pixel whose main
-    /// drawable's display mode is an index group, with a word that fits eight
-    /// bits. Anything else refuses the whole read, reported once. A colour
-    /// layout over an index-mode pixel returns the raw index word's bytes as
-    /// colour and is reported once: no inverse colormap is applied.
+    /// A colour-index byte is the plane word itself. From a drawable it is
+    /// taken only where scanout would take that word as an index: a
+    /// colour-buffer pixel whose main drawable's display mode is an index
+    /// group, with a word within eight bits; anything else refuses the whole
+    /// read, reported once. From board memory named by address there is no
+    /// window to ask, and the byte is the field's as it stands: the X server
+    /// saves screen pixels this way (the text cursor's save-under) and puts
+    /// them back with an image write. A colour layout over an index-mode
+    /// pixel returns the raw index word's bytes as colour and is reported
+    /// once: no inverse colormap is applied.
     pub fn dma_read_pack(&mut self, src: &DmaSource, l: &DmaLayout, w: u32, h: u32, bottom_up: bool, out: &mut [u8]) -> bool {
         let packed = l.fields[0].width != 0;
         let first = l.from[0] as u32;
@@ -991,12 +1000,6 @@ impl Board {
         let index_max: u32 = if first == dma::BYTE_INDEX_HIGH { 0xfff } else { 0xff };
         let mut o: usize = 0;
 
-        if index_read && !src.drawable {
-            if self.dma_report(dma::REPORT_INDEX_OBJECT) {
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA index read of board memory, which records no display mode");
-            }
-            return false;
-        }
         for r in 0..h {
             let board_row = if bottom_up { h - 1 - r } else { r };
 
@@ -1026,7 +1029,7 @@ impl Board {
                 }
                 let indexed = index_read || (index_or_red && group < ODSY_GAMMA_GROUP);
 
-                if indexed && (group >= ODSY_GAMMA_GROUP || word > index_max) {
+                if indexed && src.drawable && (group >= ODSY_GAMMA_GROUP || word > index_max) {
                     if self.dma_report(dma::REPORT_INDEX) {
                         crate::dlog!(
                             LogModule::Odyssey,
@@ -1161,7 +1164,7 @@ impl Board {
             // What the read covers, current in the mirror.
             let (x0, y0, x1, y1) = (src.x, src.y, src.x + w as i64 - 1, src.y + h as i64 - 1);
             let planes = super::pipe::backend::DestMem { colour: src.fields, depth: src.depth, stencil: src.stencil, did: src.fields[0], overlay: src.fields[1] };
-            self.gpu_read_back(&planes, x0, y0, x1, y1);
+            self.gpu_read_back(&planes, x0, y0, x1, y1, super::gpu_unit::Observation::DmaRead);
         }
         let Ok(n) = bus.entries(table, seq, &mut e) else {
             return;

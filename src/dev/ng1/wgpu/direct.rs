@@ -15,7 +15,9 @@ use crate::wgpu::{Fragment, Gpu, Scanout, ScanoutPipeline, ScanoutShaders, Sourc
 const HEIGHT: usize = REX3_SCREEN_HEIGHT as usize;
 const DID_BYTES: usize = FB_STRIDE * HEIGHT;
 const MAX_PIXELS: u32 = (FB_STRIDE * HEIGHT) as u32;
-const DID_EXPAND: Fragment =
+// Each workgroup owns one scanline; its lanes write disjoint packed words.
+pub(super) const DID_WORKGROUPS: u32 = HEIGHT as u32;
+pub(super) const DID_EXPAND: Fragment =
     Fragment::new("ng1_did_expand.wgsl", include_str!("shaders/did_expand.wgsl"));
 
 fn scanout_error(error: String) -> ResidentError {
@@ -93,6 +95,24 @@ pub(crate) struct CaptureCount {
     pub(crate) attempted_bytes: u64,
     pub(crate) successes: u64,
     pub(crate) successful_bytes: u64,
+}
+
+impl CaptureCount {
+    pub(crate) fn attempt(&mut self, bytes: u64) -> Result<(), ResidentError> {
+        let attempts = self.attempts.checked_add(1).ok_or(ResidentError::InvalidState("composed capture counter exhausted"))?;
+        let attempted_bytes = self.attempted_bytes.checked_add(bytes).ok_or(ResidentError::InvalidState("composed capture bytes exhausted"))?;
+        self.attempts = attempts;
+        self.attempted_bytes = attempted_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn success(&mut self, bytes: u64) -> Result<(), ResidentError> {
+        let successes = self.successes.checked_add(1).ok_or(ResidentError::InvalidState("composed capture counter exhausted"))?;
+        let successful_bytes = self.successful_bytes.checked_add(bytes).ok_or(ResidentError::InvalidState("composed capture bytes exhausted"))?;
+        self.successes = successes;
+        self.successful_bytes = successful_bytes;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -176,9 +196,10 @@ impl Ng1ResidentFrame<'_> {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub(crate) enum CaptureFault {
-    BeforeCopy,
-    AfterMap,
+    BeforeCapture,
+    AfterStaging,
 }
 
 /// The group retains the raster's plane buffers without exposing their
@@ -201,6 +222,7 @@ pub(crate) struct Ng1ResidentScanout {
     traffic: ResidentScanoutTraffic,
     last_frame: Option<ResidentFrameStamp>,
     capture_scratch: Vec<u32>,
+    #[cfg(test)]
     capture_fault: Option<CaptureFault>,
 }
 
@@ -268,7 +290,9 @@ impl Ng1Scanout {
             pipeline, scanout, bindings, display_layout: layout, did_layout, did_source: None,
             did: None, vc2, did_params, did_pipeline, did_group: None, display_group: None,
             uploaded: None, dimensions: None, traffic: ResidentScanoutTraffic::default(),
-            last_frame: None, capture_scratch: Vec::new(), capture_fault: None,
+            last_frame: None, capture_scratch: Vec::new(),
+            #[cfg(test)]
+            capture_fault: None,
         })
     }
 }
@@ -287,6 +311,7 @@ impl Ng1ResidentScanout {
         self.did.as_ref().expect("DID buffer is bound after composition")
     }
 
+    #[cfg(test)]
     pub(crate) fn fail_next_capture(&mut self, fault: CaptureFault) {
         self.capture_fault = Some(fault);
     }
@@ -306,7 +331,7 @@ impl Ng1ResidentScanout {
             });
             pass.set_pipeline(&self.did_pipeline);
             pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups((HEIGHT as u32).div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(DID_WORKGROUPS, 1, 1);
         }
         gpu.submit(encoder);
         gpu.check().map_err(scanout_error)
@@ -332,22 +357,23 @@ impl Ng1ResidentScanout {
             return Err(ResidentError::InvalidState("resident capture output is too small"));
         }
         let bytes = pixels as u64 * 4;
-        self.traffic.composed_readbacks.attempts += 1;
-        self.traffic.composed_readbacks.attempted_bytes += bytes;
+        self.traffic.composed_readbacks.attempt(bytes)?;
+        #[cfg(test)]
         let fault = self.capture_fault.take();
-        if matches!(fault, Some(CaptureFault::BeforeCopy)) {
-            return Err(ResidentError::Failed("injected composed capture failure before copy".into()));
+        #[cfg(test)]
+        if matches!(fault, Some(CaptureFault::BeforeCapture)) {
+            return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
         }
         self.capture_scratch.resize(pixels, 0);
         self.scanout.read_output(stamp.width, stamp.height, &mut self.capture_scratch)
             .map_err(scanout_error)?;
-        if matches!(fault, Some(CaptureFault::AfterMap)) {
-            return Err(ResidentError::Failed("injected composed capture failure after map".into()));
+        #[cfg(test)]
+        if matches!(fault, Some(CaptureFault::AfterStaging)) {
+            return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
         }
         self.scanout.gpu().check().map_err(scanout_error)?;
         out[..pixels].copy_from_slice(&self.capture_scratch);
-        self.traffic.composed_readbacks.successes += 1;
-        self.traffic.composed_readbacks.successful_bytes += bytes;
+        self.traffic.composed_readbacks.success(bytes)?;
         Ok(())
     }
 

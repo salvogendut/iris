@@ -9,7 +9,10 @@ pub(super) const ODSY_PART: u32 = 0xc013;
 pub(super) const ODSY_MANUFACTURER: u32 = 0x023;
 
 // The one modeled scanout mode's retrace period, from the compiled 60 Hz 1280x1024 mode-description file
-pub(super) const ODSY_FRAME_CLOCKS: u32 = 1688 * 1066;
+pub(super) const ODSY_LINE_CLOCKS: u32 = 1688;
+pub(super) const ODSY_FRAME_CLOCKS: u32 = ODSY_LINE_CLOCKS * 1066;
+/// 1280x1024_60's vertical blanking, in lines.
+pub(super) const ODSY_BLANK_LINES: u32 = 42;
 pub(super) const ODSY_PIXEL_CLOCK_HZ: u32 = 107964476;
 
 // The display channel's active size, backend entries 0x2802 (pixels) and 0x2803 (lines).
@@ -194,7 +197,7 @@ pub(super) mod reg {
     // 1,000,000,000 once, after the program load (the doubleword and the single
     // write are ESTABLISHED). That the register is 0x3f0 is INFERRED; its unit
     // and meaning are UNKNOWN: a sync timeout in board clocks, in nanoseconds or
-    // a non-timeout limit all fit. The model accepts the write and records the value, runs no
+    // a non-timeout limit are all possible. The model accepts the write and records the value, runs no
     // timer, and raises no flag because of it.
     pub const SETUP_7F0: u32 = 0x7f0;
     pub const QUICK_FLUSH_ARG: u32 = 0x0443; // 1 operand: 0xfa or 0x96 seen
@@ -531,7 +534,6 @@ pub(super) mod dma {
     pub const REPORT_SHAPE: u32 = 1 << 6;
     pub const REPORT_WRITE: u32 = 1 << 7;
     pub const REPORT_UPLOAD_SENTINEL: u32 = 1 << 8;
-    pub const REPORT_INDEX_OBJECT: u32 = 1 << 9;
     pub const REPORT_COLOUR_OVER_INDEX: u32 = 1 << 10;
     pub const REPORT_UNLISTED_FIELDS: u32 = 1 << 14;
 }

@@ -69,8 +69,10 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [callout-arg0-is-core-ptr.md](jitv2/callout-arg0-is-core-ptr.md) | rule | JIT→Rust callouts: arg 0 is always the `MipsCore` pointer |
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
+| [compile-pool-size-on-small-hosts.md](jitv2/compile-pool-size-on-small-hosts.md) | rule | The compile pool is sized for the host as well as the guest: one worker per guest CPU, capped by the host's usable CPUs; the guest's own CPUs are not counted against it |
 | [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
 | [compile-queues-belong-to-the-pool.md](jitv2/compile-queues-belong-to-the-pool.md) | rule | Both compilation queues belong to their JIT pool; old machine workers must never consume the replacement's requests |
+| [compile-workers-park-instead-of-polling.md](jitv2/compile-workers-park-instead-of-polling.md) | rule | The compile pool parks; the producer wakes it: an idle worker cost 1.4% of a core polling every 200µs |
 | [compile-time-profile.md](jitv2/compile-time-profile.md) | measure | An IRIX boot is bound by how much jitv2 compiles: workers saturated, where a compile's time goes (regalloc 37%, egraph 20%), and why a faster allocator or `opt_level=none` only buys more recompiles |
 | [compile-churn-avoidance-snapshot.md](jitv2/compile-churn-avoidance-snapshot.md) | design | Compile churn avoidance: skip a recompile whose inputs did not change |
 | [cop0-does-not-have-to-end-a-region.md](jitv2/cop0-does-not-have-to-end-a-region.md) | design | CP0 does not have to end a region |
@@ -91,7 +93,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | history | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
 | [jit-page-probe-must-be-retired-on-drop.md](jitv2/jit-page-probe-must-be-retired-on-drop.md) | history | The jitv2 dirty-page probe must be retired when its cache dies |
-| [jit-v2-design.md](jitv2/jit-v2-design.md) | design | IRIS JIT v2 — Design Plan (draft for discussion) |
+| [jit-v2-design.md](jitv2/jit-v2-design.md) | design | IRIS JIT v2 design: implemented; the current state (compile pool included) at the top, the original plan and as-built notes below |
 | [jitv2_lockstep_region_ending_double_page_jump.md](jitv2/jitv2_lockstep_region_ending_double_page_jump.md) | rule | jitv2_lockstep: region-ending words landed 1-2 pages off (double-page-jump) |
 | [jitv2_lui_fusion_foreign_delay_slot_hazard.md](jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md) | rule | jitv2 LUI+ORI/ADDIU fusion: missing foreign-delay-slot guard (fixed, then gated off by default) |
 | [lockstep-must-disable-inline-memory.md](jitv2/lockstep-must-disable-inline-memory.md) | rule | jitv2_lockstep must disable the inline load/store path |
@@ -100,6 +102,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [read-status-in-registers.md](jitv2/read-status-in-registers.md) | rule | JIT memory hooks return status in registers, never memory |
 | [retry-bail-in-delay-slot-must-arm-the-branch.md](jitv2/retry-bail-in-delay-slot-must-arm-the-branch.md) | rule | A retry bail out of an inlined delay slot must arm the branch |
 | [smc-writes-to-executing-page.md](jitv2/smc-writes-to-executing-page.md) | design | Self-modifying writes onto the page being executed (`jitv2_smc_check`) |
+| [sync-compile-gates-on-hot.md](jitv2/sync-compile-gates-on-hot.md) | rule | Sync compile gates a page with code on the pool's hot count, and never sets `page_scheduled` |
 | [unsupported-instructions.md](jitv2/unsupported-instructions.md) | design | JIT v2 instruction coverage and interpreter boundaries |
 | [what-actually-blocks-gpr-forwarding.md](jitv2/what-actually-blocks-gpr-forwarding.md) | measure | What actually blocks GPR store-to-load forwarding (and what doesn't) |
 
@@ -111,14 +114,18 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 |---|---|---|
 | [frontend-pcm-output.md](devices/frontend-pcm-output.md) | design | Per-machine PCM factory for SDL hosts, bounded stereo ring, no host-backend fallback and pause/stop ownership |
 | [embedded-flash-prom-selection.md](devices/embedded-flash-prom-selection.md) | rule | Use upstream packed PROMs and resolver; retain the empty-path alias for embedded frontends |
+| [refreshing-the-generated-register-files.md](devices/refreshing-the-generated-register-files.md) | rule | The Hub and Bedrock register files are byte-for-byte copies of the chips repository's generated files; how to refresh them and what the contract test then catches |
 | [ip35-board-eeprom-cpu-config.md](devices/ip35-board-eeprom-cpu-config.md) | rule | The IP35 PROM checks its flash CPU record against the node board EEPROM's format-3 extended data (`CpuContext`); the field layout and how it was read out of the PROM |
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
 | [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
+| [draw-marks-tell-the-display-what-shows.md](devices/draw-marks-tell-the-display-what-shows.md) | rule | IMPACT and VPro compose only when drawing landed in a buffer the screen shows: a draw marks its store, planes and box after its stores (`display::Marks`); a path that cannot must say "anything"; `IRIS_DISPLAY_VERIFY=1` checks the verdicts; measurements |
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
+| [onyx2-mediaio-rad1-is-not-the-octanes.md](devices/onyx2-mediaio-rad1-is-not-the-octanes.md) | rule | The Onyx2's MediaIO RAD1 (`Rad1::mediaio()`): revision 0x70 (7.0; 0xc0 panicked the kernel), 0x88/0x8c are not a mute (every other second was silent), its counter runs from reset |
 | [hal2-cs4216-volume-and-clocking.md](devices/hal2-cs4216-volume-and-clocking.md) | rule | HAL2 and CS4216: speaker volume is the PBUS PIO ch2 MDAC (`0x1fbd8800`/`0x1fbd8804`), and clocking is SM3-Slave from HAL2 |
+| [sn-node-traps.md](devices/sn-node-traps.md) | rule | Node machines (`hub`, `bedrock`): the uncached attribute selects a decode and is never an address bit; a park slot is not a CPU number (`ip27` CPUs are 0 and 2, and `stop_others` indexed by number waits for itself); a register read after firmware ran is not a reset value; plus a six-point checklist for node code |
 | [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
 | [pci-layer-open.md](devices/pci-layer-open.md) | open | PCI layer open items: restore vs reset and the AIC-7880 chip reset, the O2's RST#, Bridge reset pins and master time-out approximations, the 2 GB window's reserved range, no external ATE SSRAM, MACE 64-bit PIO |
-| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30); threading, byte order and open items |
+| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30, IP53); threading, byte order and open items |
 | [virtio-9p-design.md](devices/virtio-9p-design.md) | design | virtio-9p: 9P2000.L server over a host directory; why every path is walked with `O_NOFOLLOW`, what a fid is, open items |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [embedded-prom-compression.md](devices/embedded-prom-compression.md) | measure | Which compression the built-in PROMs use: deflate per PROM against LZMA2, zstd and dictionaries, sizes, decode times and git cost; why deflate won |
@@ -134,6 +141,8 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [ip28-prom-bank-layouts.md](devices/ip28-prom-bank-layouts.md) | measure | IP28 PROM failures with single 32/128 MB banks and validated alternative layouts |
 | [o2-icon-backdrop-crosshatch.md](devices/o2-icon-backdrop-crosshatch.md) | open | O2 icon boxes crosshatch: GL dithers the panel's own colour, truncated just under the 5-bit grid; the guest's drawing, unconfirmed against hardware; `re dither off` compares |
+| [o2-timing-interrupts-are-line-compares.md](devices/o2-timing-interrupts-are-line-compares.md) | rule | GBE has four line-compare interrupts and no vblank one; IRIX uses lines 1028 and ~976; the refresh thread raises them as line events; the old "dispatcher never returns" hang did not reproduce |
+| [second-newport-needs-slot0-and-board-rev-4.md](devices/second-newport-needs-slot0-and-board-rev-4.md) | rule | IRIX probes a second Newport only at 0x1F4F0000; an Indy needs board revision 4; its retrace and FIFO share the slot's GIO_EXP0 pin |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
@@ -187,6 +196,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [release-forward-listeners-before-rebind.md](net/release-forward-listeners-before-rebind.md) | rule | Release old forwarding sockets before rebinding their ports |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
+| [a-nic-restart-must-join-its-old-backend.md](net/a-nic-restart-must-join-its-old-backend.md) | rule | Every NIC runs its backend through `net::link::Session`: a restart joins the old backend before the new one binds, or a reset loses the port forwards |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 asks for mountd over TCP; the share is UDP only, so mount with `-o proto=udp` (a plain mount fails); MOUNT v3 must list AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
@@ -216,6 +226,8 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 
 | Note | Kind | Title |
 |---|---|---|
+| [irix-swaps-buffers-in-the-retrace-handler.md](rex3/irix-swaps-buffers-in-the-retrace-handler.md) | rule | From the shipped kernel modules (Newport, GR2, IMPACT): a swap request schedules, the retrace handler writes the mode and hands the buffer back; Newport's flip is an XMAP9 mode write (bit 0) that waits for BACKBUSY only, never for the graphics FIFO, which is why the emulator's fence must guard capture |
+| [video-timing-from-vc2-and-bt445-pll.md](rex3/video-timing-from-vc2-and-bt445-pll.md) | rule | Newport refresh rate: VC2 table totals at the Bt445 PLL clock (20 MHz x M / ((N + 1) x 2^P), fitted to the `.u` format files and register read-backs); checked with `setmon -n` |
 | [cursor-drawn-3px-right-of-x-pointer.md](rex3/cursor-drawn-3px-right-of-x-pointer.md) | open | Newport draws the hardware cursor 3 px right of the X pointer (measured by corner pinning) |
 | [alphahost-fields-and-aline-alpha.md](rex3/alphahost-fields-and-aline-alpha.md) | rule | REX3 source alpha: host fields and antialiased lines |
 | [batched-hostrw-in-the-jit.md](rex3/batched-hostrw-in-the-jit.md) | rule | Batched HOSTRW in the REX3 JIT — and how the equivalence test lied twice |
@@ -251,6 +263,7 @@ GR2 (XZ/Extreme): HQ2 HLE, GL state, FIN handshakes, the RE3 span JIT. Hardware 
 | Note | Kind | Title |
 |---|---|---|
 | [DESIGN.md](gr2/DESIGN.md) | design | GR2 design |
+| [video-timing-from-vc1-tables.md](gr2/video-timing-from-vc1-tables.md) | rule | GR2 refresh rate: the VC1 frame and line-state table formats (units of five clocks), two known clocks; PROM-checked only. Also the O2's totals and dot clock |
 | [bringup.md](gr2/bringup.md) | howto | GR2 bring-up: emulator-side gotchas |
 | [cx-save-must-wait-for-hq.md](gr2/cx-save-must-wait-for-hq.md) | rule | Context save: GEDMA reads must wait for the queued 0x1E1 |
 | [fin2-wait-must-stall.md](gr2/fin2-wait-must-stall.md) | rule | FIN2 polls must not outrun the HQ2 (pixel DMA timeout) |
@@ -273,7 +286,8 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [detail-textures-follow-the-drivers-table.md](mgras/detail-textures-follow-the-drivers-table.md) | rule | IMPACT detail textures, measured on a real board: base + w (detail - 0.53) / 32 from the driver's table at k = 32 2^LOD, nothing from the TXLOD index on; level -2 is broken on the board; run dettex with --impact |
 | [dma-past-the-mapped-window.md](mgras/dma-past-the-mapped-window.md) | open | A host DMA past the kernel's mapped page window wrote the IP28 exception vectors; it now stops there, the virtual-DMA TLB-miss refill is not modelled |
 | [dcb-device-numbers.md](mgras/dcb-device-numbers.md) | design | DCB device numbers: trust the kernel's dcbctrl writes, not header names |
-| [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | rule | Take the IMPACT display frame before the retrace pulse, not after |
+| [video-timing-from-vc3-and-dac-pll.md](mgras/video-timing-from-vc3-and-dac-pll.md) | rule | IMPACT refresh rate: VC3 table totals at the DAC PLL clock (33 MHz reference, formula fitted to the format files); `.sdb` layout; rates checked with `setmon -n` |
+| [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | history | The frame was taken before the retrace pulse (2026-10-28); the display refresh thread takes it after the blank (2026-11-14). The handler ran 7 ms late in the old trace: what to watch if tearing returns |
 | [fog-per-pixel-through-a-table.md](mgras/fog-per-pixel-through-a-table.md) | rule | RGBA fog is a table over window depth (biased index, 32 steps EXP / 512 linear), fogged in pixel pairs; the GE HLE builds it from the projection (model-private FOG_LUT) |
 | [gl-lines-follow-diamond-exit.md](mgras/gl-lines-follow-diamond-exit.md) | rule | GL lines are drawn by diamond exit with the minor offset (even widths judged half a pixel off); the start pixel is in, colours extrapolate to the first centre; smooth width-1 lines and smooth points follow measured coverage (a smooth point's pixel box is latched at glPointSize), wider smooth lines are aliased |
 | [subtract-blend-follows-the-real-board.md](mgras/subtract-blend-follows-the-real-board.md) | rule | IMPACT's SUBTRACT / REVERSE_SUBTRACT drop or un-invert factors for some alpha/constant pairs; the GE HLE copies the board (309 of 312 cells) |
@@ -292,6 +306,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
 | [real-high-impact.md](mgras/real-high-impact.md) | howto | The real High IMPACT (purple) and its emulated twin: access, share, screen saver, the cloned image's network, identity bytes, GE fresh-context words, what differs |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
+| [texture-colour-tables.md](mgras/texture-colour-tables.md) | rule | SGI_texture_color_table: 768 auto-incrementing device writes at 0x9000_0000 outside any pixel op, TEXMODE1 15:13; lookup after filtering (RGB per channel, L through R), modelled in interp/JIT/wgpu and matched on purple |
 | [texture-readback-follows-libglcore.md](mgras/texture-readback-follows-libglcore.md) | rule | glGetTexImage of ALPHA, LUMINANCE, INTENSITY and RGB textures is libGLcore's, not the board's |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
 
@@ -301,7 +316,9 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 
 | Note | Kind | Title |
 |---|---|---|
+| [x-index-reads-by-address-return-the-field-byte.md](odyssey/x-index-reads-by-address-return-the-field-byte.md) | rule | The X server saves screen pixels with colour-index DMA reads of board memory by address (word 0 `0x2000`, format byte `0x41`); refusing them left black blocks where Motif text cursors had been. Answer with the field's byte |
 | [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
+| [video-timing-from-the-vtg-tables-and-clock-part.md](odyssey/video-timing-from-the-vtg-tables-and-clock-part.md) | rule | VPro refresh rate: frame and line tables (VC2-style entries, picture lines by state bit 6) at the I2C clock part's frequency (two parts, 12 MHz reference), sniffed from the two-wire control words; rates checked with `setmon -n` |
 | [vpro-line-rasterisation-on-a-real-v10.md](odyssey/vpro-line-rasterisation-on-a-real-v10.md) | measure | linetest on octopus: aliased line pixels match the model (centre rule, minor replication, flat ends); smoothed lines are a per-column minor-distance table with a 255 plateau, not area coverage, plus an undecoded near-45-degree spill |
 | [solidview-profile-2026-11-07.md](odyssey/solidview-profile-2026-11-07.md) | measure | SolidView: lines dominate (465k, 8.7 px each); GPU unit 6.1 s to 2.5 s; open: GPU line kernel needs exact maths, one-pixel off-by-one on the GPU unit, threaded CPU unit slower than inline |
 | [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
@@ -364,15 +381,18 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [cdrom-hot-insert-remount.md](gui/cdrom-hot-insert-remount.md) | rule | GUI CD-ROM insert must hot-load + remount /CDROM |
 | [cmd-q-bypasses-close-intercept-fold-on-poweroff.md](gui/cmd-q-bypasses-close-intercept-fold-on-poweroff.md) | rule | macOS Cmd+Q bypasses the close-intercept — fold CHD overlays on power-off, not just quit |
 | [cycles-ptr-must-be-cleared-before-dropping-the-machine.md](gui/cycles-ptr-must-be-cleared-before-dropping-the-machine.md) | rule | iris-gui: clear the cached `CyclesPtr` before dropping the Machine |
+| [removed-config-keys-must-be-folded-not-deleted.md](gui/removed-config-keys-must-be-folded-not-deleted.md) | rule | Retired MachineConfig keys: keep + fold in `fold_deprecated`, or old gui.json locks the GUI |
 | [egui-default-font-glyph-coverage-avoid-tofu.md](gui/egui-default-font-glyph-coverage-avoid-tofu.md) | rule | egui default fonts: which glyphs render, which are tofu |
 | [gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md](gui/gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md) | design | A new graphics board needs no `iris-gui` capture wiring |
 | [gui-frame-sink-carries-only-the-damaged-band.md](gui/gui-frame-sink-carries-only-the-damaged-band.md) | rule | iris-gui's frame sink carries only the damaged band — screenshots and VNC read `screen.rgba`, never the sink |
 | [gui-owns-the-winit-event-loop.md](gui/gui-owns-the-winit-event-loop.md) | rule | iris-gui must not create a `winit::EventLoop` — eframe owns the process's one, which is why `IRIS_GUI_GL` always fell back |
 | [gl-teardown-must-run-on-the-refresh-thread.md](gui/gl-teardown-must-run-on-the-refresh-thread.md) | rule | GL teardown must run on the REX3-Refresh thread |
 | [gui_mouse_integration.md](gui/gui_mouse_integration.md) | design | GUI mouse integration — current approach, and the classic-Mac absolute-mouse pattern |
+| [gui-reads-configs-through-core-parse.md](gui/gui-reads-configs-through-core-parse.md) | rule | iris-gui must read configs with `MachineConfig::from_toml_str` and write them with `machines::to_toml`, or automatic thread counts and unset banks are lost |
 | [i18n-catalog-gotchas.md](gui/i18n-catalog-gotchas.md) | rule | GUI text catalogs (i18n) gotchas |
 | [keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md](gui/keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md) | rule | Keyboard capture: egui steals Tab/arrows/Esc, and egui-winit eats Ctrl+C/X/V |
 | [keyboard-layout-send-physical-keys-not-logical.md](gui/keyboard-layout-send-physical-keys-not-logical.md) | rule | Non-US keyboard layouts: send physical key positions, never logical keys |
+| [profile-menus-must-use-core-hardware-tables.md](gui/profile-menus-must-use-core-hardware-tables.md) | rule | GUI profile menus, NVRAM, console routing and backing-file paths must follow the selected platform |
 | [machine-profile-vs-guest-ip22.md](gui/machine-profile-vs-guest-ip22.md) | design | Machine profile vs guest "IP22" in Software Manager |
 | [windows-silent-exit-0xc000041d.md](gui/windows-silent-exit-0xc000041d.md) | rule | Windows: CLI vanishes with exit 0xC000041D and no message |
 | [winit-window-calls-must-be-on-event-thread.md](gui/winit-window-calls-must-be-on-event-thread.md) | rule | Window methods must only be called on the event-loop thread (Windows crash) |
@@ -405,13 +425,14 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 | Note | Kind | Title |
 |---|---|---|
 | [ci-mode-overlay-is-in-the-temporary-directory.md](snapshot/ci-mode-overlay-is-in-the-temporary-directory.md) | howto | CI mode overlay path is $TMPDIR/iris-ci-PID-START-scsiID.overlay |
+| [frontend-snapshot-root.md](snapshot/frontend-snapshot-root.md) | rule | Incomplete snapshot guards and restore use the same frontend-selected directory |
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
 | [mc-restore-must-republish-bank-map.md](snapshot/mc-restore-must-republish-bank-map.md) | rule | MC snapshot restore must publish the saved physical bank map |
 | [per-device-saveloadsave-round-trip-is-the-regression-net.md](snapshot/per-device-saveloadsave-round-trip-is-the-regression-net.md) | rule | Per-device save→load→save round-trip is the regression net |
 | [scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md](snapshot/scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md) | howto | Scratch SCSI volume - SGI VH layout and IRIX raw-device gotchas |
-| [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | design | Snapshot manifest format (snapshot.toml schema_version=1) |
+| [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | history | Snapshot manifest format (snapshot.toml schema_version=1) |
 | [snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md](snapshot/snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md) | design | Snapshot v2 device state is postcard-encoded BinValue *.bin |
 
 ## perf/
@@ -439,6 +460,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
 | [sgiemu-policy-belongs-to-the-machine.md](perf/sgiemu-policy-belongs-to-the-machine.md) | rule | Opt-in GPR/RTC caches belong to each machine; preserve worker policy and separate persistent code keys |
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
+| [window-presents-only-what-changed.md](perf/window-presents-only-what-changed.md) | rule | The window presents only what changed: an unchanged picture is not uploaded or composed again, the mip chain is rebuilt only when the picture changes and only when the window minifies it, and IMPACT's mark test walks the VC3 window-ID runs |
 | [windows-timer-waits-round-to-the-system-tick.md](perf/windows-timer-waits-round-to-the-system-tick.md) | rule | On Windows a timed park rounds up to the 15.6 ms system tick (the guest clock ran at 64-80 Hz, glquake looked hung after a timedemo); the hptimer waits on a high-resolution waitable timer, plans around its 0.5 ms grid, and raises the process timer resolution; never pace below the tick with park_timeout or wait_timeout |
 
 ## testing/
@@ -495,7 +517,7 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 | Note | Kind | Title |
 |---|---|---|
 | [gl-backend-presents-only-on-the-windows-display.md](wgpu/gl-backend-presents-only-on-the-windows-display.md) | rule | wgpu's GL backend presents only from an instance opened on the window's display; without it, surfaceless EGL and a readback per frame through the GL renderer. Headless/CI/iris-gui stay displayless; keep PreferEgl when the GL renderer shares a thread with a board device |
-| [gpu-floats-are-not-the-hosts.md](wgpu/gpu-floats-are-not-the-hosts.md) | rule | GPU float division is not correctly rounded and products get fused: `div_exact` and the multiply-by-one guard before comparing with the CPU model (measured on RADV) |
+| [gpu-floats-are-not-the-hosts.md](wgpu/gpu-floats-are-not-the-hosts.md) | rule | GPU float division is not correctly rounded and products get fused: use `div_exact` and a bit-observable f32 barrier before comparing with the CPU model (measured on RADV and D3D12) |
 | [vram-accesses-are-atomic.md](wgpu/vram-accesses-are-atomic.md) | design | Board memory on the GPU is accessed with atomics, because two pixels can share a word; texel reads use a second plain binding (1%); what relaxed atomics compile to; never mix atomic and plain on one word |
 | [the-mirror-and-its-dirty-maps.md](wgpu/the-mirror-and-its-dirty-maps.md) | design | The GPU unit's board memory has a CPU mirror; dirty maps both ways keep them in step, and the front end must wait before it touches memory |
 | [read-storage-in-place.md](wgpu/read-storage-in-place.md) | rule | Read records, slots and tables from their buffers in place: a 4.8 KB struct copied by value gave silently wrong texels on RADV once the kernel grew |
@@ -523,6 +545,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 
 | Note | Kind | Title |
 |---|---|---|
+| [display-refresh-common-layer.md](plans/display-refresh-common-layer.md) | plan | Issue #742: one refresh thread for all boards, guest-programmed refresh rate, vblank/compose/present callbacks, heads and host monitors, stereo (SBS, display glasses); survey of today's six display threads and of each board's timing, stereo and dual-head hardware |
 | [wgpu-ui.md](plans/wgpu-ui.md) | plan | The iris window on wgpu: a presenter in `src/wgpu`, the board's device shared, VPro frames presented with no readback, then Newport's compositor in WGSL |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
@@ -537,6 +560,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [wgpu-raster.md](plans/wgpu-raster.md) | plan | Plan: the boards' raster units on the host GPU through wgpu compute (board memory on the GPU, tile-binned batches; common layer landed, VPro first, IMPACT second (raster unit landed, in the board behind `raster = "wgpu"`), GR2 open) |
 | [odyssey-board-memory.md](plans/odyssey-board-memory.md) | plan | VPro board memory as the hardware has it: one tiled SDRAM pool addressed by base/pitch/format, replacing the fixed planes and the invented object store; measure the tile layout on a real V10 first |
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
+| [pci-passthrough.md](plans/pci-passthrough.md) | plan | Host PCI devices in emulated slots through Linux VFIO: what the PCI layer already gives, the gaps (sub-dword config writes, a published DMA view per host for the IOMMU, INTx without KVM, snapshots), which Bridge placements map (word values yes, byte stream and doubleword no), MACE's two views as an open case, jitv2 and unseen writes, step order; nothing built |
 | [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
 | [jitv2-gpr-forwarding.md](plans/jitv2-gpr-forwarding.md) | history | Guest registers as SSA values in jitv2: what xiri and revenir measured and the staged plan; done 2026-11-10, outcome in jitv2/gpr-cache.md |
@@ -547,5 +571,6 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
 | [vpro-lines-on-the-triangle-arithmetic.md](plans/vpro-lines-on-the-triangle-arithmetic.md) | plan | VPro lines: integer pixel walk kept, attributes on the triangle's f32/0.15/12.12 arithmetic instead of f64, major-axis t; then a ring primitive for the threaded CPU unit and a REC_LINE GPU kernel; validate on octopus |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |
-| [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules
+| [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules |
+| [multinode.md](plans/multinode.md) | design | Multi-node machines (IP27 and IP35): the product, board, family, `sn` and chip levels; naming rules; how a node, `sn::Machine` and a product's `node_specs`/`build_io` fit together; known approximations and the follow-up list |
 | [kona-back-end.md](plans/kona-back-end.md) | design | Design: the InfiniteReality (KONA) board: concrete back end, pipe lock, draw-state table on a tile scheduler, geometry hand-off, ownership, steps and approximations

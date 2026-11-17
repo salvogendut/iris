@@ -3,27 +3,26 @@
 //! process.
 
 use crate::config::MachineConfig;
-use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, SerialBackend, TeeBackend};
+use crate::dev::serial_host::{open_log, serial_line_with_override, CiSerialBackend, SerialBackend, SerialLine};
 use std::sync::Arc;
 
 /// One of the board's serial connections: what it is called, the TCP port
 /// and the setting that names the port, the CI backend it uses when it is
-/// the console, the log it keeps when it is not, and where the host end goes.
-pub(crate) struct SerialPort<'a> {
+/// the console, the log it keeps when it is not, a Unix socket with the setting that names it,
+/// and where the host end goes.
+pub(crate) struct SerialPort {
     pub label: &'static str,
     pub port: u16,
     pub setting: &'static str,
-    pub ci: &'a Arc<CiSerialBackend>,
+    pub ci: Arc<CiSerialBackend>,
     pub log: Option<String>,
-    pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + 'a>,
+    pub socket: Option<(String, &'static str)>,
+    pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync>,
 }
 
-/// Connect the board's serial ports to the host. The console takes
-/// `serial_log` and, under CI, the in-process backend; the others listen on
-/// their TCP ports, and a port that is taken leaves its stream unconnected
-/// rather than stopping the machine. Port 0 takes any free port, so several
-/// lines may name it.
-pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort<'_>], console: usize) -> Result<(), String> {
+/// Connect the board's serial ports to the host: the console takes `serial_log` and, under CI, the
+/// in-process backend. A taken TCP port leaves its stream unconnected; port 0 takes any free port.
+pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort], console: usize) -> Result<(), String> {
     for (i, a) in ports.iter().enumerate() {
         if let Some(b) = ports[i + 1..].iter().find(|b| b.port == a.port && a.port != 0) {
             return Err(format!("{name} {} and {} serial ports must be distinct", a.label, b.label));
@@ -33,6 +32,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
     for (index, port) in ports.iter().enumerate() {
         log_config.serial_log = if index == console { cfg.serial_log.clone() } else { port.log.clone() };
         let tag = format!("{name} {}", port.label);
+        let console_mark = if index == console { " (console)" } else { "" };
         let log = open_log(&log_config, &tag);
         let host = match port.setting {
             "serial_port_a" => cfg.serial_backends.a.as_ref(),
@@ -42,36 +42,14 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
             key if key.ends_with(".l1_port") => cfg.serial_backends.l1.as_ref(),
             _ => None,
         };
-        let backend: Arc<dyn SerialBackend> = if let Some(host) = host {
-            let line = crate::dev::serial_host::SerialLine {
-                label: &tag, tcp_port: None, tcp_setting: port.setting,
-                socket: None, socket_setting: "",
-            };
-            crate::dev::serial_host::serial_line_with_override(
-                &line, log, (cfg.ci && index == console).then_some(port.ci), Some(host),
-            ).0
-        } else if cfg.ci && index == console {
-            if let Some(log) = log {
-                port.ci.set_log(log);
-            }
-            port.ci.clone()
-        } else {
-            let mut backend = null_serial_backend();
-            match tcp_serial_backend(port.port) {
-                Some((socket, actual_port)) => {
-                    eprintln!("iris: {tag} on 127.0.0.1:{actual_port}");
-                    backend = socket;
-                }
-                None => eprintln!(
-                    "iris: {tag}: port {} unavailable; is another iris using it? ({})",
-                    port.port, port.setting
-                ),
-            }
-            match log {
-                Some(log) => Arc::new(TeeBackend::new(backend, log)),
-                None => backend,
-            }
+        let line = SerialLine {
+            label: &format!("{tag}{console_mark}"),
+            tcp_port: Some(port.port),
+            tcp_setting: port.setting,
+            socket: port.socket.as_ref().map(|(path, _)| path.as_str()),
+            socket_setting: port.socket.as_ref().map_or("", |(_, setting)| setting),
         };
+        let (backend, _) = serial_line_with_override(&line, log, (cfg.ci && index == console).then_some(&port.ci), host);
         (port.connect)(backend);
     }
     Ok(())
@@ -101,9 +79,10 @@ mod frontend_tests {
                 _ => &mut cfg.serial_backends.d,
             };
             *slot = Some(host.clone());
-            let installed = Mutex::new(None);
-            let ports = [SerialPort { label: "fixture", port, setting, ci: &ci,
-                log: None, connect: Box::new(|backend| *installed.lock() = Some(backend)) }];
+            let installed = Arc::new(Mutex::new(None));
+            let output = installed.clone();
+            let ports = [SerialPort { label: "fixture", port, setting, ci: ci.clone(),
+                log: None, socket: None, connect: Box::new(move |backend| *output.lock() = Some(backend)) }];
             connect_serial_ports(&cfg, "test", &ports, 0).unwrap();
             let backend = installed.lock().clone().unwrap();
             assert!(backend.try_send_byte(b'x'));

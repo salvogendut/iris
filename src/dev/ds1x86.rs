@@ -5,7 +5,8 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 use crate::snapshot::{get_field, u8_slice_to_toml, load_u8_slice};
 use crate::config::{format_unix_utc, RtcOffset};
 use crate::dev::battery_clock;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use crate::dev::chip_clock::{Clock, Stamp};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs::File;
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
@@ -35,7 +36,7 @@ struct RtcData {
     // Base time in centiseconds since epoch
     base_centiseconds: u64,
     // Timestamp when time registers were last set (for delta calculation)
-    time_base: Instant,
+    time_base: Stamp,
     // Calendar registers already represent this tick. Never serialized: loads
     // and guest writes invalidate it, including writes within the same tick.
     converted_centiseconds: Option<u64>,
@@ -58,17 +59,19 @@ pub struct Ds1x86 {
     /// keeps no clock of the guest's (`[rtc_offset]`). Only the seed moves;
     /// the clock then runs normally.
     offset: RtcOffset,
+    clock: Clock,
 }
 
 impl Ds1x86 {
     pub fn new(size: usize, nvram_path: String, offset: RtcOffset) -> Self {
         // DS1286: 64 bytes, regs at 0
         // DS1386: 8K/32K, regs at 0 (first 16 bytes)
+        let clock = Clock::default();
         let rtc = Self {
             data: Mutex::new(RtcData {
                 regs: vec![0; size],
                 base_centiseconds: 0,
-                time_base: Instant::now(),
+                time_base: clock.now(),
                 converted_centiseconds: None,
                 calendar_cache_enabled: false,
                 set: false,
@@ -76,6 +79,7 @@ impl Ds1x86 {
             size,
             nvram_path,
             offset,
+            clock,
         };
 
         // The clock starts where `[rtc_offset]` puts it, unless a clock the
@@ -98,9 +102,20 @@ impl Ds1x86 {
         rtc
     }
 
+    /// ci_clock: the CPU's cycle counter, the clock's time base (see
+    /// [`Clock`]). Until it is set the clock stands still.
+    #[cfg(feature = "ci_clock")]
+    pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
+        self.clock.set_cpu_cycles(cycles);
+    }
+
     /// Run the clock `offset` seconds from host time.
     fn start_clock(&self, data: &mut RtcData, offset: i64) {
+        #[cfg(not(feature = "ci_clock"))]
         let (host, at) = battery_clock::host_second();
+        // The second starts now: guest time has no host second to align to.
+        #[cfg(feature = "ci_clock")]
+        let (host, at) = (battery_clock::host_second().0, self.clock.now());
         data.base_centiseconds = (host + offset).max(0) as u64 * 100;
         data.converted_centiseconds = None;
         data.time_base = at;
@@ -109,8 +124,8 @@ impl Ds1x86 {
     }
 
     /// The guest's time now, in whole seconds since 1970.
-    fn guest_now(data: &RtcData) -> i64 {
-        ((data.base_centiseconds + data.time_base.elapsed().as_millis() as u64 / 10) / 100) as i64
+    fn guest_now(&self, data: &RtcData) -> i64 {
+        ((data.base_centiseconds + self.clock.since(data.time_base).as_millis() as u64 / 10) / 100) as i64
     }
 
     /// Set per-machine calendar caching; host policy is not snapshot state.
@@ -226,11 +241,10 @@ impl Ds1x86 {
     // Update time registers based on elapsed time since time_base
     // Should only be called when TE bit is 1 (updates enabled)
     fn update_time(&self, rtc_data: &mut RtcData) {
-        self.update_time_at(rtc_data, Instant::now());
+        self.update_time_elapsed(rtc_data, self.clock.since(rtc_data.time_base));
     }
 
-    fn update_time_at(&self, rtc_data: &mut RtcData, now: Instant) {
-        let elapsed = now.duration_since(rtc_data.time_base);
+    fn update_time_elapsed(&self, rtc_data: &mut RtcData, elapsed: std::time::Duration) {
         let elapsed_centiseconds = (elapsed.as_secs() * 100) + (elapsed.subsec_nanos() / 10_000_000) as u64;
         let current_centiseconds = rtc_data.base_centiseconds + elapsed_centiseconds;
 
@@ -250,7 +264,7 @@ impl Ds1x86 {
         }
         crate::nv_storage::save(filename, &data.regs)?;
         if data.set {
-            let r = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now(), Some(Self::guest_now(&data)));
+            let r = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now(), Some(self.guest_now(&data)));
             battery_clock::write(&battery_clock::companion(Path::new(filename)), &r)?;
         }
         Ok(())
@@ -283,7 +297,7 @@ impl Ds1x86 {
             }
             // The time registers in the file are stale: run on from the seed.
             None => {
-                let base = data.base_centiseconds + data.time_base.elapsed().as_millis() as u64 / 10;
+                let base = data.base_centiseconds + self.clock.since(data.time_base).as_millis() as u64 / 10;
                 self.centiseconds_to_regs(base, &mut data.regs, 0);
             }
         }
@@ -372,10 +386,10 @@ impl Ds1x86 {
         if is_time_reg {
             // Update base time when time registers are written. A write
             // that moves the clock sets it.
-            let before = Self::guest_now(&rtc_data);
+            let before = self.guest_now(&rtc_data);
             rtc_data.base_centiseconds = self.regs_to_centiseconds(&rtc_data.regs, base);
-            rtc_data.time_base = Instant::now();
-            if battery_clock::sets(before, Self::guest_now(&rtc_data)) {
+            rtc_data.time_base = self.clock.now();
+            if battery_clock::sets(before, self.guest_now(&rtc_data)) {
                 rtc_data.set = true;
             }
         } else if is_cmd_reg {
@@ -572,7 +586,7 @@ impl Saveable for Ds1x86 {
         // Recompute base_centiseconds from the restored register values,
         // same as load_nvram does — no need to store it separately.
         data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
-        data.time_base = Instant::now();
+        data.time_base = self.clock.now();
         data.converted_centiseconds = None;
         Ok(())
     }
@@ -589,13 +603,13 @@ mod tests {
         for enabled in [false, true] {
             rtc.set_calendar_cache_enabled(enabled);
             let mut data = rtc.data.lock();
-            let now = data.time_base;
-            rtc.update_time_at(&mut data, now);
+            let now = std::time::Duration::ZERO;
+            rtc.update_time_elapsed(&mut data, now);
             let seconds = data.regs[1];
             // A stale value at the same tick exposes whether conversion was
             // actually bypassed, rather than merely producing equal dates.
             data.regs[1] = 0xff;
-            rtc.update_time_at(&mut data, now);
+            rtc.update_time_elapsed(&mut data, now);
             assert_eq!(data.regs[1], if enabled { 0xff } else { seconds });
             drop(data);
             let saved = rtc.save_state();
@@ -611,15 +625,15 @@ mod tests {
             let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
             rtc.set_calendar_cache_enabled(enabled);
             let mut data = rtc.data.lock();
-            let now = Instant::now();
+            let now = std::time::Duration::ZERO;
             // 2000-02-28 23:59:59.99 UTC, immediately before leap day.
             data.base_centiseconds = 95178239999;
-            data.time_base = now;
-            rtc.update_time_at(&mut data, now);
+            data.time_base = rtc.clock.now();
+            rtc.update_time_elapsed(&mut data, now);
             let before = data.regs.clone();
-            rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(9));
+            rtc.update_time_elapsed(&mut data, now + std::time::Duration::from_millis(9));
             assert_eq!(data.regs, before);
-            rtc.update_time_at(&mut data, now + std::time::Duration::from_millis(10));
+            rtc.update_time_elapsed(&mut data, now + std::time::Duration::from_millis(10));
             assert_eq!(data.regs[0], 0);
             assert_eq!(data.regs[1], 0);
             assert_eq!(data.regs[2], 0);
@@ -634,11 +648,11 @@ mod tests {
         for enabled in [false, true] {
             let rtc = Ds1x86::new(8192, String::new(), RtcOffset::default());
             rtc.set_calendar_cache_enabled(enabled);
-            let now = Instant::now();
+            let now = std::time::Duration::ZERO;
             let before = {
                 let mut data = rtc.data.lock();
-                data.time_base = now;
-                rtc.update_time_at(&mut data, now);
+                data.time_base = rtc.clock.now();
+                rtc.update_time_elapsed(&mut data, now);
                 data.regs[1]
             };
             rtc.execute_command("rtc", &["w", "1", "99"], Box::new(std::io::sink())).unwrap();
@@ -646,7 +660,7 @@ mod tests {
             assert!(data.converted_centiseconds.is_none());
             // Raw monitor writes do not reset the time base. The next update
             // must still restore the running clock, even in the same tick.
-            rtc.update_time_at(&mut data, now);
+            rtc.update_time_elapsed(&mut data, now);
             assert_eq!(data.regs[1], before);
         }
     }
@@ -740,9 +754,35 @@ mod tests {
         rtc.regs_to_centiseconds(&d.regs, 0) as i64 / 100
     }
 
+    /// Under `ci_clock` the clock runs on the cycle count, as CP0 Count does,
+    /// so it reads the same however long the host took.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_time_follows_the_cycle_count() {
+        let path = std::env::temp_dir().join(format!("ds1x86-ci-clock-{}", std::process::id()));
+        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default());
+        let cycles = std::cell::UnsafeCell::new(0u64);
+        rtc.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        set_2004(&rtc);
+        let centiseconds = |rtc: &Ds1x86| {
+            let mut d = rtc.data.lock();
+            rtc.update_time(&mut d);
+            rtc.regs_to_centiseconds(&d.regs, 0)
+        };
+        let start = centiseconds(&rtc);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(centiseconds(&rtc), start, "host time does not move the clock");
+        // SAFETY: only this thread writes it; the clock reads it here, between.
+        unsafe { *cycles.get() = 150_000_000 }; // 1.5 s at 10 ns per cycle
+        assert_eq!(centiseconds(&rtc) - start, 150);
+        assert!(!path.exists(), "nothing was saved");
+    }
+
     /// A date the guest sets survives a relaunch, still running, from the
     /// reference beside the file, and wins over `[rtc_offset]`; the file
-    /// stays the chip's 8192 bytes.
+    /// stays the chip's 8192 bytes. Host time runs the clock here, which a
+    /// `ci_clock` build does not use.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn a_set_date_survives_a_relaunch() {
         let path = std::env::temp_dir().join(format!("ds1x86-clock-{}", std::process::id()));
