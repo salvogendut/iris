@@ -6306,10 +6306,12 @@ mod tests {
         push_hot_request(&new.hot_handle(), CompileRequest {
             page: &mut new_page,
             compiled_for_fr1: true,
+            cpu: 0,
         });
         assert!(old.send(CompileRequest {
             page: &mut old_page,
             compiled_for_fr1: true,
+            cpu: 0,
         }, &JitStats::default()));
         old.start(old_bus.clone(), Arc::new(JitStats::default()));
 
