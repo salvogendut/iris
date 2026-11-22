@@ -5881,7 +5881,9 @@ mod tests {
     /// A CPU thread as a compile pool sees one: it parks while held, and
     /// stops the way `MipsCpu::halt` does, with the park bit and a join. The
     /// first time it is held it flushes the pool itself instead, as a CPU whose
-    /// page pool runs out just as a worker leads an arena flush would.
+    /// page pool runs out just as a worker leads an arena flush would. Not
+    /// under loom: the forced flush it relies on is a plain-test hook.
+    #[cfg(not(loom))]
     struct FlushingCpu {
         word: Arc<AtomicU64>,
         slot: Arc<crate::cpu::smp::ParkSlot>,
@@ -5890,6 +5892,7 @@ mod tests {
         thread: Mutex<Option<JoinHandle<()>>>,
     }
 
+    #[cfg(not(loom))]
     impl FlushingCpu {
         fn start(jit: Arc<Mutex<Jitv2>>, world: Option<Arc<crate::cpu::smp::World>>, bus: Arc<dyn BusDevice>, word: Arc<AtomicU64>, slot: Arc<crate::cpu::smp::ParkSlot>) -> Arc<Self> {
             use crate::cpu::smp::HOST_PARK_BIT;
@@ -5919,6 +5922,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(loom))]
     impl Device for FlushingCpu {
         fn step(&self, _cycles: u64) {}
         fn stop(&self) {
@@ -5941,6 +5945,7 @@ mod tests {
     /// it instead, and the CPU waiting its turn to flush counts as parked, so
     /// both flushes finish, one after the other. Run on a spawned thread so a
     /// regression fails here instead of hanging the test binary.
+    #[cfg(not(loom))]
     #[test]
     fn a_cpu_flush_inside_a_worker_led_flush_takes_its_turn() {
         let epoch = crate::cpu::jitv2::hashstats::FLUSH_EPOCH.load(Ordering::SeqCst);
