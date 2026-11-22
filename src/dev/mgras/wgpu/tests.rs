@@ -696,7 +696,10 @@ fn transfer_reads_see_the_drawing() {
             regs.push((reg::XFRSIZE, p.rng.range(1, 48) as u32));
             p.apply(&regs);
             p.exec(reg::IR, 0x8);
-            for line in 0..p.rng.range(1, 8) as u32 {
+            // The GPU mirror is refreshed only under the armed block. A
+            // DMA line past its height reads outside that synchronized area.
+            let rows = p.cpu.transfer_shape().unwrap().0;
+            for line in 0..(p.rng.range(1, 8) as u32).min(rows) {
                 let want = p.cpu.dma_read_line(line);
                 p.gpu.gpu_sync_transfer(Observation::DmaRead).unwrap();
                 let got = p.gpu.dma_read_line(line);
