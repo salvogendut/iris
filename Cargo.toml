@@ -55,6 +55,12 @@ perfetto = []
 # live either way. jit_go_count is load-bearing in tests: several JIT tests
 # assert on it to prove they compared compiled code, not the interpreter.
 rexdiag = []
+# VPro texture packing check: records how each upload into board memory
+# packed its texels and checks every texture level descriptor against the
+# upload that wrote its memory; `vpro status` reports disagreements. A
+# diagnostic with a small cost per upload and per texture bind, so off by
+# default and independent of `developer`: `lightning,vprodiag` builds.
+vprodiag = []
 # Stale-code detector: verify, at execution time, that the instruction word an
 # engine is about to run still matches what memory holds at that VA.
 #
@@ -486,6 +492,10 @@ required-features = ["jitv2"]
 name = "jitv2-pcp-dump"
 path = "src/bin/jitv2_pcp_dump.rs"
 required-features = ["jitv2", "j2wp"]
+
+[[example]]
+name = "ultra64-peer"
+path = "examples/ultra64_peer.rs"
 
 [[example]]
 name = "rex3-gpu-probe"

@@ -31,8 +31,85 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Embedded hosts receive a distinct powered-off state after disk flushing.
 - Embedded frontends reject incomplete snapshots in their own storage folder.
 
+### jitv2 flushes
+
+- Under jitv2, a single-processor machine no longer hangs when the CPU runs out
+  of JIT pages (or `j2 flush`, `j2 inline on` or a cache change on the O2 asks
+  for a flush) while a compile worker is flushing its full code arena. A
+  worker's flush no longer restarts a CPU the monitor has stopped.
+### Linux file choosers
+
+- The Linux AppImage of iris-gui now opens the desktop's file chooser through
+  the XDG portal; it used to need `zenity` installed. On a system with
+  neither a portal nor `zenity`, the Browse buttons now say what to install
+  instead of doing nothing.
+### Indy and Indigo2 keyboard
+
+- The Indy and Indigo2 keyboard controller now translates key codes when the
+  guest asks it to. NetBSD's installer and console get working cursor keys,
+  and a key no longer repeats forever after it is pressed
+  ([#765](https://github.com/techomancer/iris/issues/765)).
+### NetBSD on the R5000 Indy
+
+- NetBSD/sgimips boots on an Indy with `--cpu r5000`; its kernel
+  stopped with `panic: r5k picache line size 16` before reaching the installer.
+### InfiniteReality graphics
+
+- The InfiniteReality pipe's tile renderer no longer hangs when one of its
+  jobs is handed to a worker at the same moment that worker goes idle, which
+  happened in about 1 in 15 test runs on Apple Silicon (Onyx2, Origin 3200).
+
+### Volume headers
+
+- `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
+  Octane's PROM can load a Linux kernel from the disk's volume header; an
+  11 MB `vmlinux` made it time out or panic. `--no-split` keeps files as
+  they are.
+
+### virtio
+
+- virtio-serial and virtio-9p on PCI (Octane, Tezro) offer
+  `VIRTIO_F_ACCESS_PLATFORM`, so Linux gives them bus addresses they can reach
+  instead of physical ones; Linux's `virtio_console` hung at load.
+
+### Fibre Channel
+
+- Linux's qla2xxx brings the ISP2200's loop online and finds its disks on the
+  Octane (Linux 7.3); it stopped at the port login, which the adapter refused.
+### Octane
+
+- The Bridges' 64 GB windows reach PCI: the 32-bit and 64-bit aliases of PCI
+  memory and PCI I/O space, on the onboard Bridge and on the PCI module's
+  and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
+  no longer stops with a bus error before its first message.
+- `[virtio_serial] bridge_slot` and `[virtio_9p] bridge_slot` move the
+  Octane's virtio devices within the onboard Bridge's slots 4 to 7.
+- virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
+  the SuperIO interrupt pin: Linux's serial console no longer dies when
+  virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
+### PCI-to-PCI bridges
+
+- The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes
+  32-bit I/O, as the DEC 21154 it reports does, so an I/O BAR above 64 KiB
+  behind it reaches the card. IRIX 6.5.30 on the Octane puts the ISP2200's
+  there and no longer warns `ppb IO base/limit conflict` at boot. The
+  bridge's ISA enable bit now blocks what it blocks on the real part.
+
 ### Display
 
+- VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
+  server now appear, on the CPU raster and the GPU raster unit; LightWave
+  Modeler's viewports showed no grid, labels or model.
+- VPro: Icon Catalog on a 12-bit visual scrolls cleanly (scrolled icons came
+  out pale and scrambled) and its tabs are grey again, not red and green.
+- VPro: the check mark of a checked menu toggle (IRIS GL pop-up menus, such
+  as powerflip's) draws as a check mark, not a black bar twice the box's width.
+- VPro: text in X edit fields on a TrueColor desktop (nedit's file dialog,
+  any Motif text field) no longer loses the columns the text cursor has passed over.
+- VPro: buttonfly's button labels draw as letters, not as pale boxes; large
+  LUMINANCE and INTENSITY textures are no longer stored as four 4-bit channels.
+- Maximum IMPACT: every other screen row stayed black (PROM menus and
+  monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables
   (`GL_SGI_texture_color_table`) now map textures as on a real board, in the
   interpreter, the raster JIT and the GPU raster unit.
@@ -40,6 +117,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   the Indy and Indigo2: the second board moved to GIO expansion slot 0 with
   its interrupts on that slot, and `iris` opens a window for each head. The
   Ultra64 board shares that slot and is turned off with two heads.
+- Indy and Indigo2: two devices on one shared graphics interrupt (Indigo2 GIO
+  slots, both heads) no longer lose an interrupt when one of them lets go.
 - The `iris` window shows frames at once and no longer waits for the host
   monitor's vertical sync, so the guest's retrace is not held to the host's
   rate. `vsync = true` restores the wait (useful on an X11 desktop with no
@@ -136,6 +215,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   volume buttons, NetBSD and the PROM).
 - Tezro: `[tezro] audio = true` adds an ICE1724 audio controller (off by
   default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
+- Fuel, Origin 3200 and Onyx 3000: `[machine] audio_card = true` fits the same
+  ICE1724 audio card (IRIX's "MAD"), so these machines have sound.
+- Tezro, Fuel, Origin 3200 and Onyx 3000: IRIX's flushed PIO reads through the
+  PIC no longer hang the machine; on a Tezro with audio, amesh and other sound
+  programs froze it with their sound repeating.
+- `ice1724` (alias `envy`) shows the Tezro audio controller's own state: the
+  interrupt line, status and mask registers, each engine's buffer and
+  position, a register dump and the guest's last accesses (see `debug.md`).
 - Onyx2: MediaIO sound no longer drops every other second, panics the kernel
   on the first sound, or makes the driver report "RAD UST not incrementing".
 - The monitor's `audio status` lists every sound card (HAL2, MACE audio,
@@ -155,6 +242,21 @@ hashes are given where a change is easiest to understand by reading the commit.
   boots on both from a Fibre Channel disk (`[fibre_channel.disk.N]`).
 - The I-brick has a USB keyboard and mouse, driven by the `ps2` monitor
   commands.
+- Origin 3200 and Onyx 3000: `[machine] cpus` fits 1, 2 or 4 processors on
+  each C-brick, up to eight with two C-bricks. A kept flash file follows the
+  new count on the next start. [Guide](docs/origin3200-ip35.md)
+- Onyx 3000: `[machine] nodes` selects one or two C-bricks with either
+  graphics board. Unset, it is as before: one with `ir3`, two with `v12`.
+- Config: what one machine has beyond the shared keys (`nodes`, `flash`,
+  `console`, `l1_port`, `usb_input`, `audio_card` and the rest) is now written
+  in `[machine]`. The tables named for a machine (`[tezro]`, `[onyx3000]`,
+  `[fuel]`, ...) are still read; iris-gui saves the new layout. Error
+  messages name the `machine.` key.
+- `[graphics] node` and `widget` say where the graphics board plugs in on the
+  Onyx 3000 (and `widget` on the Tezro), for trying other placements.
+- Origin 3200 and Onyx 3000 with two C-bricks of 512 MiB or more each: IRIX
+  no longer corrupts memory (processes dying with memory faults and bus
+  errors, kernel panics and hangs under disk load).
 
 ### Onyx 3000
 
@@ -201,6 +303,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### O2
 
+- OpenBSD finds its SCSI disks and CD-ROM again: since 2026-10-31 its
+  accesses to the AIC-7880s went to memory, so every command timed out
+  ("board is not responding").
+- An R5000 O2 running OpenBSD no longer stops for good the first time it
+  idles (after `boot device: sd0`).
+- `iris-ci rollback` works on the O2, returning memory, devices and
+  copy-on-write disks to the last `restore`.
 - `prom` also takes the IRIX installer's `ip32prom.image`; a raw O2 PROM file
   that is not the whole 512 KiB flash is refused at start with the reason.
 - On a busy host the O2 no longer stops at the PROM's serial loader prompt
@@ -218,6 +327,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   supply, system board and processor module records, not the Octane's.
 - Onyx2: the BaseIO-G has the MediaIO daughtercard (a second IOC3: serial,
   keyboard, mouse, parallel port, RAD1 audio), and `hinv` lists it all.
+
+### Ultra64 dev board
+
+- macOS: the Indy now receives the N64 emulator's interrupts and RDB packets;
+  the bridge's shared memory grew, so rebuild gopher64 against this IRIS.
+- Indy: acknowledging one of the board's interrupts (GIO, RDB read, RDB
+  write) no longer drops another that is still pending (issue 263).
 
 ### Indy and Indigo2 chime on the first boot
 
@@ -252,6 +368,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   `monitor_history` file left by an earlier nightly is no longer read.
 - Tab at the terminal console completes monitor command names, also after
   `cpu` and `cpu <n>`.
+- Machines with more than one CPU: `b <symbol>` and other breakpoint commands
+  accept names from a map loaded with `loadsym` (they failed with "unknown
+  symbol").
 - The terminal is left usable however iris ends (monitor `quit`, a signal, the
   guest powering off, the window closing, a panic), not only after Ctrl-C.
 - The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over
@@ -259,6 +378,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Storage
 
+- Indy and Indigo2 under NetBSD (and other drivers that arm the DMA channel
+  after starting a transfer): a SCSI data phase now starts when the driver
+  arms the channel, not on a 100 µs poll after it (issue 346).
+- Octane: iris warns at start-up about a device on the internal SCSI bus
+  outside ids 1-3, which the PROM and IRIX never probe (a CD-ROM at
+  `[scsi.4]` was invisible); put such devices on controller 1.
+- `log scsi` shows each mailbox command, request (controller, target, CDB)
+  and completion of the QLogic SCSI adapters (Octane and later machines).
 - A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be an
   `http://` or `https://` URL on a server with range support. See STORAGE.md.
 - New default Cargo feature `http-media` provides those URLs.
@@ -412,6 +539,8 @@ image) where the guest test suites showed they differed:
   replayable recording from the monitor, with no `IRIS_ODSY_REC` at power-on.
 - Replays check the marks' hashes; `VPRO_REPLAY_DUMP=<dir>` writes the
   replayed planes in `vpro fbdump`'s files.
+- `IRIS_ODSY_TRACE=<file>` also traces a replay (`gputrace` builds), and
+  pattern loads in a trace show their words.
 
 ### VPro on the host GPU
 
@@ -463,6 +592,10 @@ image) where the guest test suites showed they differed:
   every CPU, interpreter and jitv2; the Octane PROM's `ide fpu` tests pass.
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` set the Inexact
   cause and flag, and raise an enabled Inexact trap, when they drop a fraction.
+- FPU conversions follow the R4400, R5000 and R10000 rules (#71): an
+  unrepresentable result, a denormal or quiet-NaN source, and a long past the
+  part's range go to the kernel's FP emulator. `CVT.S.D` raises Inexact with
+  Overflow and flushes or traps an underflow by FCSR.FS. Interpreter and jitv2.
 
 ### Interpreter
 
@@ -471,6 +604,14 @@ image) where the guest test suites showed they differed:
 
 ### jitv2
 
+- jitv2: compiled code is kept when a memory controller moves a bank (the
+  PROM's memory sizing on Indy, O2, Octane and the IP27/IP35 machines no
+  longer flushes it), and addresses that reach the same memory share one
+  compiled page.
+- jitv2 on machines of several nodes (Origin 2000/Onyx2, Origin 3200/Onyx
+  3000): every processor shares one compile pool and one body of compiled
+  code, where each node had its own. `j2 pcp` shows a page's bank and offset;
+  `j2 status` counts remaps.
 - The compile pool no longer polls: an idle worker parks until a request
   arrives, instead of waking every 200µs (which cost about 1.4% of a host
   core per worker), and a small host can now settle. All machines.
@@ -496,6 +637,8 @@ image) where the guest test suites showed they differed:
 
 ### Idle parking
 
+- With `idle-pause`, a single-processor machine whose guest has no interrupt
+  source (the Octane PROM menu, fx) no longer parks for good after a minute.
 - With `idle-pause`, multiprocessors (Octane, Tezro, Origin, Onyx) no longer
   stall at boot; `IRIS_IDLE_PEER_US` and `IRIS_IDLE_SLICE_US` bound a park.
 - An idle multiprocessor under jitv2 wakes far less often, and busy kernel
@@ -523,6 +666,8 @@ image) where the guest test suites showed they differed:
 - Nightlies and releases publish only after `build.yml` boots IRIX on an Indy
   and an O2 on Linux, macOS and Windows and matches golden login screens.
 - `iris-ci screen-wait GOLDEN` waits for the screen to match a golden image.
+- `iris-ci boot-test` boots OpenBSD 6.9 on the O2 to its login with
+  `--steps tests/openbsd/boot-openbsd69-o2.toml` (a local disk; see TESTING.md).
 - A failed first phase keeps the PROM's output and the CPU's registers
   (`phase-a.log`, `phase-a-cpu.log`).
 - `iris-ci rtc-save` works on an O2, writing its PROM flash.
@@ -533,6 +678,8 @@ image) where the guest test suites showed they differed:
 
 - The `developer` profile uses thin LTO, so a rebuild after an edit takes one
   to three minutes instead of about nine; measure performance with `--release`.
+- Distribution packagers can build iris and iris-gui without network access,
+  CHD support included: `cargo vendor`, then `LIBCHDMAN_FORCE_SOURCE=1` (issue 213).
 
 ### iris-gui
 
@@ -546,6 +693,17 @@ image) where the guest test suites showed they differed:
   earlier keeps its `threads = 1` until **Automatic** is ticked.
 - The CI tab's **Ping** and the CI self-test reach the configured CI socket.
 - The **Use built-in PROM** button no longer leaves a `prom` iris refuses.
+- The stopped-machine summary lists NVMe and Fibre Channel disks, names SCSI
+  targets on a second bus as `controller:id` (also in the missing-disk prompt),
+  leaves out the Origin 3200's unused SCSI map and shows an unplugged or
+  stream Ethernet.
+- The New machine dialog names the machine after the chosen model (`o2`,
+  `octane`) until a name is typed, and asks for a motherboard EEPROM only on
+  the Indigo2, as the settings editor now does.
+- The summary shows the machine folder and paths relative to it, cut to the
+  panel's width; coloured buttons (Start, Stop, Create, …) have white text;
+  the status footer says "No network" instead of a network light on a machine
+  with networking off, and names a stream network.
 
 ## October 2026
 

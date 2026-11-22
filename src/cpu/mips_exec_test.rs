@@ -180,6 +180,10 @@ mod tests {
         fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
             std::ptr::null()
         }
+        #[cfg(feature = "jitv2")]
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, std::ptr::null()))
+        }
     }
 
     /// Disable every jitv2 dispatch path on a freshly-constructed executor —
@@ -261,30 +265,6 @@ mod tests {
         core.reset(false);
         assert_eq!(core.cp0_prid, 0x0000_2321, "R5000 PRId after reset");
         assert_eq!(core.fpu_fir,  0x0000_2300, "R5000 FIR after reset");
-    }
-
-    /// R5000 Config IB/DB describe fixed 32-byte lines (VR5000 UM 6.5.8).
-    /// NetBSD writes K0 without copying those read-only fields back.
-    #[test]
-    fn config_writes_preserve_r5000_fixed_cache_lines() {
-        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(prid: u32, fixed: bool) {
-            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
-            let cfg = MipsCpuConfig::indy().with_prid(prid);
-            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg);
-            let before = exec.core.read_cp0(16);
-            if fixed { assert_eq!(before & 0x30, 0x30); }
-            for value in [0u64, 3, 0x30, 7] {
-                exec.core.write_gpr(8, value);
-                assert_eq!(exec.exec(0x4088_8000), EXEC_COMPLETE); // mtc0 t0, Config
-                let after = exec.core.read_cp0(16);
-                assert_eq!(after & 7, value & 7, "K0 remains writable");
-                assert_eq!(after & 0x30, if fixed { 0x30 } else { value & 0x30 });
-                assert_eq!(after & !0x3f, before & !0x3f, "cache sizes and other fields stay intact");
-            }
-        }
-        check::<R4400Cache>(0x0450, false);
-        check::<crate::cpu::mips_cache_v2::R5000Cache>(0x2310, true);
-        check::<crate::cpu::mips_cache_v2::R5000Cache>(0x2321, true);
     }
 
     /// IP28's play_hello_tune returns before touching HAL2 on pre-2.0 CPUs.
@@ -1514,53 +1494,60 @@ mod tests {
         });
     }
 
-    /// 2^31 is a single but not a word, so CVT.W.S of it is Invalid with the
-    /// largest word as the default result, like any other overflow. It was
-    /// taken for in range because `i32::MAX as f32` rounds up to it. -2^31
-    /// still converts exactly.
+    /// 2^31 is a single but not a word, so CVT.W.S of it is unrepresentable
+    /// (Unimplemented Operation on every modelled part). It was taken for in
+    /// range because `i32::MAX as f32` rounds up to it. -2^31 still converts
+    /// exactly.
     #[test]
-    fn cvt_w_s_of_2_to_the_31_is_invalid() {
-        const FCSR_CV: u32 = 0x0001_0000;
+    fn cvt_w_s_of_2_to_the_31_is_unrepresentable() {
+        const FCSR_CE: u32 = 0x0002_0000;
         on_big_stack(|| {
             let mut exec = tlb_exec::<R4400Cache>(Arc::new(MockMemory::new()));
             exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
             let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
-            for (input, want, invalid) in [(2147483648.0f32, i32::MAX, true), (-2147483648.0f32, i32::MIN, false)] {
+            for (input, want, traps) in [(2147483648.0f32, 0x5a5a_5a5a, true), (-2147483648.0f32, i32::MIN, false)] {
                 exec.core.fpu_fcsr = 0;
                 exec.core.fpr[1] = input.to_bits() as u64;
-                assert_eq!(exec.exec(cvt), EXEC_COMPLETE, "{input}");
+                exec.core.fpr[2] = 0x5a5a_5a5a;
+                let s = exec.exec(cvt);
+                assert_eq!(s & EXEC_IS_EXCEPTION != 0, traps, "{input}");
                 assert_eq!(exec.core.fpr[2] as u32, want as u32, "{input} result");
-                assert_eq!(exec.core.fpu_fcsr & FCSR_CV != 0, invalid, "{input} Cause.V");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CE != 0, traps, "{input} Cause.E");
             }
         });
     }
 
     /// A conversion whose result a word cannot hold takes Unimplemented
-    /// Operation on the R10000 family, leaving fd alone (NEC U10278EJ4V0UM
-    /// Appendix B.4, p. 350); the R4400 raises Invalid and writes the default.
+    /// Operation, leaving fd alone, on every modelled part: measured on an
+    /// Indy R4400 (cpu-tests oracle), VR5000 UM 9.4.6, NEC U10278EJ4V0UM
+    /// Appendix B.4, p. 350.
     #[test]
-    fn unrepresentable_conversions_are_unimplemented_on_the_r10000_family() {
+    fn unrepresentable_conversions_are_unimplemented() {
         const FCSR_CE: u32 = 0x0002_0000;
         const FCSR_CV: u32 = 0x0001_0000;
         const OLD: u64 = 0x5a5a_5a5a;
-        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(traps: bool) {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>() {
             let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
             exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
             let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
-            for input in [2147483648.0f32, f32::INFINITY, -1.0e20, f32::NAN] {
+            let trunc_d = make_cop1_compute(RS_D, 0, 1, 2, FUNCT_FTRUNC_W);
+            for (instr, input) in [
+                (cvt, 2147483648.0f32.to_bits() as u64),
+                (cvt, f32::INFINITY.to_bits() as u64),
+                (cvt, (-1.0e20f32).to_bits() as u64),
+                (cvt, 0x7FBF_FFFF), // MIPS quiet NaN
+                (cvt, 0x7FC0_0000), // MIPS signalling NaN
+                (trunc_d, (-2147483649.0f64).to_bits()),
+                (trunc_d, f64::NEG_INFINITY.to_bits()),
+            ] {
                 exec.core.fpu_fcsr = 0;
-                exec.core.fpr[1] = input.to_bits() as u64;
+                exec.core.fpr[1] = input;
                 exec.core.fpr[2] = OLD;
-                let s = exec.exec(cvt);
-                if traps {
-                    assert!(s & EXEC_IS_EXCEPTION != 0, "{input} traps");
-                    assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input} FPE");
-                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input} Cause.E alone");
-                    assert_eq!(exec.core.fpr[2], OLD, "{input} fd untouched");
-                } else {
-                    assert_eq!(s, EXEC_COMPLETE, "{input}");
-                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CV, "{input} Cause.V");
-                }
+                let s = exec.exec(instr);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{input:#x} traps");
+                assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input:#x} FPE");
+                assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input:#x} Cause.E alone");
+                assert_eq!(exec.core.fpr[2], OLD, "{input:#x} fd untouched");
             }
             // A representable value still converts.
             exec.core.fpu_fcsr = 0;
@@ -1569,9 +1556,281 @@ mod tests {
             assert_eq!(exec.core.fpr[2] as u32, 7);
         }
         on_big_stack(|| {
-            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
-            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
-            run::<R4400Cache>(false);
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+            run::<crate::cpu::mips_cache_v2::R5000Cache>();
+            run::<R4400Cache>();
+        });
+    }
+
+    /// One FP conversion on model `C`, FR=1, with FCSR written through CTC1's
+    /// own path (so the host rounding mode follows RM) and a sentinel in fd
+    /// ($f2). The source is $f1. Returns the status, fd and FCSR, and puts
+    /// the host back in round-to-nearest.
+    fn conv_case<C: CpuModel + From<Arc<dyn BusDevice>>>(fmt: u32, funct: u32, src: u64, fcsr: u32) -> (crate::cpu::mips_exec::ExecStatus, u64, u32) {
+        struct RestoreRounding;
+        impl Drop for RestoreRounding {
+            fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
+        }
+        let _restore = RestoreRounding;
+        let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+        exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+        exec.core.write_fpu_control(31, fcsr);
+        exec.core.fpr[1] = src;
+        exec.core.fpr[2] = CONV_OLD;
+        let s = exec.exec(make_cop1_compute(fmt, 0, 1, 2, funct));
+        (s, exec.core.fpr[2], exec.core.fpu_fcsr)
+    }
+    const CONV_OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+    const FCSR_C_E: u32 = 0x0002_0000;
+    const FCSR_C_V: u32 = 0x0001_0000;
+    const FCSR_C_O: u32 = 0x0000_4000;
+    const FCSR_C_U: u32 = 0x0000_2000;
+    const FCSR_C_I: u32 = 0x0000_1000;
+    const FCSR_C_ALL: u32 = 0x0003_f000;
+
+    fn assert_unimplemented(r: (crate::cpu::mips_exec::ExecStatus, u64, u32), what: &str) {
+        let (s, fd, fcsr) = r;
+        assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: traps");
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}: FPE");
+        assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_E, "{what}: Cause.E alone");
+        assert_eq!(fcsr & 0x7c, 0, "{what}: no Flag");
+        assert_eq!(fd, CONV_OLD, "{what}: fd untouched");
+    }
+
+    /// CVT.S.L and CVT.D.L on the R4400 and R5000 hand a long outside
+    /// [-2^52, 2^52) to software (VR5000 UM 9.4.6; an Indy R4400 and R5000
+    /// both convert 2^40+1 and trap 2^53+1 and 2^62). The R10000 family
+    /// converts every long. That fixes `fpu/vec_cvt_from_l` on both parts.
+    #[test]
+    fn cvt_from_long_is_unimplemented_past_52_bits_on_the_r4000_class() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let cases: [(i64, bool); 8] = [
+                ((1 << 52) - 1, false), (-(1 << 52), false), ((1 << 40) + 1, false), (0, false),
+                (1 << 52, true), (-(1 << 52) - 1, true), ((1 << 53) + 1, true), (i64::MIN, true),
+            ];
+            for (v, out) in cases {
+                for funct in [FUNCT_FCVT_S, FUNCT_FCVT_D] {
+                    let r = conv_case::<C>(RS_L, funct, v as u64, 0);
+                    let what = format!("{} cvt.{}.l {v}", C::NAME, if funct == FUNCT_FCVT_S { 's' } else { 'd' });
+                    if out && limited {
+                        assert_unimplemented(r, &what);
+                    } else {
+                        assert_eq!(r.0, EXEC_COMPLETE, "{what}");
+                        let got = if funct == FUNCT_FCVT_S { f32::from_bits(r.1 as u32) as f64 } else { f64::from_bits(r.1) };
+                        let want = if funct == FUNCT_FCVT_S { v as f32 as f64 } else { v as f64 };
+                        assert_eq!(got, want, "{what}");
+                    }
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<R4400Cache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(true);
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(false);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
+    /// A long that rounds up to 2^63 is inexact. Comparing a saturating cast
+    /// of the result back to i64 called i64::MAX exact, because 2^63
+    /// saturates to i64::MAX.
+    #[test]
+    fn cvt_from_long_to_2_to_the_63_is_inexact() {
+        on_big_stack(|| {
+            for funct in [FUNCT_FCVT_S, FUNCT_FCVT_D] {
+                for v in [i64::MAX, i64::MAX - 511] {
+                    let (s, fd, fcsr) = conv_case::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(RS_L, funct, v as u64, 0);
+                    assert_eq!(s, EXEC_COMPLETE);
+                    let got = if funct == FUNCT_FCVT_S { f32::from_bits(fd as u32) as f64 } else { f64::from_bits(fd) };
+                    assert_eq!(got, 9223372036854775808.0, "{v} rounds to 2^63");
+                    assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_I, "{v} Cause.I");
+                    assert_eq!(fcsr & 0x7c, 0x04, "{v} Flag.I");
+                }
+            }
+        });
+    }
+
+    /// An enabled Inexact on an integer-to-float conversion traps with Cause.I
+    /// and leaves fd and the Flags alone, as every trapped FP exception does.
+    #[test]
+    fn cvt_from_int_inexact_trap_leaves_fd() {
+        const ENABLE_I: u32 = 0x80;
+        on_big_stack(|| {
+            for (fmt, v) in [(RS_W, 0x0100_0001u64), (RS_L, (1u64 << 40) + 1)] {
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(fmt, FUNCT_FCVT_S, v, ENABLE_I);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{v:#x} traps");
+                assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_I, "{v:#x} Cause.I");
+                assert_eq!(fcsr & 0x7c, 0, "{v:#x} no Flag");
+                assert_eq!(fd, CONV_OLD, "{v:#x} fd untouched");
+            }
+        });
+    }
+
+    /// A long conversion on the R4400 and R5000 hands a result outside
+    /// [-2^53, 2^53) to software (VR5000 UM 9.4.6, inferred for the R4400);
+    /// the R12000 converts the full range.
+    #[test]
+    fn cvt_to_long_is_unimplemented_past_53_bits_on_the_r4000_class() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let p53 = (1i64 << 53) as f64;
+            for (instr_fmt, funct, src, want, out) in [
+                (RS_D, FUNCT_FCVT_L, (p53 - 1.0).to_bits(), (1i64 << 53) - 1, false),
+                (RS_D, FUNCT_FCVT_L, (-p53).to_bits(), -(1i64 << 53), false),
+                (RS_D, FUNCT_FCVT_L, p53.to_bits(), 1i64 << 53, true),
+                (RS_D, FUNCT_FROUND_L, (-p53 - 2.0).to_bits(), -(1i64 << 53) - 2, true),
+                (RS_S, FUNCT_FCVT_L, ((1u64 << 60) as f32).to_bits() as u64, 1i64 << 60, true),
+            ] {
+                let r = conv_case::<C>(instr_fmt, funct, src, 0);
+                let what = format!("{} {funct:#x} {want}", C::NAME);
+                if out && limited {
+                    assert_unimplemented(r, &what);
+                } else {
+                    assert_eq!(r.0, EXEC_COMPLETE, "{what}");
+                    assert_eq!(r.1 as i64, want, "{what}");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<R4400Cache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
+    /// A denormal or quiet-NaN source to a conversion is Unimplemented
+    /// Operation on every part ("only trapped if the instruction is a convert
+    /// or computational operation", R4000 UM 7.x; R10000 UM p. 309 for the
+    /// denormal). The conversions used to round a denormal to 0 or ±1 with
+    /// Inexact and narrow or widen it on the host.
+    #[test]
+    fn conversions_of_denormal_and_quiet_nan_sources_are_unimplemented() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let ds: u64 = 0x0000_0000_0000_0001; // smallest double denormal
+            let ss: u64 = 0x8000_0001; // negative single denormal
+            let qd: u64 = 0x7FF7_FFFF_FFFF_FFFF; // MIPS quiet NaN
+            let qs: u64 = 0x7FBF_FFFF;
+            for (fmt, funct, src, name) in [
+                (RS_S, FUNCT_FTRUNC_W, ss, "trunc.w.s denormal"),
+                (RS_S, FUNCT_FCEIL_W, ss, "ceil.w.s denormal"),
+                (RS_D, FUNCT_FCVT_W, ds, "cvt.w.d denormal"),
+                (RS_D, FUNCT_FROUND_L, ds, "round.l.d denormal"),
+                (RS_S, FUNCT_FCVT_D, ss, "cvt.d.s denormal"),
+                (RS_S, FUNCT_FCVT_D, qs, "cvt.d.s quiet NaN"),
+                (RS_D, FUNCT_FCVT_S, ds, "cvt.s.d denormal"),
+                (RS_D, FUNCT_FCVT_S, qd, "cvt.s.d quiet NaN"),
+            ] {
+                // FS set as well: it flushes results, not operands.
+                assert_unimplemented(conv_case::<C>(fmt, funct, src, 0x0100_0000), &format!("{} {name}", C::NAME));
+            }
+        }
+        on_big_stack(|| {
+            run::<R4400Cache>();
+            run::<crate::cpu::mips_cache_v2::R5000Cache>();
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+        });
+    }
+
+    /// A signalling NaN to CVT.D.S is Invalid: the MIPS default NaN untrapped,
+    /// a trap with fd untouched when Enable.V is set. Widening it on the host
+    /// set the fraction MSB, which hands on another signalling NaN.
+    #[test]
+    fn cvt_d_s_of_a_signalling_nan_is_invalid() {
+        on_big_stack(|| {
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_S, FUNCT_FCVT_D, 0x7FC0_0001, 0);
+            assert_eq!(s, EXEC_COMPLETE);
+            assert_eq!(fd, 0x7FF7_FFFF_FFFF_FFFF, "default NaN");
+            assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_V);
+            assert_eq!(fcsr & 0x7c, 0x40);
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_S, FUNCT_FCVT_D, 0x7FC0_0001, 0x800);
+            assert!(s & EXEC_IS_EXCEPTION != 0);
+            assert_eq!(fd, CONV_OLD);
+            assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_V);
+            // Infinities and zeros still widen exactly.
+            for (src, want) in [(0x7F80_0000u64, f64::INFINITY), (0x8000_0000, -0.0)] {
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_S, FUNCT_FCVT_D, src, 0);
+                assert_eq!(s, EXEC_COMPLETE);
+                assert_eq!(fd, want.to_bits());
+                assert_eq!(fcsr & FCSR_C_ALL, 0);
+            }
+        });
+    }
+
+    /// CVT.S.D overflow raises Inexact with Overflow (R4000 UM Table 7-1;
+    /// `fpu/cvt_s_d_rounds`), in every rounding mode, including the modes
+    /// that deliver ±MAX. Between MAX and 2^128 the rounded value with an
+    /// unbounded exponent can still be MAX, which is Inexact alone.
+    #[test]
+    fn cvt_s_d_overflow_raises_inexact_too() {
+        const MAX: u64 = 0x7F7F_FFFF;
+        const INF: u64 = 0x7F80_0000;
+        let big = f64::from_bits(0x4C70_0000_0000_0000); // 2^200
+        let just_over_max = f32::MAX as f64 * (1.0 + 2f64.powi(-30)); // < MAX + half an ulp
+        on_big_stack(move || {
+            for (src, rm, want, cause) in [
+                (big, 0u32, INF, FCSR_C_O | FCSR_C_I),
+                (big, 1, MAX, FCSR_C_O | FCSR_C_I),
+                (big, 2, INF, FCSR_C_O | FCSR_C_I),
+                (big, 3, MAX, FCSR_C_O | FCSR_C_I),
+                (-big, 2, MAX | 0x8000_0000, FCSR_C_O | FCSR_C_I),
+                (just_over_max, 0, MAX, FCSR_C_I),
+                (just_over_max, 1, MAX, FCSR_C_I),
+                (just_over_max, 2, INF, FCSR_C_O | FCSR_C_I),
+            ] {
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), rm);
+                assert_eq!(s, EXEC_COMPLETE, "{src} rm={rm}");
+                assert_eq!(fd as u32 as u64, want, "{src} rm={rm}");
+                assert_eq!(fcsr & FCSR_C_ALL, cause, "{src} rm={rm} Cause");
+                assert_eq!(fcsr & 0x7c, cause >> 10, "{src} rm={rm} Flag");
+            }
+            // Enable.I alone traps an overflow, since it raises Inexact too.
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, big.to_bits(), 0x80);
+            assert!(s & EXEC_IS_EXCEPTION != 0);
+            assert_eq!(fd, CONV_OLD);
+            assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_O | FCSR_C_I);
+        });
+    }
+
+    /// A CVT.S.D result too small for a normal single underflows. With FS
+    /// clear, or Underflow or Inexact enabled, that is Unimplemented
+    /// Operation; with FS set it flushes to a zero of the source's sign with
+    /// Underflow and Inexact, as arithmetic does (`fpu_update_fcsr_full`).
+    #[test]
+    fn cvt_s_d_underflow_follows_the_fs_rules() {
+        const FS: u32 = 0x0100_0000;
+        on_big_stack(|| {
+            for src in [1.0e-40f64, -1.0e-40, 1.0e-300] {
+                assert_unimplemented(conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), 0), &format!("{src} FS=0"));
+                assert_unimplemented(conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), FS | 0x100), &format!("{src} Enable.U"));
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), FS);
+                assert_eq!(s, EXEC_COMPLETE, "{src}");
+                assert_eq!(fd as u32, if src < 0.0 { 0x8000_0000 } else { 0 }, "{src} flushed");
+                assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_U | FCSR_C_I, "{src} Cause");
+                assert_eq!(fcsr & 0x7c, 0x0c, "{src} Flag");
+            }
+            // The smallest normal single narrows exactly.
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, (f32::MIN_POSITIVE as f64).to_bits(), 0);
+            assert_eq!(s, EXEC_COMPLETE);
+            assert_eq!(fd as u32, f32::MIN_POSITIVE.to_bits());
+            assert_eq!(fcsr & FCSR_C_ALL, 0);
+        });
+    }
+
+    /// ROUND rounds to nearest, ties to even, whatever FCSR.RM says, and
+    /// CVT.W follows RM.
+    #[test]
+    fn round_ignores_rm_and_cvt_follows_it() {
+        on_big_stack(|| {
+            for rm in 0..4u32 {
+                for (x, want) in [(2.5f64, 2i32), (3.5, 4), (-2.5, -2), (-3.5, -4), (0.5, 0), (-0.5, 0), (1.5, 2), (2.4999, 2)] {
+                    let (s, fd, _) = conv_case::<R4400Cache>(RS_D, FUNCT_FROUND_W, x.to_bits(), rm);
+                    assert_eq!(s, EXEC_COMPLETE);
+                    assert_eq!(fd as u32 as i32, want, "round.w.d {x} rm={rm}");
+                }
+                let (_, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_W, (-2.5f64).to_bits(), rm);
+                assert_eq!(fd as u32 as i32, [-2, -2, -2, -3][rm as usize], "cvt.w.d -2.5 rm={rm}");
+                assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_I, "cvt.w.d -2.5 rm={rm} Inexact");
+            }
         });
     }
 
@@ -1893,12 +2152,12 @@ mod tests {
             "WAIT graduates — PC must advance so the following `j ra` is reachable");
     }
 
-    /// A WAIT that can never be released — `Status.IE` clear, or `EXL`/`ERL`
-    /// set — must NOT graduate. It returns `EXEC_RETRY` with PC still on the
-    /// instruction, so the guest correctly never progresses (matching hardware,
-    /// which hangs) while the CPU thread keeps returning to its run loop, so
-    /// the monitor, debugger and soft-reset check stay responsive. Spinning
-    /// inside the instruction instead would freeze all three.
+    /// A WAIT whose interrupts cannot be taken — `Status.IE` clear, or
+    /// `EXL`/`ERL` set — with nothing requested must NOT graduate. It returns
+    /// `EXEC_RETRY` with PC still on the instruction, so the guest waits while
+    /// the CPU thread keeps returning to its run loop, so the monitor, debugger
+    /// and soft-reset check stay responsive. Spinning inside the instruction
+    /// instead would freeze all three.
     #[test]
     fn test_wait_with_interrupts_disabled_retries_without_advancing() {
         let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
@@ -1917,6 +2176,34 @@ mod tests {
         exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL;
         assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
         assert_eq!(exec.core.pc, pc, "EXL is just as unreleasable as IE=0");
+    }
+
+    /// A requested interrupt the IM bits pass ends a WAIT executed with IE
+    /// clear: the WAIT graduates, no exception is taken, and the interrupt
+    /// waits for software to enable it. OpenBSD's R5000/RM52xx idle
+    /// (`cpu_idle_cycle_rm7k`) clears IE around its WAIT; answering RETRY
+    /// held an idle OpenBSD O2 on the WAIT for good with its clock interrupt
+    /// pending. Fix: WAIT with IE clear.
+    #[test]
+    fn test_wait_with_ie_clear_completes_on_a_requested_interrupt() {
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let (mut exec, _) = create_executor();
+        exec.core.pc = pc;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_IM_MASK;
+        exec.core.cp0_status |= crate::cpu::mips_core::CAUSE_IP7; // IM7
+        exec.core.cp0_cause = 0;
+        let epc = exec.core.cp0_epc;
+        // An interrupt IM masks does not end it.
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
+        assert_eq!(exec.core.pc, pc);
+        // The clock's IP7, which IM passes, does.
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP7 as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, pc + 4, "the WAIT graduates");
+        assert_eq!(exec.core.cp0_epc, epc, "and takes no exception");
     }
 
     /// The stall ends as soon as an enabled, unmasked interrupt is pending —
@@ -5937,6 +6224,9 @@ mod tests {
             let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
             counter.as_ref() as *const std::sync::atomic::AtomicU64
         }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr)))
+        }
     }
 
     #[test]
@@ -7269,6 +7559,30 @@ mod tests {
         }
     }
 
+    /// Config's line-size bits IB (5) and DB (4) are fixed by the part, not
+    /// by software: an MTC0 that clears them must leave them as reset set
+    /// them. The R5000 Indy PROM writes Config with IB and DB clear, and
+    /// NetBSD then sized the R5000's I-cache line as 16 bytes and panicked
+    /// ("r5k picache line size 16", techomancer/iris#773).
+    #[test]
+    fn config_line_size_bits_ignore_mtc0() {
+        use crate::cpu::mips_cache_v2::R5000Cache;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(ib_db: u32) {
+            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            let reset = exec.core.cp0_config;
+            assert_eq!(reset & 0x30, ib_db, "{} reset IB/DB", C::NAME);
+            let mtc0_config = (OP_COP0 << 26) | (0x04 << 21) | (9 << 16) | (16 << 11);
+            // Flip IB and DB, set K0 to 2: only K0 may change.
+            exec.core.write_gpr(9, ((reset ^ 0x30) & !7 | 2) as u64);
+            assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+            assert_eq!(exec.core.cp0_config, reset & !7 | 2, "{}: IB/DB must stay", C::NAME);
+        }
+        check::<R4400Cache>(0);
+        check::<R5000Cache>(0x30);
+    }
+
     // ============ C1: misaligned instruction address raises AdEL ===========
     //
     // Before the fix nothing checked PC alignment, so a misaligned target
@@ -7422,6 +7736,35 @@ mod tests {
         crate::cpu::mips_exec::MipsCpu::new(exec)
     }
 
+    /// `loadsym` goes to the selected CPU and a breakpoint to every CPU. With
+    /// a symbol table per CPU the unselected ones refused the name and the
+    /// whole command failed with "unknown symbol".
+    #[test]
+    fn a_symbol_loaded_once_names_a_breakpoint_on_every_cpu() {
+        use crate::traits::Device;
+        let map = std::env::temp_dir().join(format!("iris-symtest-{}.map", std::process::id()));
+        std::fs::write(&map, "ffffffff80001000 T sendsig\n").unwrap();
+        let cpus: Vec<Arc<dyn crate::cpu::mips_exec::CpuDevice>> = vec![Arc::new(nop_cpu()), Arc::new(nop_cpu())];
+        let monitor = crate::cpu::cpu_monitor::CpuMonitor::new(cpus);
+        let run = |line: &str| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let cap = Capture::default();
+            let r = monitor.execute_command(words[0], &words[1..], Box::new(cap.clone()));
+            let out = String::from_utf8_lossy(&cap.0.lock()).into_owned();
+            (r, out)
+        };
+        let (r, _) = run(&format!("loadsym {}", map.display()));
+        std::fs::remove_file(&map).ok();
+        assert!(r.is_ok(), "{:?}", r);
+        let (r, out) = run("b sendsig if a1 == 11");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("sendsig") && out.contains("if a1 == 11"), "{}", out);
+        // The unselected CPU has it too, by name.
+        let (r, out) = run("cpu 1 bl");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("sendsig"), "{}", out);
+    }
+
     // `lightning` compiles breakpoint checks out of the run loop, so nothing
     // would ever stop the CPU at the breakpoint.
     #[cfg(not(feature = "lightning"))]
@@ -7468,10 +7811,98 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
-    /// A page compiled before a remap is not dispatched over the new layout.
+    /// Two RAM banks of 1 MiB at 0 and 1 MiB, which a store to nothing swaps:
+    /// a memory controller moving banks.
+    #[cfg(feature = "jitv2")]
+    struct SwapBus {
+        banks: [crate::dev::mem::Memory; 2],
+        swapped: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl SwapBus {
+        fn at(&self, addr: u64) -> (&crate::dev::mem::Memory, u64) {
+            let swapped = self.swapped.load(std::sync::atomic::Ordering::Relaxed);
+            let bank = ((addr >> 20) & 1) as usize ^ swapped as usize;
+            (&self.banks[bank], addr & 0xF_FFFF)
+        }
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl BusDevice for SwapBus {
+        fn read8(&self, a: u64) -> BusRead8 { let (d, a) = self.at(a); d.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { let (d, a) = self.at(a); d.write8(a, v) }
+        fn read16(&self, a: u64) -> BusRead16 { let (d, a) = self.at(a); d.read16(a) }
+        fn write16(&self, a: u64, v: u16) -> u32 { let (d, a) = self.at(a); d.write16(a, v) }
+        fn read32(&self, a: u64) -> BusRead32 { let (d, a) = self.at(a); d.read32(a) }
+        fn write32(&self, a: u64, v: u32) -> u32 { let (d, a) = self.at(a); d.write32(a, v) }
+        fn read64(&self, a: u64) -> BusRead64 { let (d, a) = self.at(a); d.read64(a) }
+        fn write64(&self, a: u64, v: u64) -> u32 { let (d, a) = self.at(a); d.write64(a, v) }
+        fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { let (d, a) = self.at(a); d.gen_ptr(a) }
+        fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> { let (d, a) = self.at(a); d.code_page(a) }
+    }
+
+    /// Compiled code is keyed by the bank it was compiled from: when a remap
+    /// puts another bank at its address, the address runs that bank's page,
+    /// and the code is found again, not recompiled, where its bank went.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn compiled_code_follows_its_bank_through_a_remap() {
+        use std::sync::atomic::Ordering;
+        let bus = Arc::new(SwapBus { banks: [crate::dev::mem::Memory::new(1), crate::dev::mem::Memory::new(1)], swapped: Default::default() });
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus.clone() as Arc<dyn BusDevice>, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        // Each bank adds its own number to r2 four times and returns.
+        for (bank, add) in [(0u64, 1u16), (1, 2)] {
+            for i in 0..4 {
+                bus.write32((bank << 20) + 0x1000 + 4 * i, make_i(OP_ADDIU, 2, 2, add));
+            }
+            bus.write32((bank << 20) + 0x1010, make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR));
+        }
+        exec.core.gpr[31] = 0xffff_ffff_8000_f000;
+        let arrive = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, pc: u64| {
+            exec.core.pc = pc;
+            exec.core.in_delay_slot = false;
+            exec.core.jit_trigger = true;
+            exec.step_jit();
+            exec.jitv2_current_page()
+        };
+        let low = arrive(&mut exec, 0xffff_ffff_8000_1000);
+        assert!(!low.is_null());
+        let low = unsafe { &*low };
+        let key0 = bus.banks[0].code_page(0x1000).unwrap().key;
+        let key1 = bus.banks[1].code_page(0x1000).unwrap().key;
+        assert_eq!(low.key, key0, "the page is keyed by its bank, not its address");
+        assert!(low.is_runnable(0));
+        let compiles = low.compiles_since_flush();
+
+        // The controller swaps the banks, and tells the CPU as a machine does.
+        bus.swapped.store(true, Ordering::Relaxed);
+        exec.jitv2_layout_changed();
+        assert!(low.is_runnable(0), "a remap drops no code");
+        assert_eq!(low.addr_of(0), None, "the CPU no longer knows where the page is");
+
+        let other = arrive(&mut exec, 0xffff_ffff_8000_1000);
+        assert!(!std::ptr::eq(other, low), "the address now holds the other bank's page");
+        assert_eq!(unsafe { &*other }.key, key1);
+
+        let moved = arrive(&mut exec, 0xffff_ffff_8010_1000);
+        assert!(std::ptr::eq(moved, low), "the first bank's page is found at its new address");
+        assert_eq!(low.addr_of(0), Some((0x101, false)));
+        assert_eq!(low.compiles_since_flush(), compiles, "and runs the code it already had");
+        let jit = exec.jitv2.clone();
+        assert_eq!(jit.lock().pages_used(), 2);
+    }
+
+    /// A remap request posted while the CPU is stopped is taken by a step,
+    /// and drops no compiled code.
     #[cfg(feature = "jitv2")]
     #[test]
-    fn a_compiled_page_is_not_dispatched_after_a_remap() {
+    fn a_remap_request_keeps_compiled_code() {
         use crate::cpu::mips_exec::CpuDevice;
         let mem = Arc::new(MockMemory::new());
         let bus: Arc<dyn BusDevice> = mem.clone();
@@ -7500,10 +7931,12 @@ mod tests {
         }
         crate::traits::Device::stop(&*cpu);
         let before = page();
-        assert!(unsafe { (*before).is_runnable(0) });
+        let remaps = jit.lock().stats.remaps.load(std::sync::atomic::Ordering::Relaxed);
         world.layout_changed();
         cpu.step_n_inline(0).unwrap();
-        assert!(!unsafe { (*before).is_runnable(0) }, "the page compiled before the remap is still runnable");
+        assert_eq!(jit.lock().stats.remaps.load(std::sync::atomic::Ordering::Relaxed), remaps + 1, "the step took the request");
+        assert!(unsafe { (*before).is_runnable(0) }, "the page keeps its code through a remap");
+        assert_eq!(jit.lock().pages_used(), 1);
     }
 
     /// 64 entries on one page (four adds and a return each), sync compile.
@@ -8178,6 +8611,29 @@ mod tests {
             let lo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
             tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, lo0), (3, 0)], FUNCT_TLBWI);
             assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+        });
+    }
+
+    /// The O2's 64-bit PCI memory window (PA 0x2_0000_0000, OpenBSD's devices
+    /// from 0x2_8000_0000) shares its low 32 bits with the no-ECC alias. A page
+    /// there reaches the PCI window the bus decodes at 0x8000_0000, not RAM;
+    /// the alias and its masked match still hold everywhere else. Fix:
+    /// OpenBSD's AIC-7880 registers on the O2.
+    #[test]
+    fn phys_alias_bypass_keeps_the_o2_pci_memory_window_off_memory() {
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(Arc::new(MockMemory::new()));
+            exec.phys_mask = u32::MAX as u64;
+            exec.phys_alias = Some((0x8000_0000, 0x4000_0000, 0x4000_0000));
+            exec.phys_alias_bypass = Some((0x2_0000_0000, 0x1_0000_0000));
+            let page = |pfn: u64| (pfn << 6) | (2 << 3) | (1 << 2) | (1 << 1);
+            // VPN2 0x4000_0000: even page PCI at 0x2_8000_1000, odd page the alias.
+            tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, page(0x28_0001)), (3, page(0x8_0001))], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_0000).phys, 0x8000_1000, "PCI memory window");
+            assert_eq!(exec.debug_translate(0x4000_1000).phys, 0x4000_1000, "no-ECC alias");
+            // A software bit above the PFN still folds onto memory.
+            tlb_op(&mut exec, &[(0, 1), (5, 0), (10, 0x4000_2000), (2, page(0x18_0000)), (3, 0)], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_2000).phys, 0x4000_0000);
         });
     }
 

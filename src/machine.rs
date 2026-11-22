@@ -969,6 +969,9 @@ impl Machine {
         status.set_count_hz(cpu.count_hz_atomic());
 
         world.set_slots(vec![cpu.park_slot()]);
+        // The CPU's pool flushes through this world too: a CPU belongs to one.
+        #[cfg(feature = "jitv2")]
+        cpu.share_jitv2(cpu.jitv2(), world.clone(), 0, 0);
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));
@@ -1027,7 +1030,7 @@ impl Machine {
         // default, so this can only happen here, after `Arc::new(MipsCpu::new(..))`,
         // same reasoning as `mc.set_cpu` right above).
         #[cfg(feature = "jitv2")]
-        crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), None);
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), world.clone());
 
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();
@@ -2642,6 +2645,9 @@ impl Workstation for Machine {
     }
     fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
     fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        self.scsi_buses().iter().map(|b| b.activity()).collect()
+    }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.scsi_buses().iter().try_for_each(|b| b.flush())
     }
@@ -3179,22 +3185,11 @@ mod gr2_checkpoint_tests {
     fn gr2_disk_snapshot_round_trip_and_board_mismatches() {
         const CHILD: &str = "IRIS_GR2_M15_DISK_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            struct Remove(std::path::PathBuf);
-            impl Drop for Remove {
-                fn drop(&mut self) {
-                    let _ = std::fs::remove_dir_all(&self.0);
-                }
-            }
-
-            let path = std::env::current_dir()
-                .unwrap()
-                .join("target")
-                .join(format!("gr2-m15-disk-{}", std::process::id()));
-            std::fs::create_dir(&path).unwrap();
-            let _cleanup = Remove(path.clone());
+            // Not under the working directory: a relocated target dir leaves no `target/` there.
+            let path = crate::test_temp::TempPath::dir("gr2-m15-disk");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .current_dir(&path)
-                .env(CHILD, &path)
+                .current_dir(&*path)
+                .env(CHILD, &*path)
                 .args([
                     "--exact",
                     "machine::gr2_checkpoint_tests::gr2_disk_snapshot_round_trip_and_board_mismatches",
@@ -3214,7 +3209,8 @@ mod gr2_checkpoint_tests {
 
         crate::display_stop_tests::big_stack(|| {
             let path = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
-            assert_eq!(std::env::current_dir().unwrap(), path);
+            // The temp dir may sit behind a symlink (macOS /var), so compare resolved paths.
+            assert_eq!(std::env::current_dir().unwrap().canonicalize().unwrap(), path.canonicalize().unwrap());
 
             let mut xz = Box::new(Machine::new(config(&path, GraphicsBoard::Xz)));
             let gr2 = xz.get_gr2().unwrap();
@@ -3386,5 +3382,29 @@ mod virtio_tests {
         cfg.virtio_9p.enabled = true;
         cfg.virtio_9p.path = "/tmp".into();
         assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("a GIO slot holds one device"));
+    }
+
+    /// On the Octane the virtio devices take Bridge slots 4 and 5 unless
+    /// `bridge_slot` names one of 4 to 7, and two cannot share one.
+    #[cfg(unix)]
+    #[test]
+    fn octane_virtio_bridge_slots() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::OctaneIp30;
+        cfg.virtio_serial.enabled = true;
+        cfg.virtio_9p.enabled = true;
+        cfg.virtio_9p.path = "/tmp".into();
+        assert_eq!(cfg.octane_virtio_slots(), Ok((7, 5)));
+        cfg.virtio_serial.bridge_slot = Some(6);
+        cfg.virtio_9p.bridge_slot = Some(7);
+        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 7)));
+        assert_eq!(cfg.validate_virtio_9p_for_test(), Ok(()));
+        cfg.virtio_9p.bridge_slot = Some(6);
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("both in Bridge slot 6"));
+        cfg.virtio_9p.bridge_slot = Some(3);
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("slots 4 to 7"));
+        cfg.virtio_9p.enabled = false;
+        cfg.virtio_9p.bridge_slot = Some(6);
+        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 6)), "a disabled device holds no slot");
     }
 }

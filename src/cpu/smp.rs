@@ -9,8 +9,9 @@
 //! until the boundary. Holding is cold; the running CPU pays one load per
 //! batch.
 //!
-//! [`REQUEST_JIT_FLUSH`] rides the same bit but is not a hold: the CPU empties its
-//! JIT pool at the boundary and runs on ([`World::layout_changed`]).
+//! [`REQUEST_JIT_REMAP`] rides the same bit but is not a hold: at the boundary
+//! the CPU forgets where its JIT's code pages are and runs on
+//! ([`World::layout_changed`]).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,10 +20,11 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-/// Most CPUs one machine runs: the four HEART has slots for (IRIX's Octane
-/// kernel and PROM use two), and a Tezro's four. Per-CPU tables size to it.
-/// The CPU ids it bounds also index the idle parker's `u8` masks.
-pub const MAX_CPUS: usize = 4;
+/// Most CPUs one machine runs: two node boards of four (two C-bricks). HEART
+/// has slots for four (IRIX's Octane kernel and PROM use two) and a Tezro
+/// holds four. Per-CPU tables size to it. The CPU ids it bounds also index the
+/// idle parker's `u8` masks, one bit each, so eight is as far as those go.
+pub const MAX_CPUS: usize = 8;
 
 /// Bit of `MipsCore::hot.interrupts` asking the CPU to stop: it retires
 /// nothing more and parks at its next batch boundary. Bit 63 is the
@@ -36,8 +38,10 @@ pub const HOLD_WORLD: u32 = 1 << 1;
 /// The board holds this processor at a firmware rendezvous until the ones
 /// it must follow catch up (the IP35 PROM's presence publication).
 pub const HOLD_RENDEZVOUS: u32 = 1 << 2;
-/// Not a hold: the CPU empties its JIT pool at its next batch boundary.
-pub const REQUEST_JIT_FLUSH: u32 = 1 << 3;
+/// Not a hold: memory moved, so at its next batch boundary the CPU forgets
+/// the addresses it reached its JIT's code pages at. The pages keep their
+/// code, which is keyed by the memory it came from.
+pub const REQUEST_JIT_REMAP: u32 = 1 << 3;
 
 const NOT_A_CPU: u8 = u8::MAX;
 
@@ -117,8 +121,8 @@ impl ParkSlot {
         if s.holds == 0 {
             self.word().fetch_and(!HOST_PARK_BIT, Ordering::SeqCst);
         }
-        // A parked CPU does not wait on a flush request; wake it now, not at its next timeout.
-        if s.holds & !REQUEST_JIT_FLUSH == 0 {
+        // A parked CPU does not wait on a remap request; wake it now, not at its next timeout.
+        if s.holds & !REQUEST_JIT_REMAP == 0 {
             self.changed.notify_all();
         }
         posted
@@ -149,12 +153,12 @@ impl ParkSlot {
     }
 
     /// The CPU thread, with its executor unlocked: wait out the holds, or
-    /// until the CPU is stopped. A flush request is not waited on.
+    /// until the CPU is stopped. A remap request is not waited on.
     pub fn park(&self, running: &AtomicBool) {
         let mut s = self.state.lock();
         s.parked = true;
         self.changed.notify_all();
-        while s.holds & !REQUEST_JIT_FLUSH != 0 && running.load(Ordering::Relaxed) {
+        while s.holds & !REQUEST_JIT_REMAP != 0 && running.load(Ordering::Relaxed) {
             self.changed.wait_for(&mut s, Duration::from_millis(1));
         }
         s.parked = false;
@@ -169,6 +173,9 @@ impl ParkSlot {
 }
 
 /// Every CPU's slot: how one thread gets the machine to itself.
+///
+/// A CPU belongs to one `World`: two would both hold it with
+/// [`HOLD_WORLD`], and either one's release would let it run under the other.
 #[derive(Default)]
 pub struct World {
     slots: OnceLock<Vec<Arc<ParkSlot>>>,
@@ -178,6 +185,14 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The world of one CPU that shares its compile pool with no other. Its
+    /// own flushes and its pool's then take turns as a machine's CPUs do.
+    pub fn solo(slot: Arc<ParkSlot>) -> Self {
+        let world = Self::default();
+        world.set_slots(vec![slot]);
+        world
     }
 
     /// The machine's CPUs, once they exist.
@@ -210,11 +225,12 @@ impl World {
         self.leader.try_lock().map(|turn| self.hold_others(turn))
     }
 
-    /// Memory moved under an address: every CPU, the caller's included, empties
-    /// its JIT pool before it runs guest code again.
+    /// Memory moved under an address: every CPU, the caller's included,
+    /// forgets the addresses of its JIT's code pages before it runs guest code
+    /// again, and finds each page again through the bus.
     pub fn layout_changed(&self) {
         #[cfg(feature = "jitv2")]
-        self.slots().iter().for_each(|s| s.hold(REQUEST_JIT_FLUSH));
+        self.slots().iter().for_each(|s| s.hold(REQUEST_JIT_REMAP));
     }
 
     fn slots(&self) -> &[Arc<ParkSlot>] {
@@ -351,9 +367,9 @@ mod tests {
         assert!(world.try_lead().is_some());
     }
 
-    /// A flush request sets the park bit but does not hold a parked CPU.
+    /// A remap request sets the park bit but does not hold a parked CPU.
     #[test]
-    fn a_layout_change_asks_every_cpu_to_flush_without_holding_it() {
+    fn a_layout_change_asks_every_cpu_without_holding_it() {
         let (s, word) = slot(0);
         let world = World::new();
         world.set_slots(vec![s.clone()]);
@@ -362,19 +378,44 @@ mod tests {
             assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
         }
         s.park(&AtomicBool::new(true));
-        assert_eq!(s.release(REQUEST_JIT_FLUSH), cfg!(feature = "jitv2"));
-        assert!(!s.release(REQUEST_JIT_FLUSH));
+        assert_eq!(s.release(REQUEST_JIT_REMAP), cfg!(feature = "jitv2"));
+        assert!(!s.release(REQUEST_JIT_REMAP));
         assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
     }
 
-    /// The flush leaves another hold's park bit set.
+    /// The request leaves another hold's park bit set.
     #[test]
-    fn releasing_the_flush_keeps_another_hold() {
+    fn releasing_the_remap_request_keeps_another_hold() {
         let (s, word) = slot(0);
-        s.hold(REQUEST_JIT_FLUSH);
+        s.hold(REQUEST_JIT_REMAP);
         s.hold(HOLD_HEART);
-        assert!(s.release(REQUEST_JIT_FLUSH));
+        assert!(s.release(REQUEST_JIT_REMAP));
         assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
+
+
+    /// A CPU with its own compile pool is in a world of one, whatever its id.
+    /// Its own thread has no one to hold; anyone else holds it.
+    #[test]
+    fn a_solo_world_holds_its_cpu_for_others_but_not_for_itself() {
+        let (s, word) = slot(3);
+        let world = Arc::new(World::solo(s.clone()));
+        s.set_active(true);
+        let mine = {
+            let world = world.clone();
+            std::thread::spawn(move || {
+                set_current_cpu(3);
+                // Returns without waiting for itself to park.
+                world.stop_others(|| ())
+            })
+        };
+        mine.join().unwrap();
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        s.set_active(false);
+        let hold = world.try_lead().expect("nobody leads");
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0, "a non-CPU leader holds the CPU");
+        drop(hold);
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
     }
 
     /// Both CPUs want the machine at once, as two CPUs running out of JIT pages

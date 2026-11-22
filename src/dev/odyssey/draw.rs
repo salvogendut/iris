@@ -674,7 +674,7 @@ impl Board {
         }
         matches!(
             self.stream.pattern_shape & !pattern::SHAPE_OPAQUE,
-            pattern::SHAPE_64X16 | pattern::SHAPE_32X32 | pattern::SHAPE_16X64
+            pattern::SHAPE_64X16 | pattern::SHAPE_32X32 | pattern::SHAPE_16X64 | pattern::SHAPE_STIPPLE
         )
     }
 
@@ -697,6 +697,8 @@ impl Board {
                 }
                 (self.stream.pattern_buffer[v as usize], 31 - u)
             }
+            // Plane coordinates: the pattern repeats across the plane.
+            pattern::SHAPE_STIPPLE => (self.stream.pattern_buffer[(v & 31) as usize], 31 - (u & 31)),
             pattern::SHAPE_16X64 => {
                 if u >= 16 || v >= 64 {
                     return false;
@@ -851,6 +853,10 @@ impl Board {
         let z = f32::from_bits(self.image.box_words[6]) as f64;
 
         self.image.fragment = None;
+        #[cfg(feature = "vprodiag")]
+        if self.dest_views().scratch {
+            self.note_selected_upload("FIFO image", 0);
+        }
         if z == 0.0 || !z.is_finite() || self.dest_views().scratch {
             return;
         }

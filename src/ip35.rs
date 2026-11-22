@@ -14,8 +14,8 @@
 //! across the machine. Each node's Physical shows every node's memory at its number, and one
 //! [`World`] holds every processor still while a store moves memory.
 //!
-//! - Every C-brick runs one processor; the others are listed disabled in the node's flash, as
-//!   the PROM would after three failed starts of each ([`NodeSpec::absent`]).
+//! - A node's empty processor positions are listed disabled in a fresh flash, as the PROM would
+//!   after three failed starts of each ([`NodeSpec::absent`]).
 //! - A reset or power request from either node resets the machine; a node's reset alone is not modelled.
 //! - Processors on several nodes share memory with no coherence protocol between the nodes.
 //!
@@ -26,6 +26,7 @@
 
 use crate::dev::bedrock::{Bedrock, RamExtent};
 use crate::dev::heart::Clock;
+use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::odyssey::Odyssey;
 use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
@@ -151,6 +152,48 @@ pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, clock: &Clock, input: bool) 
     }
     pci.attach(DevFn { device: 5, function: 0 }, usb.clone());
     Ok(usb)
+}
+
+/// Said at startup and by `--validate` when the audio card is added with
+/// `no_audio` set: the guest sees the card and nothing is played.
+pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
+    "machine.audio_card is set but no_audio is too: the audio card is added and plays to nowhere";
+
+/// The audio card's device on head F of a Fuel's or an I-brick's XBridge. A model choice: the
+/// base I/O holds 1, 4, 5 and (unmodelled, I-brick) 6, and which devices the option slots are
+/// is not established.
+pub(crate) const AUDIO_CARD_DEVICE: u8 = 2;
+
+/// The ICE1724 audio card as `[machine] audio_card` fits it, playing to the host as `[audio]`
+/// sets unless `no_audio`. The board attaches it to a bus.
+pub(crate) fn audio_card(cfg: &MachineConfig, timers: &Arc<TimerManager>) -> Arc<Ice1724> {
+    let card = Arc::new(Ice1724::new(Variant::Dm8));
+    if cfg.no_audio {
+        eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
+    } else {
+        card.enable_output(cfg.audio.clone());
+    }
+    card.set_timer_manager(timers.clone());
+    card
+}
+
+/// The audio card in its slot of `pci` (head F of the base I/O's XBridge) when `[machine]
+/// audio_card` asks for it, added to the board's devices, monitor and reset.
+pub(crate) fn fit_audio_card(cfg: &MachineConfig, pci: &PciBus, timers: &Arc<TimerManager>, io: &mut BoardIo) {
+    if !cfg.audio_card() {
+        return;
+    }
+    let card = audio_card(cfg, timers);
+    pci.attach(DevFn { device: AUDIO_CARD_DEVICE, function: 0 }, card.clone());
+    card.register_locks();
+    eprintln!("iris: ICE1724 audio card at PCI device {AUDIO_CARD_DEVICE} of the base I/O");
+    io.monitor.push(card.clone());
+    io.devices.push(card.clone());
+    let base_reset = std::mem::replace(&mut io.reset, Box::new(|| {}));
+    io.reset = Box::new(move || {
+        base_reset();
+        card.reset();
+    });
 }
 
 /// A VPro at crossbar `widget` of `bedrock`'s node: its DMA enters Bedrock as that widget's inbound
@@ -291,26 +334,17 @@ pub(crate) fn machine(
         connect_cpus(&node.chip, cpus)?;
         node.chip.set_timer_manager(&timers);
     }
-    // One JIT for the processors of a node, which share its memory, its
-    // pool parking them with the rest; one of its own for a lone one.
+    // One JIT for the machine: every processor of every node compiles through
+    // one queue into one page pool, each node an address space of it.
     #[cfg(feature = "jitv2")]
-    for (node, cpus) in nodes.iter().zip(&node_cpus) {
-        let several = cpus.len() > 1;
-        if several {
-            if cfg!(feature = "jitv2_lockstep") {
-                return Err(format!("{name}: a node of several processors cannot run with jitv2_lockstep"));
-            }
-            for c in cpus {
-                c.share_jitv2(cpus[0].jitv2(), world.clone());
-            }
-        }
-        crate::cpu::jitv2::jitv2::attach_pool(
-            &cpus[0],
-            cfg.jitv2_pool_size(),
-            cfg.jitv2.compile,
-            node.chip.decode.physical().clone(),
-            several.then(|| world.clone()),
-        );
+    {
+        let pool: Vec<_> = nodes
+            .iter()
+            .zip(&specs)
+            .zip(&node_cpus)
+            .map(|((node, spec), cpus)| crate::cpu::jitv2::jitv2::PoolNode { cpus, module: spec.module, bus: node.chip.decode.physical().clone() })
+            .collect();
+        crate::cpu::jitv2::jitv2::share_pool(&pool, cfg.jitv2_pool_size(), cfg.jitv2.compile, &world).map_err(|e| format!("{name}: {e}"))?;
     }
     if let Some(hook) = &io.cpus {
         hook(&cpus);

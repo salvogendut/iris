@@ -127,7 +127,15 @@ pub(crate) enum Snapshot {
 /// page under sustained concurrent SMC just keeps losing the race to
 /// itself, correctly punted to the next arrival's request rather than
 /// compiled against torn bytes.
-pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: &dyn BusDevice, phys_base: u64, words: &mut [u32; ENTRIES_PER_PAGE]) -> Snapshot {
+///
+/// A page whose bank hands out its storage is read there, by its key alone:
+/// no bus, and no address a remap could have moved. `bus` and `phys_base`
+/// serve a page whose bank does not.
+pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: Option<(&dyn BusDevice, u64)>, words: &mut [u32; ENTRIES_PER_PAGE]) -> Snapshot {
+    let storage = page.words();
+    if storage.is_null() && bus.is_none() {
+        return Snapshot::Unreadable;
+    }
     const MAX_SEQLOCK_RETRIES: u32 = 8;
     for _ in 0..MAX_SEQLOCK_RETRIES {
         let gen0 = page.current_gen();
@@ -142,12 +150,21 @@ pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: &dyn BusDevice, phys_b
         // a word before `gen0`, or see a bump before the bytes it follows,
         // and the snapshot pairs a generation with older bytes.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        for (i, w) in words.iter_mut().enumerate() {
-            let r = bus.read32(phys_base + i as u64 * 4);
-            if !r.is_ok() {
-                return Snapshot::Unreadable;
+        if !storage.is_null() {
+            // A guest store can land while this reads; the generation check
+            // below discards such a read, so the words are read as plain
+            // memory, volatile so none is assumed stable.
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = unsafe { std::ptr::read_volatile(storage.add(i)) };
             }
-            *w = r.data;
+        } else if let Some((bus, phys_base)) = bus {
+            for (i, w) in words.iter_mut().enumerate() {
+                let r = bus.read32(phys_base + i as u64 * 4);
+                if !r.is_ok() {
+                    return Snapshot::Unreadable;
+                }
+                *w = r.data;
+            }
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let gen1 = page.current_gen();
@@ -169,14 +186,27 @@ pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: &dyn BusDevice, phys_b
 /// `finalize_batch_nonforced` + seal-queue publish).
 fn prepare_multi_entry_compile(
     req: &CompileRequest,
-    bus: &Arc<dyn BusDevice>,
+    buses: &crate::cpu::jitv2::jitv2::CodeBuses,
     analyzer: &mut Analyzer,
     cache_fp: Option<&crate::cpu::jitv2::pcache::Fingerprint>,
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
-    let bus = page.uncached.as_ref().unwrap_or(bus);
-    let phys_base = page.pfn as u64 * PAGE_SIZE as u64;
+    // The page is keyed by the memory behind it, and read in that memory's
+    // own storage when its bank hands that out (RAM, a PROM). Else its bytes
+    // are read where some CPU reaches the memory, through that CPU's bus;
+    // if none does right now (a remap since the request), the next arrival
+    // asks again.
+    let located = if page.words().is_null() {
+        let Some(at) = buses.locate(page, req.cpu as usize) else {
+            page.mark_prepare_bounced();
+            return PrepareOutcome::Done(false);
+        };
+        Some(at)
+    } else {
+        None
+    };
+    let via_bus = located.as_ref().map(|(bus, at)| (&**bus, *at));
 
     // Dirty-cache gate. The seqlock snapshot below reads RAM off the bus; the
     // guest CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a
@@ -205,7 +235,14 @@ fn prepare_multi_entry_compile(
 
     // §13.3 step 2: seqlock-snapshot the page bytes.
     let mut words = [0u32; ENTRIES_PER_PAGE];
-    let gen_snap = match snapshot_page(page, &**bus, phys_base, &mut words) {
+    let gen_snap = match snapshot_page(page, via_bus, &mut words) {
+        // A remap during a read through the bus: the address was the page's
+        // before it (`locate`), and is not now, so the words may be other
+        // memory's.
+        Snapshot::Taken(_) if via_bus.is_some_and(|(bus, at)| !crate::cpu::jitv2::jitv2::page_is_at(page, bus, at)) => {
+            page.mark_prepare_bounced();
+            return PrepareOutcome::Done(false);
+        }
         Snapshot::Taken(gen) => {
             // The lines are gone: lift the held publish's denials (below).
             if page.entry_gen() >= crate::cpu::jitv2::jitv2::GEN_HELD {
@@ -365,7 +402,7 @@ fn prepare_multi_entry_compile(
     // churn-avoidance check ignore writes to it.
     let mut used = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
     let instr_count = {
-        let instrs = analyzer.walk_multi_entry(&words, &candidates, phys_base as u32, max_instrs_per_compile());
+        let instrs = analyzer.walk_multi_entry(&words, &candidates, 0, max_instrs_per_compile());
         let mut n = 0usize;
         for instr in crate::cpu::jitv2::analyzer::instrs_linear(instrs) {
             let w = instr.word as usize;
@@ -449,7 +486,7 @@ fn prepare_multi_entry_compile(
         for &o in analyzer.covered() {
             entries[o as usize >> 6] |= 1u64 << (o % 64);
         }
-        crate::cpu::jitv2::hashstats::record(page.pfn, &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
+        crate::cpu::jitv2::hashstats::record(page.pfn(), &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
             page.last_skip_reject.load(std::sync::atomic::Ordering::Relaxed));
     }
 
@@ -471,7 +508,7 @@ fn prepare_multi_entry_compile(
 /// a real codegen decline, or a transient bus-read failure).
 pub fn handle_request(
     req: &CompileRequest,
-    bus: &Arc<dyn BusDevice>,
+    bus: &crate::cpu::jitv2::jitv2::CodeBuses,
     analyzer: &mut Analyzer,
     codegen: &mut Codegen,
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
@@ -616,14 +653,11 @@ pub fn handle_request(
 /// (`Codegen::finalize_batch_nonforced`), it is fully self-describing there
 /// — nothing about *which* entry is still needed here, only a rough count to
 /// decide whether `publish_ready_nonforced`/`force_publish_pending` are
-/// worth calling at all. A plain counter can also be conservative in the
-/// harmless direction: `publish_sealed`-derived saturating decrements mean
-/// it can undercount slightly (a sweep triggered by *this* worker's own
-/// gap-blocked entry can incidentally also unblock and publish some *other*
-/// worker's entries, which never incremented this counter — see
-/// `publish_all`'s own doc comment) but never overcounts into a permanent
-/// "stuck thinking there's still something pending" state, since it only
-/// ever grows by exactly 1 per genuinely gap-blocked compile.
+/// worth calling at all. It is only a hint. Another worker's seal can
+/// publish this worker's entries without telling it, so it can stay high
+/// (the idle sweeps zero it once the queue is empty, see
+/// `reconcile_with_seal_queue`) or, by subtracting entries this worker never
+/// counted, fall to 0 while its own entry is still queued.
 pub type PendingCount = usize;
 
 /// Deferred counterpart to `handle_request`: identical compile-from-snapshot
@@ -664,7 +698,7 @@ pub type PendingCount = usize;
 /// same reason.
 pub fn handle_request_deferred(
     req: &CompileRequest,
-    bus: &Arc<dyn BusDevice>,
+    bus: &crate::cpu::jitv2::jitv2::CodeBuses,
     analyzer: &mut Analyzer,
     codegen: &mut Codegen,
     pending: &mut PendingCount,
@@ -799,9 +833,13 @@ pub fn handle_request_deferred(
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
+            // Entries this seal released were counted when they queued; uncount
+            // them, or `pending` never returns to 0 and the worker polls at 200us.
+            let own = codegen.finalized_fn_is_among(&sealed);
+            *pending = pending.saturating_sub(sealed.len() - own as usize);
             if codegen.last_finalize_failed() {
                 page.mark_finalize_failed();
-            } else if !codegen.finalized_fn_is_among(&sealed) {
+            } else if !own {
                 // Own range still unsealed. `sealed` may be non-empty all the
                 // same (this allocation vacated the previous host page and
                 // released what waited there), so test for our own function,
@@ -882,6 +920,15 @@ fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) {
     }
 }
 
+/// `pending` is per worker, but any worker's seal can release this worker's
+/// entries. With the shared seal queue empty nothing is left to publish,
+/// whatever the count says.
+fn reconcile_with_seal_queue(codegen: &Codegen, pending: &mut PendingCount) {
+    if *pending > 0 && codegen.seal_queue_snapshot().queue_len == 0 {
+        *pending = 0;
+    }
+}
+
 /// Non-forced retry sweep for the async worker's idle-timeout scheme (see
 /// `worker_loop`'s own doc comment): re-attempts sealing whatever the
 /// shared arena's seal queue currently has queued (this worker's own
@@ -898,6 +945,7 @@ pub fn publish_ready_nonforced(codegen: &mut Codegen, pending: &mut PendingCount
     let sealed = codegen.try_seal_ready();
     *pending = pending.saturating_sub(sealed.len());
     publish_all(&sealed);
+    reconcile_with_seal_queue(codegen, pending);
 }
 
 /// Idle-timeout counterpart: force-seal whatever the shared arena's seal
@@ -912,6 +960,7 @@ pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) 
     let sealed = codegen.force_seal_pending();
     *pending = pending.saturating_sub(sealed.len());
     publish_all(&sealed);
+    reconcile_with_seal_queue(codegen, pending);
 }
 
 #[cfg(test)]
@@ -932,11 +981,11 @@ mod tests {
         #[cfg(feature = "developer")]
         {
             let stats = crate::cpu::jitv2::JitStats::default();
-            handle_request(req, bus, analyzer, codegen, &stats)
+            handle_request(req, &crate::cpu::jitv2::jitv2::CodeBuses::single(bus.clone()), analyzer, codegen, &stats)
         }
         #[cfg(not(feature = "developer"))]
         {
-            handle_request(req, bus, analyzer, codegen)
+            handle_request(req, &crate::cpu::jitv2::jitv2::CodeBuses::single(bus.clone()), analyzer, codegen)
         }
     }
 
@@ -957,6 +1006,7 @@ mod tests {
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
         fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr))) }
     }
 
     /// Every word decodes as the JIT region-boundary sentinel — a genuine
@@ -979,6 +1029,7 @@ mod tests {
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
         fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr))) }
     }
 
     struct ErrDevice;
@@ -992,6 +1043,7 @@ mod tests {
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
         fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr))) }
     }
 
     #[test]
@@ -1001,7 +1053,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1021,7 +1073,7 @@ mod tests {
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let compile = |page: &mut PhysicalCodePage| {
             page.mark_requested(4);
-            let req = CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let req = CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
             handle_request_for_test(&req, &bus, &mut Analyzer::new(), &mut Codegen::new());
         };
         compile(&mut page);
@@ -1051,7 +1103,7 @@ mod tests {
         let mut codegen = Codegen::new();
 
         page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
         assert!(page.is_runnable(4), "offset 4 must compile and publish on its own");
         let func_after_first_compile = page.func();
@@ -1074,7 +1126,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(0);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1099,7 +1151,7 @@ mod tests {
         let bus: Arc<dyn BusDevice> = Arc::new(ErrDevice);
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         page.mark_requested(0);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1133,7 +1185,7 @@ mod tests {
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             page.mark_requested(4);
             assert!(page.try_schedule_page());
-            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
@@ -1149,7 +1201,7 @@ mod tests {
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             page.mark_requested(0);
             assert!(page.try_schedule_page());
-            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
@@ -1163,7 +1215,7 @@ mod tests {
             let mut page = PhysicalCodePage::new(0, std::ptr::null());
             page.mark_requested(0);
             assert!(page.try_schedule_page());
-            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
@@ -1179,11 +1231,11 @@ mod tests {
         #[cfg(feature = "developer")]
         {
             let stats = crate::cpu::jitv2::JitStats::default();
-            handle_request_deferred(req, bus, analyzer, codegen, pending, &stats)
+            handle_request_deferred(req, &crate::cpu::jitv2::jitv2::CodeBuses::single(bus.clone()), analyzer, codegen, pending, &stats)
         }
         #[cfg(not(feature = "developer"))]
         {
-            handle_request_deferred(req, bus, analyzer, codegen, pending)
+            handle_request_deferred(req, &crate::cpu::jitv2::jitv2::CodeBuses::single(bus.clone()), analyzer, codegen, pending)
         }
     }
 
@@ -1203,7 +1255,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1224,7 +1276,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(0);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1243,7 +1295,7 @@ mod tests {
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(4);
         assert!(page.try_schedule_page());
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1277,7 +1329,7 @@ mod tests {
         for i in 0..N {
             let before = pages.iter().filter(|p| p.is_runnable(4)).count();
             pages[i].mark_requested(4);
-            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
             let mut pending: PendingCount = 0;
             handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
             let own_published = pages[i].is_runnable(4);
@@ -1291,6 +1343,39 @@ mod tests {
         let mut pending: PendingCount = 1;
         force_publish_pending(&mut codegen, &mut pending);
         assert!(pages.iter().all(|p| p.is_runnable(4)), "the forced sweep must leave every page published");
+    }
+
+    #[test]
+    fn idle_sweep_zeroes_pending_when_another_worker_released_its_entry() {
+        // Worker `a` queues one entry. Worker `b`, on the same arena, seals
+        // past it. `a` is never told, so its count must still reach 0 once
+        // the queue is empty, or it polls every 200us for good.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        const N: usize = 64;
+        let counters: Vec<AtomicU64> = (0..=N).map(|_| AtomicU64::new(0)).collect();
+        let mut pages: Vec<PhysicalCodePage> = counters.iter().enumerate()
+            .map(|(i, c)| PhysicalCodePage::new(i as u32, c as *const AtomicU64))
+            .collect();
+        let mut a = Codegen::new();
+        let (shared, state) = a.shared_arena();
+        let mut b = Codegen::new_with_shared_arena(shared, state);
+        let mut analyzer = Analyzer::new();
+        let (mut pending_a, mut pending_b): (PendingCount, PendingCount) = (0, 0);
+        pages[0].mark_requested(4);
+        let req = CompileRequest { page: &mut pages[0] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut a, &mut pending_a);
+        assert_eq!(pending_a, 1, "a's compile must be queued and counted");
+        for i in 1..=N {
+            pages[i].mark_requested(4);
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut b, &mut pending_b);
+        }
+        force_publish_pending(&mut b, &mut pending_b);
+        assert_eq!(pending_b, 0);
+        assert_eq!(b.seal_queue_snapshot().queue_len, 0, "nothing may be left to publish");
+        publish_ready_nonforced(&mut a, &mut pending_a);
+        assert_eq!(pending_a, 0, "a's entry was released by b, so a has nothing pending");
     }
 
     /// One thread stores into a page through `bus` (each `write32` bumps the
@@ -1336,7 +1421,7 @@ mod tests {
                     let mut words = [0u32; ENTRIES_PER_PAGE];
                     let mut taken = 0u64;
                     while std::time::Instant::now() < deadline && !stop.load(Relaxed) {
-                        if let Snapshot::Taken(g) = snapshot_page(&page, &*bus, 0, &mut words) {
+                        if let Snapshot::Taken(g) = snapshot_page(&page, Some((&*bus, 0)), &mut words) {
                             taken += 1;
                             if (words[0] as u64) < g {
                                 stop.store(true, Relaxed);

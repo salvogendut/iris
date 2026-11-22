@@ -82,6 +82,8 @@ impl Board {
             let at = (tag - reg::TEX_LEVEL) as usize * 3;
             let op = self.cmd.operand;
             self.tex_mut().levels[at..at + 3].copy_from_slice(&op[..3]);
+            #[cfg(feature = "vprodiag")]
+            self.check_level_packing(op[0], op[1]);
             return;
         }
         if tag == gl_cmd::TEXCOORD_3F || tag == gl_cmd::TEXCOORD_4F {
@@ -1205,7 +1207,9 @@ impl Board {
                 if self.cmd.operand_index == self.cmd.operand_count {
                     if self.trace.on(TRACE_FIFO) {
                         let at = self.stream.pattern_load_offset;
-                        self.trace_note(format_args!("pattern load words {at}..{}", at + pattern::WORDS));
+                        let words = &self.stream.pattern_buffer[at as usize..(at + pattern::WORDS) as usize];
+                        let hex = words.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ");
+                        self.trace_note(format_args!("pattern load words {at}..{}: {hex}", at + pattern::WORDS));
                     }
                     self.cmd.state = ODSY_CMD_IDLE;
                 }

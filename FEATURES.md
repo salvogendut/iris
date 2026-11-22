@@ -37,6 +37,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `r5ksc_triton` | Disabled O2/Triton integrated L2 model; deliberately refuses to compile. | `r5ksc` |
 | `idle-pause` | Park the CPU in recognized guest idle loops; opt-in. | — |
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
+| `vprodiag` | VPro texture packing check: each texture level is checked against the upload that wrote its memory, reported by `vpro status`. Off by default; small cost per upload. | — |
 | `cache-ecc` | Cache parity/ECC injection and Cache Error exceptions for SGI IDE diagnostics; adds miss/exception checks. Off by default. | — |
 | `decode-cache` | Compatibility flag; decoded-instruction caching for the shadow model is unconditional. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
@@ -166,6 +167,42 @@ checkout), for the Help menu's version line. `PROFILE` and `CARGO_PKG_VERSION` a
 by Cargo. These build-time controls are
 separate from the runtime environment inventory below.
 
+### Offline and distribution builds
+
+CHD support comes from the `libchdman-rs` crate, which iris builds with its
+`prebuilt` feature: by default its build script downloads a static archive of
+MAME's CHD code for the host target. Distribution build systems have no
+network, so set `LIBCHDMAN_FORCE_SOURCE=1`. The build script then compiles the
+MAME CHD sources shipped inside the crate (and therefore inside `cargo
+vendor` output) with the host C/C++ toolchain, and nothing is downloaded. No
+other dependency fetches anything at build time.
+
+```sh
+cargo vendor vendor >> .cargo/config.toml     # online, once: copies every crate
+                                               # into vendor/ and points Cargo at it
+LIBCHDMAN_FORCE_SOURCE=1 cargo build --release --offline --locked
+LIBCHDMAN_FORCE_SOURCE=1 cargo build --release --offline --locked \
+    -p iris-gui --features iris/lightning,bundled   # the GUI, as the release builds it
+```
+
+CHD support stays on; there is no build without it.
+
+A prebuilt archive downloaded earlier is cached in `~/Library/Caches/libchdman-rs`
+(macOS), `~/.cache/libchdman-rs` (Linux) or `$XDG_CACHE_HOME/libchdman-rs`, and
+an offline build without `LIBCHDMAN_FORCE_SOURCE` uses it. Such a build passing
+on a developer machine therefore says nothing about a clean build host.
+[tools/offline-build-test.sh](tools/offline-build-test.sh) runs the steps above
+with the network denied and with a fresh `CARGO_HOME`, cache and target
+directory. Then the `chd-extract` it built unpacks a CHD made by MAME's
+`chdman`. With `--expect-download-failure` it first shows that the same build
+without `LIBCHDMAN_FORCE_SOURCE` fails.
+
+| Variable | Effect |
+|---|---|
+| `LIBCHDMAN_FORCE_SOURCE` | Any value: compile the bundled MAME CHD sources instead of downloading a prebuilt archive. Needs a C++20 compiler. |
+| `LIBCHDMAN_CPU` | `portable` compiles the FLAC codec as generic C. Without it an x86_64 source build passes `-mavx2 -mfma`, and the binary can fail with an illegal instruction on CPUs older than Haswell. Packages for a generic x86_64 baseline should set `portable`. |
+| `LIBCHDMAN_PREBUILT_FALLBACK` | Any value: compile from source if the prebuilt download fails, instead of stopping the build. |
+
 ## Shared machine configuration inventory
 
 Source: [src/config.rs](src/config.rs), `MachineConfig` and nested structs.
@@ -226,8 +263,19 @@ the first `[section]`, because TOML tables continue until the next header.
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)), onyx3000_ip35 (the Origin 3200 with a G-brick or a V-brick; `[graphics] board` picks it, see [the Onyx 3000 guide](docs/onyx3000-ip35.md)). |
 | `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`), meaning the machine's part of that family, or a part (`r14000_600`); independent of build features. With `test_device` set (the bare-metal benchmark rig) any part is accepted on any machine, `r14000_500` and the R16000 parts among them. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cache` | `auto` | How the CPU caches are modelled: `full` (tags, line data, LRU and write-back, as on a real R4400 or R5000; transparent in a `tcache` or `jitv2` build, which keeps tags and states but writes through to memory), `shadow` (memory is the only store; tag arrays only answer CACHE instructions, the faster model under jitv2) or `auto` (`shadow` in a `jitv2` build, `full` otherwise). The R10000 family always uses `shadow`. `--cache` overrides. |
-| `machine.cpus` | `1`; `4` on the Tezro | Processors fitted. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro, each run on its own host thread; one selects the one-processor board with one PIC, two or four the board with two PICs. |
+| `machine.cpus` | `1`; `4` on the Tezro | Processors fitted on each node board, each run on its own host thread. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro; one selects the one-processor board with one PIC, two or four the board with two PICs. 1, 2 or 4 on each C-brick of the Origin 3200 and Onyx 3000, so two C-bricks run up to eight. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
+
+The keys in the sections below, down to `[onyx3000]`, and those of
+[`[o2]`](#o2) and [`[octane]`](#octane), are `[machine]` keys too: what one
+machine has beyond the shared keys. Write them in `[machine]`; a key the
+profile does not have is refused. Two are named differently there: `nodes`
+(also accepted as `c_bricks`) is the node boards of an Origin 2000 or Onyx2 and
+the C-bricks of an Origin 3200 or Onyx 3000, and `audio_card` is the `audio`
+key of the Tezro, Fuel, Origin 3200 and Onyx 3000 tables, which fits the
+ICE1724 audio card. The tables named for a machine are the older spelling. They are
+still read, a `[machine]` key wins over the same key there, and a config saved
+by iris-gui writes `[machine]`.
 
 ### [origin200], [origin2000] and [onyx2]
 
@@ -297,7 +345,7 @@ Origin 3200 settings apply when `machine.profile = "origin3200_ip35"`.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `c_bricks` | `1` | 1 or 2 C-bricks, each with one processor. Two are joined by the direct NUMAlink cable. |
+| `c_bricks` | `1`; `2` on an Onyx 3000 with a V12 | 1 or 2 C-bricks, each with `machine.cpus` processors. Two are joined by the direct NUMAlink cable. |
 | `flash` | unset | Persistent 16 MiB boot-flash file of the first C-brick; the second keeps its own at the name with `.1` added. Unset, the flash is volatile. |
 | `console` | `l1` | `l1`, `ioc3_a` or `ioc3_b`. Selects the guest console connection. |
 | `l1_port` | `8882` | Host TCP port for the first C-brick's L1 console. |
@@ -313,16 +361,19 @@ written to a saved config only when one of these keys is set. See the
 ### [onyx3000]
 
 Onyx 3000 settings apply when `machine.profile = "onyx3000_ip35"`. The keys are
-those of `[origin3200]` except `c_bricks`, which `[graphics] board` fixes:
-`flash`, `console`, `l1_port`, `l1_log`, `l1_revision` and `brick_serial`, with
-the same defaults. A `[onyx3000]` table is written to a saved config only when
+those of `[origin3200]`, with the same defaults: `c_bricks` (`[machine] nodes`), `flash`, `console`,
+`l1_port`, `l1_log`, `l1_revision` and `brick_serial`. Either graphics board
+takes one or two C-bricks; `c_bricks` left unset is 2 with a V12, whose V-brick
+then has a C-brick of its own. A `[onyx3000]` table is written to a saved config only when
 one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 
 ### [graphics]
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12` on a V-brick with a second C-brick (widget 8, an approximation); it has no `none`. |
+| `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12`, on a V-brick with a second C-brick (widget 8, an approximation) or with one C-brick at widget 11 of the I-brick; it has no `none`. |
+| `graphics.node` | the machine's placement | Onyx 3000: the C-brick (0 or 1) whose XIO link reaches the graphics board. Unset, a pipe is on the first and a V12 on the last. On node 0 the board is at the I-brick's port B; on node 1 it is in a brick of that C-brick's own. Other machines refuse a value other than 0. |
+| `graphics.widget` | the machine's placement | The Crosstalk widget the board answers at, for experiment. Onyx 3000: 11 on node 0; 8, 9, 11, 12 or 13 in a brick on node 1 (unset: 8 for a V12, 11 for a pipe). Tezro: 8, 9, 12, 13 or 14 (unset: 12, the only one known to work). Other machines refuse it. |
 | `graphics.flash` | unset | InfiniteReality2: the file that keeps the pipe's 512 KiB flash EEPROM between runs; created when absent. Unset keeps it in memory. |
 | `graphics.heads` | `1` | 1 or 2; dual-head requires Newport. The second head takes GIO expansion slot 0, so `ultra64` is turned off and `test_device` is refused. |
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
@@ -497,6 +548,7 @@ Needs a Unix host.
 |---|---|---|
 | `virtio_9p.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_9p.slot` | `"exp1"` | `"exp0"` or `"exp1"`, as for `virtio_serial`, and not the slot that device has. Indy and Indigo2 only. |
+| `virtio_9p.bridge_slot` | `5` | The Octane's onboard Bridge slot, 4 to 7, and not the one virtio-serial has. Octane only. |
 | `virtio_9p.path` | required | The host directory. |
 | `virtio_9p.tag` | `"share"` | The name the guest mounts it by; 1 to 64 bytes. |
 | `virtio_9p.readonly` | `false` | Refuse every write from the guest. |
@@ -514,6 +566,7 @@ table adds a port, in order.
 |---|---|---|
 | `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device`, Ultra64 and the second Newport head) or `"exp1"` (`0x1F600000`). Indy and Indigo2 only. |
+| `virtio_serial.bridge_slot` | `7` | The Octane's onboard Bridge slot, 4 to 7. Octane only. In slot 7 the device raises INTB (Bridge pin 3), elsewhere INTA. Keep slot 4 empty: its INTA is the IOC3's SuperIO pin, and OpenBSD's `ioc` driver takes the SuperIO interrupt (the serial console) from the first empty slot's pin. |
 | `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
 | `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); 1 to 200 bytes, unique. |
 | `port.console` | `false` | Tell the guest this port is its console. |
@@ -815,6 +868,7 @@ mistaken for GUI settings.
 | `IRIS_IP32_HOT` | Any presence counts O2 register accesses (MACE, GBE, rendering engine) for finding a driver polling a bit nothing sets; costs speed. | [src/ip32.rs](src/ip32.rs) |
 | `IRIS_IP32_MEC_TRACE` | Any presence traces O2 Ethernet frames (sent, received, dropped) on stderr. | [src/dev/mec.rs](src/dev/mec.rs) |
 | `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
+| `IRIS_IP32_RE_LAG_US` | Test aid: the O2 rendering engine waits this many microseconds before each memory transfer, as on a host that keeps its thread waiting. Used with `tools/prom-boot-loop.py` to check that the PROM still reaches its menu (see [TESTING.md](TESTING.md#repeated-prom-boots)). | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `IRIS_JIT_ARENA_FLUSH_MB` | Flush compiled code when the arena holds this many MiB, for testing the compile workers' flush. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
 | `IRIS_JIT_ATOMIC_GEN` | Any presence makes inline stores bump the page generation atomically with one CPU too, as they always do with several. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_CACHE` | 1 or on enables persistent JIT page reuse. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
@@ -844,7 +898,7 @@ mistaken for GUI settings.
 | `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
 | `IRIS_ODSY_REC` | Record VPro bus stores, loads and DMA reads from power-on to this path (gzip; replayed by the tests in `src/dev/odyssey/golden/`; `vpro rec` does the same from the monitor). | [src/dev/odyssey/record.rs](src/dev/odyssey/record.rs) |
 | `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
-| `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
+| `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). Also traces an offline replay (`VPRO_REPLAY`); a test that replays several sessions adds `.1`, `.2` and so on for the later ones. | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
 | `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, `dx12`, or `gl` enables the CPU-canonical legacy live REX3 GPU prototype in a `rex-gpu` build. Unset keeps that prototype off; this does not select production `[graphics] raster = "wgpu"`, and the two modes are mutually exclusive. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
@@ -980,6 +1034,7 @@ both the interpreter and jitv2.
 | `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
+| `vprodiag` | VPro texture packing check (`vpro status`, "texture packing"): every texture level the guest names is checked against the upload that wrote that memory. Off by default; works with `lightning` |
 | `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2, IMPACT, O2 and VPro annotated traces (`gr2 trace`, `mgras trace`, `re trace`, `vpro trace`); O2 engine recording (`re rec`). On with `developer`; opt in for plain and `lightning` builds |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
 | `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |
