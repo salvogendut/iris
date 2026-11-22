@@ -105,7 +105,7 @@ pub const NS_PER_GUEST_CYCLE: u64 = 10;
 /// next Compare write re-arms it via `MipsCore::arm_ip7_sequence`, which is
 /// exactly the guest's acknowledgement.
 #[inline]
-fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64) -> bool {
+fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64, _cpu: u8) -> bool {
     if ticket == IP7_SEQ_CONSUMED {
         return false;
     }
@@ -117,7 +117,11 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
     {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
         seq.store(IP7_SEQ_CONSUMED, Ordering::SeqCst);
-        crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+        crate::pf_level!(
+            crate::perfetto::events::IP7_LEVEL[_cpu as usize % crate::perfetto::events::IP7_CPUS],
+            crate::perfetto::events::IP7_COMPARE[_cpu as usize % crate::perfetto::events::IP7_CPUS],
+            true
+        );
         #[cfg(feature = "idle-pause")]
         crate::cpu::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
@@ -1856,6 +1860,7 @@ impl MipsCore {
                     self.ip7_seq,
                     &self.hot.interrupts,
                     &self.fasttick_count,
+                    self.cpu_id,
                 );
                 #[cfg(feature = "developer_ip7")]
                 if won {
@@ -1968,6 +1973,7 @@ impl MipsCore {
             let fasttick = self.fasttick_count.clone();
             let ticket = self.ip7_seq;
             let seq_ref = self.ip7_seq_shared.clone();
+            let cpu = self.cpu_id;
             // After firing, hardware would next match Compare again after a
             // full 32-bit Count wrap — self-reschedule that far out. In
             // practice the guest's interrupt handler writes Compare long
@@ -1977,8 +1983,8 @@ impl MipsCore {
             );
             self.timer_id = Some(tm.add_one_shot(
                 std::time::Duration::from_nanos(ns),
-                (irq, fasttick, wrap, ticket, seq_ref),
-                |(irq, fasttick, wrap, ticket, seq_ref)| {
+                (irq, fasttick, wrap, ticket, seq_ref, cpu),
+                |(irq, fasttick, wrap, ticket, seq_ref, cpu)| {
                     // SAFETY: points into the MipsCore owned by the executor's
                     // top-level Arc<Mutex<..>>, which outlives the armed timer
                     // (Drop for MipsCore removes it). Same contract as
@@ -1988,13 +1994,32 @@ impl MipsCore {
                     // Compare write since this one-shot was scheduled has
                     // already issued a new ticket, so this claim fails and the
                     // interrupt the guest just acked is not re-asserted.
-                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick);
+                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick, *cpu);
                     if !won {
                         return crate::hptimer::TimerReturn::Delete;
                     }
                     crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
                 },
             ));
+        }
+    }
+
+    /// Mirror the software interrupts (Cause IP0 and IP1) into
+    /// `hot.interrupts`. Compiled code polls only that word for a pending
+    /// interrupt, so a software interrupt kept in Cause alone was not taken
+    /// under the JIT until a hardware interrupt happened to send the CPU
+    /// through the interpreter's check: IRIX posts deferred work (such as
+    /// waking a process blocked on the graphics pipe) as a software
+    /// interrupt, and the Tezro's quake froze for most of a second at a time
+    /// while it sat pending behind clock ticks the handler serviced alone.
+    /// The interpreter merges only the external bits back into Cause, so the
+    /// mirror only makes the word nonzero; delivery still reads Cause.
+    pub fn sync_soft_interrupts(&self) {
+        let mask = (CAUSE_IP0 | CAUSE_IP1) as u64;
+        let soft = self.cp0_cause as u64 & mask;
+        self.hot.interrupts.fetch_and(!(mask & !soft), Ordering::SeqCst);
+        if soft != 0 {
+            self.hot.interrupts.fetch_or(soft, Ordering::SeqCst);
         }
     }
 
@@ -2010,7 +2035,7 @@ impl MipsCore {
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
             self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
             self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
-            crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+            crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], true);
             self.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2063,7 +2088,7 @@ impl MipsCore {
         self.arm_ip7_sequence();
         self.reanchor_count_and_reschedule();
         if self.cp0_cause & CAUSE_IP7 != 0 {
-            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count);
+            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count, self.cpu_id);
         } else {
             self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
         }
@@ -2191,7 +2216,7 @@ impl MipsCore {
                 // re-raise it).
                 self.cp0_cause &= !CAUSE_IP7;
                 self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
-                crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, false);
+                crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], false);
 
                 // Now classify what the guest actually asked for. Count here
                 // is virtual and materialized in lumps from the wall clock,
@@ -2250,6 +2275,7 @@ impl MipsCore {
                             ticket,
                             &self.hot.interrupts,
                             &self.fasttick_count,
+                            self.cpu_id,
                         );
                         #[cfg(feature = "developer_ip7")]
                         if won { self.ip7_late_fires += 1; }
@@ -2329,6 +2355,7 @@ impl MipsCore {
                 // Cause register: Only IP0 and IP1 are writable software interrupts
                 let mask = CAUSE_IP0 | CAUSE_IP1;
                 self.cp0_cause = (self.cp0_cause & !mask) | ((value as u32) & mask);
+                self.sync_soft_interrupts();
             }
             14 => {
                 // A guest write of a 32-bit value here is where a 64-bit
@@ -2950,8 +2977,25 @@ mod ip7_ticket_tests {
         let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
         assert_ne!(shared, IP7_SEQ_CONSUMED, "the restored deadline was armed with the delivered sentinel");
         assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
-        assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count),
+        assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count, core.cpu_id),
             "the restored deadline's one-shot could not deliver IP7");
+    }
+
+    /// A software interrupt the guest posts in Cause shows in the pending
+    /// word compiled code polls, and clearing it there leaves the hardware
+    /// lines alone. Kept only in Cause, it went untaken under the JIT until
+    /// a hardware interrupt passed through the interpreter's check.
+    #[test]
+    fn a_software_interrupt_shows_in_the_pending_word() {
+        let mut core = MipsCore::default();
+        core.hot.interrupts.store(CAUSE_IP7 as u64, Ordering::SeqCst);
+        core.write_cp0(13, CAUSE_IP0 as u64);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), (CAUSE_IP7 | CAUSE_IP0) as u64);
+        core.write_cp0(13, CAUSE_IP1 as u64);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), (CAUSE_IP7 | CAUSE_IP1) as u64);
+        core.write_cp0(13, 0);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), CAUSE_IP7 as u64);
+        assert_eq!(core.cp0_cause & (CAUSE_IP0 | CAUSE_IP1), 0);
     }
 
     fn ip7_pending(core: &MipsCore) -> bool {
@@ -3006,7 +3050,7 @@ mod ip7_ticket_tests {
                     }
                     if ticket != tried.load(Ordering::SeqCst) {
                         // SAFETY: the core outlives the scope, as it does the armed timer.
-                        claim_ip7(&seq, ticket, unsafe { &*irq.0 }, &fasttick);
+                        claim_ip7(&seq, ticket, unsafe { &*irq.0 }, &fasttick, 0);
                         tried.store(ticket, Ordering::SeqCst);
                     }
                     std::thread::yield_now();

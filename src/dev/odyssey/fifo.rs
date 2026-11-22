@@ -377,6 +377,7 @@ impl CommandFifo {
             // the enable mask says.
             let mut f = front.lock();
             f.intr_flags |= intr::FIFO_HIGH_WATER;
+            crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_HIGH_WATER, after);
             f.update_irq();
         }
         self.wake();
@@ -421,8 +422,12 @@ impl CommandFifo {
             let before = self.levels.words.fetch_sub(words, SeqCst);
             debug_assert!(before >= words, "the level counts every store before the ring shows it (push)");
             if before >= cfifo::LOW_WATER && before - words < cfifo::LOW_WATER {
+                // Traced when the flag latches, not on every crossing with it
+                // already set (hundreds of thousands a second under GL).
+                if f.intr_flags & intr::FIFO_LOW_WATER == 0 {
+                    crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, before - words);
+                }
                 f.intr_flags |= intr::FIFO_LOW_WATER;
-                crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, before - words);
                 f.update_irq();
             }
         } else {
