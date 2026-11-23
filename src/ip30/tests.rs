@@ -533,14 +533,14 @@ impl Octane {
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
         let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &PIN_WIRING);
 
-        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, MAC, ioc3::ByteBus::Ds1685(crate::dev::ds1685::Ds1685::new(None))));
+        let ioc3 = Arc::new(Ioc3::new(&Arc::new(crate::hptimer::TimerManager::new()), &ioc3::IP30, MAC, ioc3::ByteBus::Ds1685(crate::dev::ds1685::Ds1685::new(None))));
         let eth = ioc3.eth().unwrap().clone();
         eth.negotiate_at_once();
         let (link, sent, inject) = crate::net::Link::loopback();
         eth.attach(link);
         ioc3.connect_superio_interrupt(bridge.bus().board_irq(crate::pci::BoardIrq(SUPERIO_PIN as u8)));
 
-        let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
+        let isp = [0, 1].map(|i| Arc::new(Isp1040::new_at(i, Isp1040::new_bus(), &Arc::new(crate::hptimer::TimerManager::new()))));
         let at = |slot: u32| crate::pci::DevFn { device: slot as u8, function: 0 };
         bridge.bus().attach(at(SLOT_ISP0 as u32), isp[0].clone());
         bridge.bus().attach(at(SLOT_ISP1 as u32), isp[1].clone());

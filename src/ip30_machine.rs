@@ -373,7 +373,7 @@ impl OctaneMachine {
         // The buses are filled from `[scsi.N]` before the controllers exist.
         let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
         let (scratch_path, mut disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
-        let scsi = [Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
+        let scsi = [Arc::new(Isp1040::new_at(0, bus_a, &timer_manager)), Arc::new(Isp1040::new_at(1, bus_b, &timer_manager))];
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
@@ -400,7 +400,7 @@ impl OctaneMachine {
                 let board = &xio_boards[fc.board.unwrap_or(0)];
                 let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
                 board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
-                let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
+                let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci, &timer_manager)?;
                 card.fc.set_heartbeat(heartbeat.clone());
                 card.attach(board.bus(), slot);
                 eprintln!(
@@ -418,19 +418,17 @@ impl OctaneMachine {
         if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
             eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
         }
-        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
+        let ioc3 = Arc::new(Ioc3::new(&timer_manager, &ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
         ioc3.set_microlan(identity.ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = ioc3.eth().expect("the Octane's IOC3 has Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
         ioc3.connect_superio(pci);
-        ioc3.set_timer_manager(timer_manager.clone());
         // ... and resetting itself through HEART.
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);
         }));
-        let rad = Arc::new(Rad1::new());
-        rad.set_timer_manager(timer_manager.clone());
+        let rad = Arc::new(Rad1::new(&timer_manager));
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());
         }
@@ -1102,9 +1100,7 @@ impl OctaneMachine {
     fn load_board(&self, v: &toml::Value) -> Result<(), String> {
         let load = |key: &str, dev: &dyn Saveable| dev.load_state(field(v, key)?).map_err(|e| format!("{key}: {e}"));
         // The machine is stopped, so the clock holds at the saved reading while the devices re-arm.
-        if crate::snapshot::get_field(v, "clock_ns").is_some() {
-            self.timer_manager.clock().restore(crate::snapshot::field_u64(v, "clock_ns")?);
-        }
+        self.timer_manager.clock().restore(crate::snapshot::field_u64(v, "clock_ns")?);
         load("ioc3", &*self.ioc3)?;
         load("eth", &*self.eth)?;
         load("scsi0", &*self.scsi[0])?;
@@ -1380,9 +1376,8 @@ impl OctaneMachine {
         self.cpus[0].load_state(&s.cpu).map_err(|e| format!("cpu: {e}"))?;
         self.flash.restore_contents(&s.flash)?;
         self.ram.restore_bank_words(&s.memory)?;
-        // The overlays first: an import can take minutes, and the devices
-        // count their deadlines from their load, so they load last, just
-        // before the machine starts.
+        // The overlays first: an import can take minutes, so the devices load last, just before
+        // the machine starts.
         for (i, ctl) in self.scsi.iter().enumerate() {
             if let Some(sets) = &s.overlays[i] {
                 ctl.bus().import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
@@ -2211,18 +2206,18 @@ mod snapshot_tests {
             assert_eq!(digest(&a), at_save);
             assert_eq!(a.cpus[0].save_state(), cpu_at_save);
             assert_eq!(a.timer_manager.clock().now(), crate::snapshot::field_u64(&board, "clock_ns").unwrap());
-            // Two clocks run in host time while the machine is stopped: the
-            // PHY's negotiation countdown, whose time left can only have
-            // shrunk since the load, and the RTC, which keeps the host's time
-            // of day as on every machine. Everything else comes back as saved.
+            // The RTC runs in host time while the machine is stopped, as on
+            // every machine. Everything else comes back as saved.
             let (mut board, mut got) = (board, a.save_board());
-            let left = |t: &toml::Value| crate::snapshot::field_u64(&t["eth"]["phy"], "deadline").unwrap();
-            assert!(left(&got) <= left(&board));
             for t in [&mut board, &mut got] {
-                t["eth"]["phy"].as_table_mut().unwrap().remove("deadline");
                 t["ioc3"]["chip"].as_table_mut().unwrap().remove("rtc");
             }
             assert_eq!(got, board);
+            // A snapshot from before the machine clock was saved is refused.
+            let mut old = a.read_snapshot(&dir.join("saves"), "bare").unwrap();
+            old.board.as_table_mut().unwrap().remove("clock_ns");
+            a.stop();
+            assert!(a.apply_snapshot(old).unwrap_err().contains("clock_ns"));
         }).unwrap().join().unwrap();
     }
 

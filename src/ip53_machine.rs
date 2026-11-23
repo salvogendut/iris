@@ -357,16 +357,15 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
             .map_err(|_| "Tezro: PIC peer connected twice".to_string())?;
     }
 
-    let ioc4 = Arc::new(Ioc4::new(Ioc4Config::tezro()));
+    let ioc4 = Arc::new(Ioc4::new(timers, Ioc4Config::tezro()));
     ioc4.attach_clock(timekeeper.clone());
-    ioc4.set_timer_manager(timers.clone());
     for (port, backend) in serial[1..].iter().enumerate() {
         ioc4.set_serial_backend(port, backend.clone());
     }
-    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), timers));
     scsi.set_heartbeat(heartbeat.clone());
     // The Ethernet slot drives REQ64#, which the chip samples as reset ends.
-    let eth = Bcm5701::new(Bcm5701Config { req64: true, ..Bcm5701Config::new(l1.station_mac()) })?;
+    let eth = Bcm5701::new(timers, Bcm5701Config { req64: true, ..Bcm5701Config::new(l1.station_mac()) })?;
     io9.attach(0, IOC4_DEVICE, ioc4.clone(), Function { self_ordered_pio: true, req64: false });
     let ti = PciToPciBridge::with_wide_windows(
         io9.bus(0),
@@ -437,7 +436,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
                 Resettable::power_on(&**v);
             }
         }),
-        poll: None,
         at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
         monitor,
         ps2: ioc4.ps2(),

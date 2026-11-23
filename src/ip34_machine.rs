@@ -73,7 +73,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
         .transpose()?;
     eprintln!("iris: {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
-    let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, timers.clock(), heartbeat, vpro.clone())?;
+    let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, timers, heartbeat, vpro.clone())?;
     io.status = Some(status);
     io.fasttick = Some(fasttick);
     fit_audio_card(cfg, xbridge.bus(HEAD_F), timers, &mut io);
@@ -97,20 +97,20 @@ fn build_baseio(
     l1: &Arc<L1>,
     xbridge: &Arc<XBridge>,
     clock: &Clock,
-    machine_clock: &crate::clock::Clock,
+    timers: &Arc<TimerManager>,
     heartbeat: Arc<AtomicU64>,
     vpro: Option<Arc<Odyssey>>,
 ) -> Result<BoardIo, String> {
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), machine_clock.clone())?);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
-    let (ioc3, serial) = attach_ioc3(cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());
+    let (ioc3, serial) = attach_ioc3(timers, cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());
     let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
-    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), timers));
     scsi.set_heartbeat(heartbeat.clone());
     ioc3.set_heartbeat(heartbeat);
     pci.attach(DevFn { device: 1, function: 0 }, scsi.clone());
-    let usb = attach_usb(pci, &ioc3, clock, cfg.fuel.usb_input)?;
+    let usb = attach_usb(pci, &ioc3, timers, cfg.fuel.usb_input)?;
     let (reset_ioc3, reset_scsi, reset_usb) = (ioc3.clone(), scsi.clone(), usb.clone());
     let reset_vpro = vpro.as_ref().map(Arc::downgrade);
     xbridge.set_reset_output(Arc::new(move |port| {
@@ -137,7 +137,6 @@ fn build_baseio(
     ioc3.register_locks();
     xbridge.register_locks();
     let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone(), timekeeper.clone());
-    let poll_usb = usb.clone();
     let disks = scsi.clone();
     Ok(BoardIo {
         frontend_storage: scsi.clone(),
@@ -149,7 +148,6 @@ fn build_baseio(
             reset_usb.power_on();
             reset_clock.power_on();
         }),
-        poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,
         monitor: vec![scsi.clone(), ioc3.ps2()],
         ps2: ioc3.ps2(),

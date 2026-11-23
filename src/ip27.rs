@@ -340,7 +340,7 @@ pub(crate) fn pci_devices(
         1 => Ok(&bus_b),
         _ => Err(format!("controller {c} ({name} has controllers 0 and 1)")),
     })?;
-    let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
+    let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a, timers)), Arc::new(Isp1040::new_at(1, bus_b, timers))];
     for s in &scsi {
         s.set_heartbeat(heartbeat.clone());
     }
@@ -350,12 +350,11 @@ pub(crate) fn pci_devices(
     pci.attach(slot(1), scsi[1].clone());
     // The Fuel's M48T35 Timekeeper is the same part.
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
-    let ioc3 = Arc::new(Ioc3::new(ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
+    let ioc3 = Arc::new(Ioc3::new(timers, ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 has Ethernet").clone();
     pci.attach(slot(2), ioc3.clone());
     ioc3.connect_superio(pci);
-    ioc3.set_timer_manager(timers.clone());
 
     let console = cfg.ci.then(|| Arc::new(CiSerialBackend::new()));
     let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, name, console.as_ref());
@@ -403,7 +402,6 @@ pub(crate) fn pci_devices(
         reset,
         display: None,
         status: None,
-        poll: None,
         at_batch: None,
         fasttick: None,
         cpus: None,

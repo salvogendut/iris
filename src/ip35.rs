@@ -87,6 +87,7 @@ pub(crate) fn xbridge_on(bedrock: &Bedrock) -> Arc<XBridge> {
 /// then the IOC3's two ports.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attach_ioc3(
+    timers: &Arc<TimerManager>,
     cfg: &MachineConfig,
     pci: &PciBus,
     board: &'static Ioc3Board,
@@ -96,7 +97,7 @@ pub(crate) fn attach_ioc3(
     l1_setting: &'static str,
     l1_log: Option<String>,
 ) -> (Arc<Ioc3>, Vec<SerialPort>) {
-    let ioc3 = Arc::new(Ioc3::new(board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
+    let ioc3 = Arc::new(Ioc3::new(timers, board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
     pci.attach(DevFn { device: 4, function: 0 }, ioc3.clone());
     ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
     let serial: [Arc<CiSerialBackend>; 3] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
@@ -140,9 +141,8 @@ pub(crate) fn attach_ioc3(
 /// The OHCI controller at device 5 of head `pci`. With `input`, a USB keyboard and mouse sit on its
 /// first two root ports and take the host's input instead of `ioc3`'s PS/2 pair, or a guest that
 /// opened both would see every key twice.
-pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, clock: &Clock, input: bool) -> Result<Arc<Ohci>, String> {
-    let usb = Ohci::new();
-    usb.set_clock(clock.clone());
+pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, timers: &Arc<TimerManager>, input: bool) -> Result<Arc<Ohci>, String> {
+    let usb = Ohci::new(timers);
     if input {
         let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
         usb.attach(0, keyboard.clone())?;
@@ -166,13 +166,12 @@ pub(crate) const AUDIO_CARD_DEVICE: u8 = 2;
 /// The ICE1724 audio card as `[machine] audio_card` fits it, playing to the host as `[audio]`
 /// sets unless `no_audio`. The board attaches it to a bus.
 pub(crate) fn audio_card(cfg: &MachineConfig, timers: &Arc<TimerManager>) -> Arc<Ice1724> {
-    let card = Arc::new(Ice1724::new(Variant::Dm8));
+    let card = Arc::new(Ice1724::new(timers, Variant::Dm8));
     if cfg.no_audio {
         eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
     } else {
         card.enable_output(cfg.audio.clone());
     }
-    card.set_timer_manager(timers.clone());
     card
 }
 
@@ -268,7 +267,7 @@ pub(crate) fn machine(
     // The machine numbers its processors once, across its nodes in order.
     let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
     for spec in &specs {
-        let l1 = Arc::new(L1::new(spec.l1.clone())?);
+        let l1 = Arc::new(L1::new(&timers, spec.l1.clone())?);
         nodes.push(NodeBoard::<Bedrock, Flash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, &prom, &timers, first_cpu, specs.len(), &events, &l1)?);
         l1s.push(l1);
         first_cpu += spec.processors.count();
@@ -293,19 +292,9 @@ pub(crate) fn machine(
         let several = spec.processors.count() > 1;
         let cpus: Vec<_> = (0..spec.processors.count())
             .map(|n| {
-                // A node's first processor brings its boot flash, and the first node's the
-                // board's devices, up to date; every processor of a node of several joins the
-                // PROM's holds.
-                let flash = (n == 0).then(|| (node.flash.clone(), clock.clone()));
-                let board = (index == 0 && n == 0).then(|| io.poll.clone()).flatten();
+                // Every processor of a node of several joins the PROM's holds.
                 let held = io.at_batch.clone().filter(|_| several);
                 let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    if let Some((flash, clock)) = &flash {
-                        flash.advance_to(clock());
-                    }
-                    if let Some(board) = &board {
-                        board();
-                    }
                     if let Some(held) = &held {
                         held();
                     }

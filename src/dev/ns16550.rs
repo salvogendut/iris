@@ -40,20 +40,16 @@
 //!
 //! * Transmit is instant. A write of the transmit register hands the byte to
 //!   the host backend (or, in loopback, back to the receiver) before the
-//!   write returns, so the holding register and the transmitter read empty.
-//!   The one exception is a backend that cannot take the byte (see
-//!   [`SerialBackend::try_send_byte`]): the byte is held, the transmitter
-//!   reads busy, and [`Ns16550::poll_tx`] retries it, gives up after
-//!   [`XMIT_RETRY_TIMEOUT`] and then treats the backend as disconnected until
-//!   it takes a byte again, as QEMU's transmit retry does. A byte given up on
-//!   goes to the backend's plain `send_byte`, which drops it where the host
-//!   end is full but lets a log tee record it, so a stalled console client
-//!   never leaves a hole in the serial log. QEMU's transmit
-//!   timer is not here. Nothing is paced to the baud rate; the divisor and line control
-//!   only set how long the receive timeout is.
+//!   write returns, so the holding register and the transmitter always read
+//!   empty. A host client that reads slowly never holds the guest: the
+//!   backend queues its output and, past a cap, drops the oldest (see
+//!   [`crate::dev::serial_host::ClientQueue`]). QEMU's transmit retry and
+//!   hold-off machinery is not here. Nothing is paced to the baud rate; the
+//!   divisor and line control only set how long the receive timeout is.
 //! * The host end is a [`SerialBackend`] polled by [`Ns16550::pump`], where
-//!   QEMU's chardev calls back. The receive timeout is a host-time deadline
-//!   that [`Ns16550::check_timeout`] resolves, where QEMU arms a timer.
+//!   QEMU's chardev calls back. The receive timeout is a deadline on the
+//!   machine clock that the owner's timer resolves with
+//!   [`Ns16550::check_timeout`].
 //! * A receive overrun with the FIFOs off keeps the character already in the
 //!   receive register and drops the new one, which is what the part does.
 //!   QEMU overwrites the register.
@@ -72,8 +68,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::clock::Clock;
 use crate::dev::serial_host::{null_serial_backend, SerialBackend};
 use crate::snapshot::{get_field, hex_u8, toml_bool, toml_u32, toml_u8};
 
@@ -181,8 +178,9 @@ pub struct Ns16550 {
     recv_fifo_itl: usize,
     thr_ipending: bool,
     timeout_ipending: bool,
-    /// When the receive timeout fires, while characters sit unread.
-    timeout_deadline: Option<Instant>,
+    clock: Clock,
+    /// When the receive timeout fires, in machine ns, while characters sit unread.
+    timeout_at: Option<u64>,
     char_transmit_time: Duration,
     /// Characters a script or the monitor has typed, ahead of what the
     /// backend delivers. They reach the receiver the way the backend's do,
@@ -191,20 +189,9 @@ pub struct Ns16550 {
     /// The last [`OUT_KEEP`] bytes sent, and how many were sent in all.
     out: VecDeque<u8>,
     sent: u64,
-    /// Bytes not yet sent, oldest first: the first is in the shift register
-    /// and the rest wait in the holding register or the transmit FIFO. Only a
-    /// backend that refuses a byte leaves any. The transmitter is busy while
-    /// there are any.
-    held: VecDeque<u8>,
-    held_since: Option<Instant>,
-    /// A held byte was given up on: the backend counts as disconnected, and
-    /// bytes complete without waiting, until it takes one.
-    backend_dead: bool,
+    /// Output may be waiting in the backend, so a poll has a flush to do.
+    unflushed: bool,
 }
-
-/// How long a refused byte is retried before the backend counts as
-/// disconnected.
-pub const XMIT_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Ns16550 {
     /// A port in its reset state. `baudbase` is the reference clock over 16
@@ -227,14 +214,13 @@ impl Ns16550 {
             recv_fifo_itl: 1,
             thr_ipending: false,
             timeout_ipending: false,
-            timeout_deadline: None,
+            clock: Clock::new(),
+            timeout_at: None,
             char_transmit_time: RESET_CHAR_TIME,
             typed: VecDeque::new(),
             out: VecDeque::new(),
             sent: 0,
-            held: VecDeque::new(),
-            held_since: None,
-            backend_dead: false,
+            unflushed: false,
         };
         s.reset();
         s
@@ -257,15 +243,18 @@ impl Ns16550 {
         self.recv_fifo_itl = 1;
         self.char_transmit_time = RESET_CHAR_TIME;
         self.timeout_ipending = false;
-        self.timeout_deadline = None;
+        self.timeout_at = None;
         self.recv_fifo.clear();
         self.thr_ipending = false;
-        self.held.clear();
-        self.held_since = None;
     }
 
     pub fn set_backend(&mut self, backend: Arc<dyn SerialBackend>) {
         self.backend = backend;
+    }
+
+    /// The machine clock the receive timeout runs on.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
     }
 
     /// Change the reference clock the divisor divides (the IOC3 derives it
@@ -291,9 +280,16 @@ impl Ns16550 {
     }
 
     /// How long a character takes on the line at the programmed rate and
-    /// frame.
+    /// frame. Nothing here waits for it; a DMA engine in front of the port
+    /// may.
     pub fn char_time(&self) -> Duration {
         self.char_transmit_time
+    }
+
+    /// The holding register is empty, so a DMA engine may write a byte.
+    /// Transmit is instant, so it always is once the write returns.
+    pub fn tx_ready(&self) -> bool {
+        self.lsr & LSR_THRE != 0
     }
 
     pub fn loopback(&self) -> bool {
@@ -304,12 +300,6 @@ impl Ns16550 {
     pub fn rx_pending(&self) -> usize {
         self.typed.len()
             + if self.fcr & FCR_FE != 0 { self.recv_fifo.len() } else { (self.lsr & LSR_DR != 0) as usize }
-    }
-
-    /// A byte is waiting to go out: only a backend that refused one leaves
-    /// any.
-    pub fn tx_pending(&self) -> bool {
-        !self.held.is_empty()
     }
 
     /// Type characters at the port, as if the host had sent them. They wait
@@ -333,6 +323,11 @@ impl Ns16550 {
     /// Bytes sent in all, including those no longer kept.
     pub fn bytes_out(&self) -> u64 {
         self.sent
+    }
+
+    /// Bytes the host end dropped for clients that did not read.
+    pub fn host_dropped(&self) -> u64 {
+        self.backend.dropped()
     }
 
     // ----- interrupt identification -----
@@ -402,7 +397,6 @@ impl Ns16550 {
                 }
             }
             IIR_FCR => {
-                self.check_timeout(Instant::now());
                 let ret = self.iir;
                 if ret & IIR_ID == IIR_TX_EMPTY {
                     self.thr_ipending = false;
@@ -414,7 +408,6 @@ impl Ns16550 {
             MCR => self.mcr,
             LSR => {
                 self.pump();
-                self.check_timeout(Instant::now());
                 let ret = self.lsr;
                 // Reading clears the break and overrun latches.
                 if self.lsr & (LSR_BI | LSR_OE) != 0 {
@@ -488,7 +481,7 @@ impl Ns16550 {
         }
         if val & FCR_RFR != 0 {
             self.lsr &= !(LSR_DR | LSR_BI);
-            self.timeout_deadline = None;
+            self.timeout_at = None;
             self.timeout_ipending = false;
             self.recv_fifo.clear();
         }
@@ -545,92 +538,17 @@ impl Ns16550 {
         if self.loopback() {
             self.receive(&[val]);
         } else {
-            if self.fcr & FCR_FE != 0 {
-                // A full transmit FIFO drops its oldest byte, not the one
-                // in the shift register.
-                if self.held.len() > FIFO_LENGTH {
-                    self.held.remove(1);
-                }
-                self.held.push_back(val);
-            } else if self.held.len() >= 2 {
-                // The holding register is overwritten.
-                *self.held.back_mut().expect("two held") = val;
-            } else {
-                self.held.push_back(val);
-            }
-            self.drain_tx(Instant::now());
-        }
-        self.sync_tx_flags();
-    }
-
-    /// The holding register is empty once the shift register has taken its
-    /// byte, and the transmitter once nothing is held at all.
-    fn sync_tx_flags(&mut self) {
-        if self.held.len() <= 1 {
-            self.lsr |= LSR_THRE;
-            self.thr_ipending = true;
-        }
-        if self.held.is_empty() {
-            self.lsr |= LSR_TEMT;
-        }
-        self.update_irq();
-    }
-
-    /// Hand held bytes to the backend in order. One it refuses stays, and
-    /// the transmitter stays busy, until it takes it or the retry time is
-    /// out. Past that the backend counts as disconnected and the byte goes
-    /// to its `send_byte`, which drops it where the host end is full (a log
-    /// tee still records it); further bytes are tried once and go the same
-    /// way if refused. Every byte counts as sent in the output tail.
-    fn drain_tx(&mut self, now: Instant) {
-        while let Some(&b) = self.held.front() {
-            if self.backend.try_send_byte(b) {
-                self.backend_dead = false;
-            } else {
-                if !self.backend_dead {
-                    let since = *self.held_since.get_or_insert(now);
-                    if now.saturating_duration_since(since) < XMIT_RETRY_TIMEOUT {
-                        return;
-                    }
-                    self.backend_dead = true;
-                }
-                self.backend.send_byte(b);
-            }
             if self.out.len() == OUT_KEEP {
                 self.out.pop_front();
             }
-            self.out.push_back(b);
+            self.out.push_back(val);
             self.sent += 1;
-            self.held.pop_front();
-            self.held_since = None;
+            self.backend.send_byte(val);
+            self.unflushed = true;
         }
-    }
-
-    /// Retry held bytes at `now`. Returns whether any went, which is when a
-    /// DMA engine waiting on the transmitter may go on.
-    pub fn poll_tx(&mut self, now: Instant) -> bool {
-        let before = self.held.len();
-        if before == 0 {
-            return false;
-        }
-        self.drain_tx(now);
-        self.sync_tx_flags();
-        self.held.len() < before
-    }
-
-    /// When a refused byte stops being retried, if one is held.
-    pub fn tx_deadline(&self) -> Option<Instant> {
-        self.held_since.map(|t| t + XMIT_RETRY_TIMEOUT)
-    }
-
-    /// The port can take a byte from a DMA engine: the holding register is
-    /// empty, or with the FIFOs on the transmit FIFO is not full.
-    pub fn tx_ready(&self) -> bool {
-        if self.fcr & FCR_FE != 0 {
-            self.held.len() <= FIFO_LENGTH
-        } else {
-            self.lsr & LSR_THRE != 0
-        }
+        self.lsr |= LSR_THRE | LSR_TEMT;
+        self.thr_ipending = true;
+        self.update_irq();
     }
 
     // ----- receive -----
@@ -640,9 +558,9 @@ impl Ns16550 {
             let ret = self.recv_fifo.pop_front().unwrap_or(0);
             if self.recv_fifo.is_empty() {
                 self.lsr &= !(LSR_DR | LSR_BI);
-                self.timeout_deadline = None;
+                self.timeout_at = None;
             } else {
-                self.timeout_deadline = Some(Instant::now() + self.char_transmit_time * 4);
+                self.timeout_at = Some(self.timeout_from_now());
             }
             self.timeout_ipending = false;
             ret
@@ -691,7 +609,7 @@ impl Ns16550 {
                 }
             }
             self.lsr |= LSR_DR;
-            self.timeout_deadline = Some(Instant::now() + self.char_transmit_time * 4);
+            self.timeout_at = Some(self.timeout_from_now());
         } else {
             if self.lsr & LSR_DR != 0 {
                 // The register keeps the character it has.
@@ -704,11 +622,13 @@ impl Ns16550 {
         self.update_irq();
     }
 
-    /// Take what the host has typed, as far as the port will accept it.
-    /// Returns whether anything arrived. Called by the shell's service loop
-    /// and on status and data reads, so a driver polling for data sees it at
-    /// once.
+    /// Write out what the host end has queued and take what it has typed; whether anything
+    /// arrived. The service loop and status and data reads call it.
     pub fn pump(&mut self) -> bool {
+        if self.unflushed {
+            self.backend.flush();
+            self.unflushed = self.backend.queued();
+        }
         if self.loopback() {
             // Loopback disconnects the serial input: what arrives on the
             // line goes nowhere and only the looped-back characters reach
@@ -750,26 +670,26 @@ impl Ns16550 {
         moved
     }
 
-    /// Resolve the receive timeout at `now`: characters left unread for four
-    /// character times raise the timeout cause. Returns whether it did.
-    pub fn check_timeout(&mut self, now: Instant) -> bool {
-        match self.timeout_deadline {
-            Some(d) if d <= now => {
-                self.timeout_deadline = None;
-                if !self.recv_fifo.is_empty() {
-                    self.timeout_ipending = true;
-                    self.update_irq();
-                    return true;
-                }
-                false
+    fn timeout_from_now(&self) -> u64 {
+        self.clock.now() + self.char_transmit_time.as_nanos() as u64 * 4
+    }
+
+    /// When the receive timeout is due, in machine ns, for the owner's timer.
+    pub fn timeout_due(&self) -> Option<u64> {
+        self.timeout_at
+    }
+
+    /// Raise the timeout cause if characters sat unread for four character times; whether it did.
+    pub fn check_timeout(&mut self) -> bool {
+        match self.timeout_at {
+            Some(d) if d <= self.clock.now() => {
+                self.timeout_at = None;
+                self.timeout_ipending = !self.recv_fifo.is_empty();
+                self.update_irq();
+                self.timeout_ipending
             }
             _ => false,
         }
-    }
-
-    #[cfg(test)]
-    fn timeout_deadline(&self) -> Option<Instant> {
-        self.timeout_deadline
     }
 
     // ----- hooks for a DMA engine in front of the port -----
@@ -853,8 +773,7 @@ impl Ns16550 {
         };
         self.update_parameters();
         // The timeout restarts from the load.
-        self.timeout_deadline = (!self.recv_fifo.is_empty() && !self.timeout_ipending)
-            .then(|| Instant::now() + self.char_transmit_time * 4);
+        self.timeout_at = (!self.recv_fifo.is_empty() && !self.timeout_ipending).then(|| self.timeout_from_now());
         self.update_irq();
     }
 }
@@ -883,6 +802,7 @@ mod tests {
     fn uart() -> (Ns16550, Arc<Wire>) {
         let w = Arc::new(Wire::default());
         let mut u = Ns16550::new(115200);
+        u.set_clock(Clock::stepped());
         u.set_backend(w.clone());
         (u, w)
     }
@@ -1033,22 +953,28 @@ mod tests {
         assert_eq!(u.read(IIR_FCR), IIR_NONE);
     }
 
+    /// PC16550D p. 17, Table IV: characters below the trigger level and no
+    /// FIFO access for four character times raise the timeout cause, which
+    /// the owner's timer resolves with no register read.
     #[test]
-    fn the_timeout_restarts_after_a_partial_read_and_a_flush_clears_it() {
+    fn the_timeout_comes_four_character_times_after_the_last_access() {
         let (mut u, _) = uart();
         u.write(IER, IER_RX);
         u.write(IIR_FCR, 0xc1);
         u.receive(&[1, 2]);
-        let first = u.timeout_deadline().expect("armed");
-        assert!(!u.check_timeout(first - Duration::from_micros(1)));
-        assert_eq!(u.read(THR), 1);
-        let second = u.timeout_deadline().expect("a partial read starts it again");
-        assert!(second >= first);
-        assert!(u.check_timeout(second));
+        let four = u.char_transmit_time.as_nanos() as u64 * 4;
+        assert_eq!(u.timeout_due(), Some(four));
+        u.clock.step(four - 1);
+        assert!(!u.check_timeout() && !u.irq(), "two characters are below the trigger level");
+        u.clock.step(1);
+        assert!(u.check_timeout());
         assert_eq!(u.iir & 0x0f, IIR_CTI);
+        assert_eq!(u.read(THR), 1);
+        assert_eq!((u.irq(), u.timeout_due()), (false, Some(2 * four)), "a partial read starts it again");
         u.write(IIR_FCR, 0xc7);
-        assert_eq!((u.irq(), u.timeout_deadline()), (false, None), "a flush clears it");
-        assert_eq!(u.read(IIR_FCR) & 0x0f, IIR_NONE);
+        assert_eq!((u.irq(), u.timeout_due()), (false, None), "a flush clears it");
+        u.clock.step(4 * four);
+        assert!(!u.check_timeout());
         u.write(IER, IER_TX);
         u.write(IIR_FCR, 0xc7);
         assert_eq!(u.iir & 0x0f, IIR_TX_EMPTY, "resetting the transmit FIFO raises the empty cause");
@@ -1065,119 +991,5 @@ mod tests {
         assert_eq!(w.out.lock().unwrap().len(), OUT_KEEP + 6, "every byte reached the backend");
         assert_eq!((u.bytes_out(), u.output_tail(usize::MAX).len()), (OUT_KEEP as u64 + 6, OUT_KEEP));
         assert!(u.output_tail(2).ends_with("z!"));
-    }
-
-    /// A backend that takes bytes only while its gate is open. Its plain
-    /// `send_byte` drops a byte while shut, as a full socket's does, and
-    /// keeps a note of it, as a log tee in front of it would.
-    #[derive(Default)]
-    struct Gated {
-        open: std::sync::atomic::AtomicBool,
-        out: Mutex<Vec<u8>>,
-        dropped: Mutex<Vec<u8>>,
-    }
-
-    impl SerialBackend for Gated {
-        fn send_byte(&self, b: u8) {
-            if !self.try_send_byte(b) {
-                self.dropped.lock().unwrap().push(b);
-            }
-        }
-        fn try_send_byte(&self, b: u8) -> bool {
-            let open = self.open.load(std::sync::atomic::Ordering::SeqCst);
-            if open {
-                self.out.lock().unwrap().push(b);
-            }
-            open
-        }
-        fn recv_byte(&self) -> io::Result<u8> {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "empty"))
-        }
-    }
-
-    fn gated() -> (Ns16550, Arc<Gated>) {
-        let g = Arc::new(Gated::default());
-        let mut u = Ns16550::new(115200);
-        u.set_backend(g.clone());
-        (u, g)
-    }
-
-    fn open(g: &Gated, yes: bool) {
-        g.open.store(yes, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Ports the held-byte case of QEMU's serial transmit retry: a byte the
-    /// backend refuses keeps the transmitter busy and goes out, in order,
-    /// once the backend takes it.
-    #[test]
-    fn a_refused_byte_is_held_and_sent_in_order_when_the_backend_opens() {
-        let (mut u, g) = gated();
-        u.write(IER, 0x02);
-        u.read(IIR_FCR);
-        u.write(THR, b'a');
-        assert_eq!(u.read(LSR) & 0x60, 0x20, "the shift register is stuck, the holding register is free");
-        assert!(u.tx_ready());
-        u.write(THR, b'b');
-        assert_eq!(u.read(LSR) & 0x60, 0, "busy");
-        assert!(!u.tx_ready());
-        assert!(u.tx_deadline().is_some());
-        assert!(!u.poll_tx(Instant::now()), "still refused");
-        open(&g, true);
-        assert!(u.poll_tx(Instant::now()));
-        assert_eq!(*g.out.lock().unwrap(), b"ab");
-        assert_eq!(u.read(LSR) & 0x60, 0x60);
-        assert!(u.tx_ready() && u.irq());
-        assert_eq!((u.bytes_out(), u.tx_deadline()), (2, None));
-    }
-
-    /// The hold is bounded: past two seconds the byte goes to the plain send,
-    /// which drops it, and the backend counts as disconnected, so later bytes
-    /// complete at once until it takes one again. The output tail keeps
-    /// every byte the guest sent.
-    #[test]
-    fn a_hold_gives_up_after_two_seconds_and_the_backend_counts_as_gone() {
-        let (mut u, g) = gated();
-        let t0 = Instant::now();
-        u.write(THR, b'x');
-        assert!(!u.poll_tx(t0 + Duration::from_millis(1999)));
-        assert!(u.poll_tx(t0 + Duration::from_secs(3)), "given up on");
-        assert!(g.out.lock().unwrap().is_empty());
-        assert_eq!(*g.dropped.lock().unwrap(), b"x", "handed to the plain send");
-        u.write(THR, b'y');
-        assert_eq!(u.read(LSR) & 0x60, 0x60, "a dead backend completes without waiting");
-        assert_eq!(*g.dropped.lock().unwrap(), b"xy");
-        open(&g, true);
-        u.write(THR, b'z');
-        assert_eq!(*g.out.lock().unwrap(), b"z");
-        assert_eq!(u.output_tail(usize::MAX), "xyz");
-        open(&g, false);
-        u.write(THR, b'w');
-        assert_eq!(u.read(LSR) & 0x40, 0, "it took a byte, so the next is worth waiting for");
-    }
-
-    /// Without the FIFOs the shift register and the holding register take two
-    /// bytes, and a third overwrites the holding register. A transmit overrun
-    /// with the FIFOs on drops the oldest byte behind the shift register.
-    #[test]
-    fn held_bytes_overrun_as_the_part_does() {
-        let (mut u, g) = gated();
-        for b in [1, 2, 3] {
-            u.write(THR, b);
-        }
-        open(&g, true);
-        assert!(u.poll_tx(Instant::now()));
-        assert_eq!(*g.out.lock().unwrap(), [1, 3], "the third write replaced the second");
-        g.out.lock().unwrap().clear();
-        open(&g, false);
-        u.write(IIR_FCR, 1);
-        for b in 0..FIFO_LENGTH as u8 + 3 {
-            u.write(THR, b);
-        }
-        assert!(!u.tx_ready());
-        open(&g, true);
-        assert!(u.poll_tx(Instant::now()));
-        let mut want = vec![0];
-        want.extend(3..FIFO_LENGTH as u8 + 3);
-        assert_eq!(*g.out.lock().unwrap(), want, "the byte in the shift register survives");
     }
 }

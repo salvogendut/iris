@@ -196,7 +196,7 @@ fn build_baseio(
     // widget 15 and E as 14 is inferred from the port letters; head E's bus is empty.
     let pci = xbridge.bus(HEAD_F);
     // The on-board Fibre Channel adapter, with the disks of `[fibre_channel]`.
-    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
+    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci, timers)?;
     card.attach(pci, 1);
     // The slot runs 64-bit data phases, inferred from the PROM: its rings are right only if the
     // bridge reverses each adapter DMA doubleword as it does on such a slot.
@@ -206,6 +206,7 @@ fn build_baseio(
     fibre.set_heartbeat(heartbeat.clone());
     let section = cfg.ip35_section();
     let (ioc3, serial) = attach_ioc3(
+        timers,
         cfg,
         pci,
         &IO7,
@@ -218,7 +219,7 @@ fn build_baseio(
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("the IO7's IOC3 has Ethernet").clone();
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
-    let usb = attach_usb(pci, &ioc3, clock, !cfg.headless)?;
+    let usb = attach_usb(pci, &ioc3, timers, !cfg.headless)?;
     let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
     xbridge.set_reset_output(Arc::new(move |port| {
         if port == HEAD_F {
@@ -234,7 +235,6 @@ fn build_baseio(
     connect_serial_ports(cfg, cfg.machine.profile.product_name().unwrap_or_default(), &serial, console_index)?;
     let console = cfg.ci.then(|| serial[console_index].ci.clone());
     let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
-    let poll_usb = usb.clone();
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
     let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone()];
     let scsi_fibre = fibre.clone();
@@ -247,7 +247,6 @@ fn build_baseio(
             reset_usb.power_on();
             reset_clock.power_on();
         }),
-        poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,
         monitor,
         ps2: ioc3.ps2(),

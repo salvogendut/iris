@@ -85,7 +85,7 @@ mod frontend_tests {
                 log: None, socket: None, connect: Box::new(move |backend| *output.lock() = Some(backend)) }];
             connect_serial_ports(&cfg, "test", &ports, 0).unwrap();
             let backend = installed.lock().clone().unwrap();
-            assert!(backend.try_send_byte(b'x'));
+            backend.send_byte(b'x');
             assert_eq!(host.drain_guest(), b"x");
             assert_eq!(ci.drain_guest(), b"x");
             host.push_host(b"h");
