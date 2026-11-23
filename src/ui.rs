@@ -12,7 +12,8 @@ use glow::HasContext;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::ng1::rex3::Renderer;
 use crate::gfx_display::GfxDisplay;
-use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats, STATUS_BAR_HEIGHT};
+use crate::disp::Rex3Screen;
+use crate::status::{STATUS_BAR_HEIGHT, STRIP_STRIDE};
 use crate::compositor::{Compositor, SwCompositor};
 use crate::gl_compositor::GlCompositor;
 use crate::debug_overlay::DebugOverlay;
@@ -47,6 +48,29 @@ struct GlState {
     vao:        glow::VertexArray,
     main_vbo:   glow::Buffer,
     status_vbo: glow::Buffer,
+    /// The status bar's texture, made on first use.
+    bar_tex:    Option<glow::Texture>,
+}
+
+/// Upload a drawn status bar strip (`crate::status::StatusBar`) to `tex`,
+/// making it on first use, and return it.
+unsafe fn upload_bar(gl: &glow::Context, tex: &mut Option<glow::Texture>, bar: &[u32], width: usize) -> glow::Texture {
+    let t = *tex.get_or_insert_with(|| {
+        let t = gl.create_texture().unwrap();
+        gl.bind_texture(glow::TEXTURE_2D, Some(t));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
+            STRIP_STRIDE as i32, STATUS_BAR_HEIGHT as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+        t
+    });
+    gl.bind_texture(glow::TEXTURE_2D, Some(t));
+    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, STRIP_STRIDE as i32);
+    let bytes = std::slice::from_raw_parts(bar.as_ptr() as *const u8, bar.len() * 4);
+    gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, width.min(STRIP_STRIDE) as i32, STATUS_BAR_HEIGHT as i32,
+        glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(bytes)));
+    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+    t
 }
 
 // Pending window-resize request, applied by the event-loop thread only.
@@ -383,6 +407,7 @@ impl GlRenderer {
             vao,
             main_vbo,
             status_vbo,
+            bar_tex: None,
         });
         true
     }
@@ -532,9 +557,7 @@ impl Renderer for GlRenderer {
         &mut self,
         screen:        &mut Rex3Screen,
         overlay:       &mut DebugOverlay,
-        status:        &mut StatusBar,
-        sbtex:         &mut StatusBarTexture,
-        stats:         &BarStats,
+        bar: &[u32],
         need_readback: bool,
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
@@ -721,7 +744,7 @@ impl Renderer for GlRenderer {
 
             // ── Pass 3: status bar ───────────────────────────────────────────
             gl.scissor(0, 0, win_w_i, win_h_i);
-            let sb_tex = sbtex.render_and_upload(status, stats, width, gl);
+            let sb_tex = upload_bar(gl, &mut state.bar_tex, bar, width);
             Self::draw_tex_fallback(gl, state, state.status_vbo, sb_tex, win_w_f, win_h_f,
                 minify, minify);
 
@@ -748,6 +771,9 @@ impl Renderer for GlRenderer {
     fn stop(&mut self) {
         if let Some(state) = self.state.take() {
             self.compositor.destroy(&state.gl);
+            if let Some(t) = state.bar_tex {
+                unsafe { state.gl.delete_texture(t); }
+            }
             // Hand the context back to `not_current_context` so the next
             // `ensure_init()` call (on whatever thread REX3's next
             // start() respawns) sees a genuine "first call ever since the
@@ -788,7 +814,6 @@ impl Renderer for GlRenderer {
     }
 
     #[cfg(feature = "wgpu")]
-    fn takes_resident_readback_frames(&self) -> bool { true }
 
     // Called from the monitor/CI socket thread — NOT the context-owning refresh
     // thread — so it must not touch GL. Record the request; `present()` applies
@@ -850,9 +875,7 @@ impl Renderer for WgpuRenderer {
         &mut self,
         screen:        &mut Rex3Screen,
         overlay:       &mut DebugOverlay,
-        status:        &mut StatusBar,
-        sbtex:         &mut StatusBarTexture,
-        stats:         &BarStats,
+        bar: &[u32],
         need_readback: bool,
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
@@ -893,7 +916,7 @@ impl Renderer for WgpuRenderer {
                             }
                         }
                         let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
-                        let sb = sbtex.render_pixels(status, stats, width);
+                        let sb = bar;
                         let frame = crate::wgpu::Frame::Gpu { buffer: &buffer, width: width as u32, height: height as u32 };
                         let r = self.presenter.present(frame, ov, sb, crate::disp::FB_STRIDE);
                         self.report(r);
@@ -909,7 +932,7 @@ impl Renderer for WgpuRenderer {
             self.compositor.compose_pixels(&src);
         }
         let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
-        let sb = sbtex.render_pixels(status, stats, width);
+        let sb = bar;
         // A prebuilt frame is in `fb_rgb`, as the GL renderer takes it;
         // `rgba` may lag it until something asks for a frame.
         let rgba: &[u32] = if prebuilt { &screen.fb_rgb } else { self.compositor.pixels() };
@@ -944,7 +967,6 @@ impl Renderer for WgpuRenderer {
         self.board_device
     }
 
-    fn takes_resident_readback_frames(&self) -> bool { true }
 
     fn present_gpu_frame(
         &mut self,
@@ -953,9 +975,7 @@ impl Renderer for WgpuRenderer {
         height:  u32,
         screen:  &mut Rex3Screen,
         overlay: &mut DebugOverlay,
-        status:  &mut StatusBar,
-        sbtex:   &mut StatusBarTexture,
-        stats:   &BarStats,
+        bar: &[u32],
     ) {
         if width == 0 || height == 0 {
             return;
@@ -965,42 +985,9 @@ impl Renderer for WgpuRenderer {
         }
         *self.display_res.lock() = (width, height);
         let ov = if overlay.active() { Some(overlay.render_pixels(&screen.overlay_source())) } else { None };
-        let sb = sbtex.render_pixels(status, stats, width as usize);
+        let sb = bar;
         let r = self.presenter.present(crate::wgpu::Frame::Gpu { buffer: frame, width, height }, ov, sb, crate::disp::FB_STRIDE);
         self.report(r);
-    }
-
-    fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> {
-        Some(self.presenter.gpu())
-    }
-
-    fn present_resident_gpu_frame(
-        &mut self,
-        frame: &wgpu::Buffer,
-        width: u32,
-        height: u32,
-        _screen: &mut Rex3Screen,
-        overlay: &mut DebugOverlay,
-        status: &mut StatusBar,
-        sbtex: &mut StatusBarTexture,
-        stats: &BarStats,
-    ) -> Result<(), String> {
-        // The debug overlay's pixel inspector expects CPU plane snapshots,
-        // which are intentionally stale in resident mode.
-        if overlay.active() {
-            return Err("resident debug overlays require a raw-plane observation".into());
-        }
-        if let Some((w, h)) = self.window_size.lock().take() {
-            self.presenter.resize(w, h);
-        }
-        *self.display_res.lock() = (width, height);
-        let sb = sbtex.render_pixels(status, stats, width as usize);
-        self.presenter.present(
-            crate::wgpu::Frame::Gpu { buffer: frame, width, height },
-            None,
-            sb,
-            crate::disp::FB_STRIDE,
-        )
     }
 
     #[cfg(test)]

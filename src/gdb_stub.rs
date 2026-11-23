@@ -800,6 +800,7 @@ pub struct GdbServer {
     stop: Arc<AtomicBool>,
     client: Arc<Mutex<Option<TcpStream>>>,
     thread: Option<thread::JoinHandle<()>>,
+    _port: crate::ports::PortGuard,
 }
 
 impl GdbServer {
@@ -842,7 +843,8 @@ impl GdbServer {
             }
         })?;
         eprintln!("GDB stub: listening on {addr}");
-        Ok(Self { addr, stop, client, thread: Some(thread) })
+        let port = crate::ports::register("tcp", addr, "GDB stub");
+        Ok(Self { addr, stop, client, thread: Some(thread), _port: port })
     }
     pub fn addr(&self) -> SocketAddr { self.addr }
 }

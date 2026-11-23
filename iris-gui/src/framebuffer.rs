@@ -47,7 +47,7 @@
 
 use iris::compositor::{Compositor, SwCompositor};
 use iris::debug_overlay::DebugOverlay;
-use iris::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture, FB_STRIDE};
+use iris::disp::{Rex3Screen, FB_STRIDE};
 use iris::gl_compositor::GlCompositor;
 use iris::headless_gl::HeadlessGl;
 use iris::dev::ng1::rex3::Renderer;
@@ -219,9 +219,7 @@ impl Renderer for CaptureRenderer {
         &mut self,
         screen:         &mut Rex3Screen,
         _overlay:       &mut DebugOverlay,
-        _status:        &mut StatusBar,
-        _sbtex:         &mut StatusBarTexture,
-        _stats:         &BarStats,
+        _bar: &[u32],
         need_readback:  bool,
         live_fb_rgb:    Option<&[u32]>,
         live_fb_aux:    Option<&[u32]>,
@@ -270,9 +268,6 @@ impl Renderer for CaptureRenderer {
     }
 
     fn resize(&mut self, _width: usize, _height: usize) {}
-
-    #[cfg(feature = "wgpu")]
-    fn takes_resident_readback_frames(&self) -> bool { true }
 }
 
 /// GPU compositor path: `GlCompositor` on a hidden GL context (REX3-Refresh thread).
@@ -305,9 +300,7 @@ impl Renderer for GlCaptureRenderer {
         &mut self,
         screen:         &mut Rex3Screen,
         _overlay:       &mut DebugOverlay,
-        _status:        &mut StatusBar,
-        _sbtex:         &mut StatusBarTexture,
-        _stats:         &BarStats,
+        _bar: &[u32],
         need_readback:  bool,
         live_fb_rgb:    Option<&[u32]>,
         live_fb_aux:    Option<&[u32]>,
@@ -359,9 +352,6 @@ impl Renderer for GlCaptureRenderer {
     }
 
     fn resize(&mut self, _width: usize, _height: usize) {}
-
-    #[cfg(feature = "wgpu")]
-    fn takes_resident_readback_frames(&self) -> bool { true }
 }
 
 impl Drop for GlCaptureRenderer {
@@ -496,7 +486,7 @@ impl RowDamage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iris::disp::{FB_MAX_H, MORE_CPUS};
+    use iris::disp::FB_MAX_H;
 
     /// `screen.rgba` words are `0xAABBGGRR`, so R sits in the low byte — the
     /// opposite of the `0x00RRGGBB` a reader might expect.
@@ -529,50 +519,23 @@ mod tests {
         }
     }
 
-    fn bar_stats() -> BarStats {
-        BarStats {
-            now:            std::time::Instant::now(),
-            cycles:         0,
-            fasttick:       0,
-            more_cpus:      [None; MORE_CPUS],
-            decoded_delta:  0,
-            l1i_hits:       0,
-            l1i_fetches:    0,
-            uncached:       0,
-            hb:             0,
-            count_hz:       0,
-            gfifo_pending:  0,
-        }
-    }
-
-    /// `present` ignores the overlay, status bar and stats, but it wants them.
+    /// `present` ignores the overlay and status bar, but it wants them.
     struct Dummies {
         overlay: DebugOverlay,
-        status:  StatusBar,
-        sbtex:   StatusBarTexture,
-        stats:   BarStats,
+        bar:     Vec<u32>,
     }
 
     impl Dummies {
         fn new() -> Self {
             Self {
                 overlay: DebugOverlay::new(),
-                status:  StatusBar::new(),
-                sbtex:   StatusBarTexture::new(),
-                stats:   bar_stats(),
+                bar:     vec![0; iris::status::STRIP_STRIDE * iris::status::STATUS_BAR_HEIGHT],
             }
         }
     }
 
     fn present(r: &mut CaptureRenderer, screen: &mut Rex3Screen, d: &mut Dummies) {
-        r.present(screen, &mut d.overlay, &mut d.status, &mut d.sbtex, &d.stats, false, None, None);
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn capture_renderer_accepts_resident_readback_frames() {
-        let renderer = CaptureRenderer::new(FrameSink::new());
-        assert!(renderer.takes_resident_readback_frames());
+        r.present(screen, &mut d.overlay, &d.bar, false, None, None);
     }
 
     /// Copy `w`×`h` of a strided picture, as the GUI's texture would end up

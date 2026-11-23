@@ -50,7 +50,7 @@ fn make_rex3_unstarted() -> TestBoard<Rex3> {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
-            let rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             unsafe {
                 (*rex.fb_rgb.get()).fill(0);
                 (*rex.fb_aux.get()).fill(0);
@@ -95,7 +95,7 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 #[test]
 fn power_on_reset_fits_default_service_thread_stack() {
-    let rex = with_big_stack(|| Arc::new(Rex3::new(crate::disp::StatusSource::detached())));
+    let rex = with_big_stack(|| Arc::new(Rex3::new(crate::status::MachineStatus::detached())));
     std::thread::spawn(move || rex.power_on())
         .join()
         .expect("REX3 reset overflowed the service thread stack");
@@ -168,7 +168,7 @@ mod resident_gate_tests {
     #[test]
     fn resident_attachment_requires_a_quiescent_exclusive_board() {
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
 
             rex.running.store(true, Ordering::Release);
@@ -228,7 +228,7 @@ mod resident_gate_tests {
         assert!(RasterModeKind::Resident.ensure_available(RasterModeKind::LegacyReplay).is_err());
 
         with_big_stack(|| {
-            let rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let error = rex.enable_gpu_replay_using(|| Err("adapter unavailable".into())).err().unwrap();
             assert_eq!(error, "adapter unavailable");
             assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
@@ -240,7 +240,7 @@ mod resident_gate_tests {
     #[ignore = "requires a conformant host GPU"]
     fn gpu_replay_refuses_resident_attachment() {
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
             rex.enable_gpu_replay(&backend).expect("initialize legacy GPU replay");
             assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
@@ -353,7 +353,7 @@ mod resident_gate_tests {
     #[test]
     fn resident_go_dispatches_without_cpu_raster() {
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             set_up_draw(&rex);
             let index = 20 * 2048 + 10;
             let before_rgb = unsafe { (*rex.fb_rgb.get())[index] };
@@ -374,7 +374,7 @@ mod resident_gate_tests {
     #[test]
     fn resident_gate_rejects_unsupported_observers_and_invalid_restores() {
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let before = unsafe { (*rex.fb_rgb.get())[0] };
             unsafe { (*rex.context.get()).colorred = 0x1234; }
             rex.attach_resident_raster(probe(Ok(())).0).unwrap();
@@ -413,7 +413,7 @@ mod resident_gate_tests {
                 ResidentError::Unsupported("test opcode"),
                 ResidentError::Failed("test device loss".into()),
             ] {
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 set_up_draw(&rex);
                 let index = 20 * 2048 + 10;
                 let before_rgb = unsafe { (*rex.fb_rgb.get())[index] };
@@ -466,7 +466,7 @@ mod resident_gate_tests {
 
         with_big_stack(|| {
             for submit_error in [None, Some(ResidentError::Failed("test submission".into()))] {
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 set_up_draw(&rex);
                 let calls = Arc::new(AtomicUsize::new(0));
                 let submits = Arc::new(AtomicUsize::new(0));
@@ -499,7 +499,7 @@ mod resident_gate_tests {
         }
 
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             set_up_draw(&rex);
             rex.attach_resident_raster(PanicBackend).unwrap();
             rex.start();
@@ -527,7 +527,7 @@ mod resident_gate_tests {
     fn resident_status_reports_the_first_fault_to_machine_control_once() {
         with_big_stack(|| {
             let lost = Arc::new(AtomicUsize::new(1));
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let (sender, receiver) = std::sync::mpsc::channel();
             rex.set_fatal_sender(sender);
             rex.attach_resident_raster(LossProbe(lost)).unwrap();
@@ -545,7 +545,7 @@ mod resident_gate_tests {
     #[test]
     fn resident_successful_reset_rearms_fault_notification() {
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let (sender, receiver) = std::sync::mpsc::channel();
             rex.set_fatal_sender(sender);
             rex.attach_resident_raster(LossProbe(Arc::new(AtomicUsize::new(0)))).unwrap();
@@ -566,7 +566,7 @@ mod resident_gate_tests {
     fn resident_idle_device_loss_wakes_machine_control_once() {
         with_big_stack(|| {
             let lost = Arc::new(AtomicUsize::new(0));
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let (sender, receiver) = std::sync::mpsc::channel();
             rex.set_fatal_sender(sender);
             rex.attach_resident_raster(LossProbe(Arc::clone(&lost))).unwrap();
@@ -674,7 +674,7 @@ mod resident_gate_tests {
                     "resident gate requires a hardware adapter: {}", gpu.caps);
                 eprintln!("resident device-loss {stage}: {}", gpu.caps);
 
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 rex.fb_rgb.get_mut().isolate().unwrap();
                 rex.fb_aux.get_mut().isolate().unwrap();
                 let (sender, receiver) = std::sync::mpsc::channel();
@@ -751,7 +751,7 @@ mod resident_gate_tests {
         }
 
         with_big_stack(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.attach_resident_raster(ResetBackend).unwrap();
             rex.start();
             while rex.resident_unparker.lock().is_none() {
@@ -800,7 +800,7 @@ fn test_hostr_board_ports_and_batch_retirement() {
         const LATCH: u64 = 0xa1b2_c3d4_e5f6_0718;
         const FIRST: u64 = 0x1122_3344_5566_7701;
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+        let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
         let ctx = rex.context.get_mut();
         // The probe supplies synthetic port words; the unused address mode
         // prevents the resident READ walker from replacing them.
@@ -932,7 +932,7 @@ fn test_hostr_board_failures_are_sticky() {
         for first in ["scalar DMA", "bulk DMA", "PIO"] {
             let observations = Arc::new(AtomicUsize::new(0));
             let enqueues = Arc::new(AtomicUsize::new(0));
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             let ctx = rex.context.get_mut();
             ctx.drawmode0 = DrawMode0(DM0_READ_BLOCK);
             ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
@@ -986,7 +986,7 @@ fn test_hostr_board_failures_are_sticky() {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+        let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
         let ctx = rex.context.get_mut();
         ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_READ | (7 << DRAWMODE0_ADRMODE_SHIFT));
         ctx.drawmode1 = DrawMode1(DRAWMODE1_PLANES_NONE);
@@ -4284,7 +4284,7 @@ mod jit_tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);
@@ -5890,6 +5890,58 @@ mod jit_tests {
                 reg(rex, REX3_SLOPEBLUE, 0);
                 reg(rex, REX3_XYENDI,   xy(14, 4));
                 reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shaded colour-index spans at 12bpp, as IRIS GL draws lit CI surfaces
+    /// (SideFX PRISMS "smooth"/"facet", issue #798): the index is the red
+    /// DDA's integer part. The JIT used to pack clamped R/G/B bytes instead,
+    /// so the green and blue registers (left holding floats by the client)
+    /// leaked into the index and the surface drew as stripes. DRAWMODE1 is
+    /// the guest's: 12bpp CI with DITHER, single and double buffered.
+    #[test]
+    fn jit_span_shade_ci12() {
+        for dm1 in [0x3009_7011u32, 0x3009_7031] {
+            let dm0 = DM0_DRAW_SPAN | (1 << 18) | (1 << 12); // SHADE, ENZPAT
+            compare_jit_interp(0, 0, 40, 0,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,    0xFFF);
+                    // 12bpp CI takes COLORRED as o12.9: index 0x950 + 0.5.
+                    reg(rex, REX3_COLORRED,  0x46d2_a100);
+                    reg(rex, REX3_COLORGRN,  0x3f72_3ede);
+                    reg(rex, REX3_COLORBLUE, 0x3f72_3ede);
+                    reg(rex, REX3_SLOPERED,  3 << 9);
+                    reg(rex, REX3_SLOPEGRN,  0x4580_0018);
+                    reg(rex, REX3_SLOPEBLUE, 0x4580_0018);
+                    reg(rex, REX3_ZPATTERN,  0xFFFF_FBFF);
+                    reg(rex, REX3_XYENDI,    xy(40, 0));
+                    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+                },
+                dm0, dm1,
+            );
+        }
+    }
+
+    /// The line shader's copy of the same colour selection.
+    #[test]
+    fn jit_iline_shade_ci12() {
+        let dm1 = 0x3009_7011u32;
+        let dm0 = DM0_DRAW_ILINE | (1 << 18);
+        compare_jit_interp(0, 0, 16, 6,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFF);
+                reg(rex, REX3_COLORRED,  0x46d1_e000);
+                reg(rex, REX3_COLORGRN,  0x3f50_bf9e);
+                reg(rex, REX3_COLORBLUE, 0x3f50_bf9e);
+                reg(rex, REX3_SLOPERED,  5 << 9);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(14, 4));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
             },
             dm0, dm1,
         );

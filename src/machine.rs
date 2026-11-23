@@ -482,11 +482,11 @@ impl Machine {
         // (CPU cycle counter is no longer among these: it lives inline on
         // MipsCore.hot.cycles now, wired into devices via set_cpu_cycles
         // after the executor/CPU exist — see Hot::cycles's doc comment.)
-        let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see Rex3::HB_*
+        let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see crate::status::hb
         let fasttick_count = Arc::new(AtomicU64::new(0)); // CP0 Compare match counter
         // What every graphics board's status bar reads; the CPU feeds its
         // fetch counters and the cycle counter is wired in below.
-        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick_count.clone());
+        let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick_count.clone());
         let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
         let (fatal_tx, fatal_rx) = mpsc::channel::<MachineFatal>();
 
@@ -541,7 +541,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        ioc.set_clock_ticks(fasttick_count.clone());
+        ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
         // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
         // target on a controller (`ScsiDeviceConfig::placement`). The disks
         // recorded here, and the scratch volume's path for the CI socket,
@@ -1009,6 +1009,11 @@ impl Machine {
         // Must happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
         status.set_cpu_cycles(cpu.cycles_ptr());
+        // Which timer is the clock depends on the kernel: IRIX on the Indy
+        // takes it on CP0 Compare, on the Indigo2 and IP28 from the 8254.
+        // Both count into the CPU's tick counter; each publishes the rate it
+        // was programmed to, and the bar expects their sum.
+        cpu.publish_tick_rate(status.cpu(0).tick_rate());
         if let Some(td) = &board.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
             if board.testdev.is_none() {
@@ -1060,6 +1065,7 @@ impl Machine {
             crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
             monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
         }
+        monitor.register_device(status.clone());
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
             cpu.running_flag(),
             cpu.cycles_ptr(),
@@ -2641,7 +2647,8 @@ impl Workstation for Machine {
     }
     fn scratch_path(&self) -> Option<&std::path::Path> { Machine::scratch_path(self) }
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
-        Some(self.hpc3.scsi().clone())
+        let ctls = std::iter::once(self.hpc3.scsi()).chain(self.hpc3.scsi1());
+        Some(Arc::new(crate::workstation::DiscChangers(ctls.map(|c| c.clone() as _).collect())))
     }
     fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
     fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
@@ -3097,6 +3104,30 @@ mod stop_order_tests {
         machine.stop();
         assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
+    }
+
+    /// A CD-ROM on the Indigo2's second controller is `[scsi.20]`; disc
+    /// changes must reach it by that key.
+    #[test]
+    fn second_controller_cdrom_takes_disc_changes() {
+        use crate::config::{MachineProfile, ScsiDeviceConfig};
+        use crate::workstation::Workstation;
+        let dir = crate::display_stop_tests::scratch("indigo2-disc");
+        let nv = dir.to_path_buf();
+        let machine = big_stack(move || {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+            crate::test_temp::nvram_in(&mut cfg, &nv);
+            cfg.machine.profile = MachineProfile::Indigo2Ip22;
+            cfg.scsi.insert(20, ScsiDeviceConfig { cdrom: true, controller: 1, ..Default::default() });
+            Box::new(Machine::new(cfg))
+        });
+        let changer = Workstation::disc_changer(&*machine).expect("a disc changer");
+        assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [20]);
+        let iso = dir.join("a.iso");
+        std::fs::write(&iso, vec![0u8; 2048]).unwrap();
+        let path = iso.to_string_lossy().into_owned();
+        assert_eq!(changer.load_disc(20, path.clone()), Ok(path));
+        assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no id 4");
     }
 }
 

@@ -7,17 +7,18 @@ use std::sync::Arc;
 pub trait Renderer: Send {
     /// Composite and present one display frame.
     ///
-    /// The renderer owns its compositor, debug overlay, and status bar texture.
-    /// It drives the full pipeline: compose → overlay → status bar → swap.
+    /// The renderer owns its compositor and drives the full pipeline:
+    /// compose → overlay → status bar → swap. `bar` is the status bar,
+    /// already drawn by the display layer (`crate::status::StatusBar`):
+    /// `STATUS_BAR_HEIGHT` rows of `STRIP_STRIDE` 0xAABBGGRR pixels, the
+    /// display's width of them drawn. The renderer only shows it.
     /// When `need_readback` is true the renderer must populate `screen.rgba`
     /// with the composited pixels (for screenshots) before returning.
     fn present(
         &mut self,
         screen:        &mut crate::disp::Rex3Screen,
         overlay:       &mut crate::debug_overlay::DebugOverlay,
-        status:        &mut crate::disp::StatusBar,
-        sbtex:         &mut crate::disp::StatusBarTexture,
-        stats:         &crate::disp::BarStats,
+        bar:           &[u32],
         need_readback: bool,
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
@@ -50,38 +51,12 @@ pub trait Renderer: Send {
         _height:  u32,
         _screen:  &mut crate::disp::Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status:  &mut crate::disp::StatusBar,
-        _sbtex:   &mut crate::disp::StatusBarTexture,
-        _stats:   &crate::disp::BarStats,
+        _bar:     &[u32],
     ) {}
-
-    /// The resident path must verify the presenter's actual device,
-    /// rather than relying on a renderer's claim that it takes GPU frames.
-    #[cfg(feature = "wgpu")]
-    fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> { None }
-
-    #[cfg(feature = "wgpu")]
-    #[allow(clippy::too_many_arguments)]
-    fn present_resident_gpu_frame(
-        &mut self,
-        _frame: &wgpu::Buffer,
-        _width: u32,
-        _height: u32,
-        _screen: &mut Rex3Screen,
-        _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status: &mut crate::disp::StatusBar,
-        _sbtex: &mut crate::disp::StatusBarTexture,
-        _stats: &crate::disp::BarStats,
-    ) -> Result<(), String> {
-        Err("renderer does not support resident GPU frames".into())
-    }
 
     #[cfg(all(test, feature = "wgpu"))]
     fn resident_presented_frames(&self) -> Option<u64> { None }
 
     #[cfg(all(test, feature = "wgpu"))]
     fn resident_presented_texture(&self) -> Option<&wgpu::Texture> { None }
-
-    #[cfg(feature = "wgpu")]
-    fn takes_resident_readback_frames(&self) -> bool { false }
 }

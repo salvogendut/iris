@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 use crate::debug_overlay::DebugOverlay;
-use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, StatusSource, FB_STRIDE};
+use crate::disp::{Rex3Screen, FB_STRIDE};
+use crate::status::{MachineStatus, StatusBar};
 use crate::gfx_display::DisplayStop;
 
 mod marks;
@@ -260,6 +261,34 @@ struct Phase {
     epoch_ns: u64,
 }
 
+/// Requests counted in, and how many a frame has served.
+#[derive(Default)]
+struct Tickets {
+    requested: AtomicU64,
+    served: AtomicU64,
+}
+
+impl Tickets {
+    fn request(&self) {
+        self.requested.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn pending(&self) -> bool {
+        self.requested.load(Ordering::Acquire) != self.served.load(Ordering::Acquire)
+    }
+
+    /// The requests a frame beginning now serves.
+    fn taken(&self) -> u64 {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// A frame served the requests up to `ticket`; returns whether it
+    /// served any.
+    fn serve(&self, ticket: u64) -> bool {
+        self.served.swap(ticket, Ordering::AcqRel) != ticket
+    }
+}
+
 /// What the rest of the emulator holds of a head: the screen, the renderer
 /// slot, and the requests. The refresh thread serves all of them.
 pub struct HeadHandle {
@@ -269,7 +298,10 @@ pub struct HeadHandle {
     screen: Mutex<Rex3Screen>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     stop: DisplayStop,
-    status: Mutex<Arc<StatusSource>>,
+    status: Mutex<Arc<MachineStatus>>,
+    /// The status bar under this head's picture, drawn here for every
+    /// renderer (see [`with_status_bar`](Self::with_status_bar)).
+    bar: Mutex<StatusBar>,
     /// The timing the board asked for, and a count of the requests.
     timing: Mutex<(VideoTiming, u64)>,
     /// Lines the board wants [`Head::line`] called at.
@@ -281,8 +313,13 @@ pub struct HeadHandle {
     stopping: Mutex<bool>,
     stopped: Condvar,
     damage: AtomicBool,
-    screenshot: AtomicBool,
-    frame_request: AtomicBool,
+    /// Screenshot and frame requests, as tickets: a frame serves the ones
+    /// made before it began, so a request that comes while a frame is being
+    /// composed waits for the next.
+    screenshot: Tickets,
+    /// Whether a screenshot is also saved as a PNG file (tests turn it off).
+    screenshot_files: AtomicBool,
+    frame_request: Tickets,
     capture: AtomicU32,
     /// Retraces delivered, for tests and the monitor.
     retraces: AtomicU64,
@@ -303,8 +340,30 @@ impl HeadHandle {
 
     /// Show another machine's status in the bar. The handle stays with the
     /// refresh thread it was made on.
-    pub fn set_status(&self, status: Arc<StatusSource>) {
+    pub fn set_status(&self, status: Arc<MachineStatus>) {
         *self.status.lock() = status;
+    }
+
+    /// The machine status this head's bar shows.
+    pub fn status(&self) -> Arc<MachineStatus> {
+        self.status.lock().clone()
+    }
+
+    /// Draw the status bar for a frame `width` pixels wide and hand it to
+    /// `f`. Once per presented frame: it clears the activity lights. The
+    /// refresh thread calls it for every board; a board that presents
+    /// from its own thread (Newport on the GPU) calls it there.
+    pub fn with_status_bar<R>(&self, gfifo_pending: usize, width: usize, f: impl FnOnce(&[u32]) -> R) -> R {
+        f(self.status_bar(gfifo_pending, width).pixels())
+    }
+
+    /// As [`with_status_bar`](Self::with_status_bar), returning the drawn
+    /// bar held (its [`StatusBar::pixels`]).
+    pub fn status_bar(&self, gfifo_pending: usize, width: usize) -> parking_lot::MutexGuard<'_, StatusBar> {
+        let status = self.status();
+        let mut bar = self.bar.lock();
+        bar.render(&status, gfifo_pending, width);
+        bar
     }
 
     /// The last frame. Screenshots and VNC read `rgba`.
@@ -406,22 +465,50 @@ impl HeadHandle {
 
     /// Ask for the next frame in `screen().rgba` and a PNG of it.
     pub fn request_screenshot(&self) {
-        self.screenshot.store(true, Ordering::Release);
+        self.screenshot.request();
         self.kick();
     }
 
     pub fn screenshot_pending(&self) -> bool {
-        self.screenshot.load(Ordering::Acquire)
+        self.screenshot.pending()
+    }
+
+    /// Whether a screenshot is also saved as `screenshot_NNNN.png`.
+    pub(crate) fn set_screenshot_files(&self, on: bool) {
+        self.screenshot_files.store(on, Ordering::Relaxed);
+    }
+
+    /// Run one frame of this head now, on the calling thread, as the refresh
+    /// thread does at a retrace: capture, compose, present, and serve the
+    /// frame and screenshot requests. For tests of a head that is not
+    /// started.
+    #[cfg(test)]
+    pub(crate) fn frame_now(&self) {
+        if let Some(head) = self.board() {
+            self.frame_now_as(&*head);
+        }
+    }
+
+    /// As [`frame_now`](Self::frame_now), with `head` standing in for the
+    /// board (a test that composes with its own display object).
+    #[cfg(test)]
+    pub(crate) fn frame_now_as(&self, head: &dyn Head) {
+        let Some(shared) = self.refresh.upgrade() else { return };
+        let mut slots = shared.slots.lock();
+        slots.append(&mut shared.incoming.lock());
+        if let Some(slot) = slots.iter_mut().find(|s| std::ptr::eq(s.handle.as_ptr(), self)) {
+            slot.frame(&shared, self, head);
+        }
     }
 
     /// Ask for the next frame in `screen().rgba`.
     pub fn request_frame(&self) {
-        self.frame_request.store(true, Ordering::Release);
+        self.frame_request.request();
         self.kick();
     }
 
     pub fn frame_pending(&self) -> bool {
-        self.frame_request.load(Ordering::Acquire)
+        self.frame_request.pending()
     }
 
     /// Keep `screen().rgba` current with every frame while a consumer has
@@ -487,9 +574,7 @@ struct Slot {
     in_blank: bool,
     /// When the blank in progress ends.
     blank_end_ns: u64,
-    status_bar: StatusBar,
     overlay: DebugOverlay,
-    sbtex: StatusBarTexture,
     size: (usize, usize),
     shown: bool,
     last_present_ns: u64,
@@ -556,7 +641,7 @@ impl Refresh {
     /// A handle for a new head. Nothing runs until the board is
     /// [attached](HeadHandle::attach) and [started](HeadHandle::start). The
     /// head leaves the schedule when the handle or the board is dropped.
-    pub fn head(&self, status: Arc<StatusSource>) -> Arc<HeadHandle> {
+    pub fn head(&self, status: Arc<MachineStatus>) -> Arc<HeadHandle> {
         let timing = VideoTiming::HZ60;
         let handle = Arc::new(HeadHandle {
             refresh: Arc::downgrade(&self.shared),
@@ -565,6 +650,7 @@ impl Refresh {
             renderer: Mutex::new(None),
             stop: DisplayStop::default(),
             status: Mutex::new(status),
+            bar: Mutex::new(StatusBar::new()),
             timing: Mutex::new((timing, 0)),
             lines: Mutex::new(Vec::new()),
             chain: Mutex::new(Chain::default()),
@@ -573,8 +659,9 @@ impl Refresh {
             stopping: Mutex::new(false),
             stopped: Condvar::new(),
             damage: AtomicBool::new(true),
-            screenshot: AtomicBool::new(false),
-            frame_request: AtomicBool::new(false),
+            screenshot: Tickets::default(),
+            screenshot_files: AtomicBool::new(true),
+            frame_request: Tickets::default(),
             capture: AtomicU32::new(0),
             retraces: AtomicU64::new(0),
         });
@@ -587,9 +674,7 @@ impl Refresh {
             field: 0,
             in_blank: false,
             blank_end_ns: 0,
-            status_bar: StatusBar::new(),
             overlay: DebugOverlay::new(),
-            sbtex: StatusBarTexture::new(),
             size: (0, 0),
             shown: false,
             last_present_ns: 0,
@@ -604,7 +689,7 @@ impl Refresh {
     }
 
     /// [`head`](Self::head) for a board that already exists.
-    pub fn add_head(&self, head: Weak<dyn Head>, status: Arc<StatusSource>) -> Arc<HeadHandle> {
+    pub fn add_head(&self, head: Weak<dyn Head>, status: Arc<MachineStatus>) -> Arc<HeadHandle> {
         let handle = self.head(status);
         handle.attach(head);
         handle
@@ -890,12 +975,13 @@ impl Slot {
     }
 
     fn readback_wanted(h: &HeadHandle) -> bool {
-        h.screenshot.load(Ordering::Acquire) || h.frame_request.load(Ordering::Acquire) || h.capture.load(Ordering::Acquire) > 0
+        h.screenshot.pending() || h.frame_request.pending() || h.capture.load(Ordering::Acquire) > 0
     }
 
     fn frame(&mut self, shared: &Shared, h: &HeadHandle, head: &dyn Head) {
         let now = (shared.clock)();
-        let shot = h.screenshot.load(Ordering::Acquire);
+        // The requests this frame serves: those made before it began.
+        let (shot, frame_ticket) = (h.screenshot.taken(), h.frame_request.taken());
         let readback = Self::readback_wanted(h);
         let said = h.damage.swap(false, Ordering::AcqRel) | head.changed();
         // Checking the verdicts: compose a frame the board would leave.
@@ -967,7 +1053,7 @@ impl Slot {
         let size = (screen.width, screen.height);
         if size.0 == 0 || size.1 == 0 {
             // No video mode: nothing to show, and nothing for a reader.
-            h.frame_request.store(false, Ordering::Release);
+            h.frame_request.serve(frame_ticket);
             return;
         }
         if size != self.size {
@@ -985,7 +1071,7 @@ impl Slot {
             return;
         }
         // Taken once per presented frame: it clears the activity lights.
-        let stats = h.status.lock().clone().snapshot(Instant::now(), head.gfifo_pending());
+        let bar = h.status_bar(head.gfifo_pending(), size.0);
         if fill && screen.prebuilt {
             for y in 0..size.1 {
                 let row = y * FB_STRIDE;
@@ -1024,12 +1110,12 @@ impl Slot {
             match composed {
                 #[cfg(feature = "wgpu")]
                 Composed::Gpu { frame, width, height } => r.present_gpu_frame(
-                    &frame, width, height, screen, &mut self.overlay, &mut self.status_bar, &mut self.sbtex, &stats,
+                    &frame, width, height, screen, &mut self.overlay, bar.pixels(),
                 ),
                 _ => {
                     let live = head.live_planes();
                     r.present(
-                        screen, &mut self.overlay, &mut self.status_bar, &mut self.sbtex, &stats,
+                        screen, &mut self.overlay, bar.pixels(),
                         renderer_reads_back, live.map(|l| l.0), live.map(|l| l.1),
                     );
                 }
@@ -1043,7 +1129,7 @@ impl Slot {
         self.last_present_ns = now;
 
         if self.rgba_current && !waiting {
-            if shot && h.screenshot.swap(false, Ordering::AcqRel) {
+            if h.screenshot.serve(shot) && h.screenshot_files.load(Ordering::Relaxed) {
                 let pixels = screen.rgba.clone();
                 let (w, hgt) = size;
                 let n = shared.screenshots.fetch_add(1, Ordering::Relaxed);
@@ -1053,7 +1139,7 @@ impl Slot {
                     Err(e) => println!("iris: screenshot failed: {}", e),
                 });
             }
-            h.frame_request.store(false, Ordering::Release);
+            h.frame_request.serve(frame_ticket);
         }
     }
 }

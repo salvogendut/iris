@@ -186,6 +186,7 @@ fn build_baseio(
     xbridge: &Arc<XBridge>,
     timers: &Arc<TimerManager>,
     clock: &Clock,
+    heartbeat: Arc<AtomicU64>,
     link_reset: impl Fn(u8) + Send + Sync + 'static,
 ) -> Result<BoardIo, String> {
     let l1 = &l1s[0];
@@ -202,6 +203,7 @@ fn build_baseio(
     xbridge.set_dma_64bit(HEAD_F, 1, true);
     eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
     let fibre = card.fc;
+    fibre.set_heartbeat(heartbeat.clone());
     let section = cfg.ip35_section();
     let (ioc3, serial) = attach_ioc3(
         cfg,
@@ -213,6 +215,7 @@ fn build_baseio(
         "machine.l1_port",
         section.l1_log.clone(),
     );
+    ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("the IO7's IOC3 has Ethernet").clone();
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
     let usb = attach_usb(pci, &ioc3, clock, !cfg.headless)?;
@@ -366,9 +369,17 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
 /// devices) on another's XIO connector. Its DMA and interrupts go through that C-brick's Bedrock.
 fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let xbridge = xbridge_on(&nodes[0].chip);
+    // The status bar's activity bits and the monitor's `speed` and `ticks`,
+    // with a display or without.
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    // CPU 0's tick counter is its Compare count, wired with the CPUs (`sn`).
+    let status = crate::status::MachineStatus::without_ticks(heartbeat.clone());
+    status.set_scsi_wide(true);
     if cfg.machine.profile != MachineProfile::Onyx3000Ip35
         || (cfg.headless && cfg.graphics_board() == crate::config::GraphicsBoard::None) {
-        return build_baseio(cfg, l1s, &xbridge, timers, clock, |_| {});
+        let mut io = build_baseio(cfg, l1s, &xbridge, timers, clock, heartbeat, |_| {})?;
+        io.status = Some(status);
+        return Ok(io);
     }
     check_placement(cfg)?;
     let Placement { node, widget } = placement(cfg);
@@ -376,7 +387,6 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
     let bedrock = &nodes[node].chip;
     let bridge = if on_ibrick { xbridge.clone() } else { xbridge_on(bedrock) };
     let brick = if on_ibrick { "the I-brick".to_string() } else { format!("the graphics brick of C-brick {node}") };
-    let status = crate::disp::StatusSource::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     // What a link reset of the board's port does, what a machine reset does, and the board's
     // entries in the machine's lists.
     type Hook = Arc<dyn Fn() + Send + Sync>;
@@ -427,11 +437,11 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
         }
     };
     let mut io = if on_ibrick {
-        build_baseio(cfg, l1s, &xbridge, timers, clock, at_port)?
+        build_baseio(cfg, l1s, &xbridge, timers, clock, heartbeat, at_port)?
     } else {
         bridge.set_reset_output(Arc::new(at_port));
         bridge.register_locks();
-        build_baseio(cfg, l1s, &xbridge, timers, clock, |_| {})?
+        build_baseio(cfg, l1s, &xbridge, timers, clock, heartbeat, |_| {})?
     };
     fit(&mut io);
     io.status = Some(status);
@@ -455,7 +465,7 @@ fn attach_ir3(
     xbridge: &Arc<XBridge>,
     cfg: &MachineConfig,
     kona: KonaConfig,
-    status: &Arc<crate::disp::StatusSource>,
+    status: &Arc<crate::status::MachineStatus>,
     widget: u8,
 ) -> Result<Arc<Kona>, String> {
     let kona = kona.with_host_widget(HOST_WIDGET)?.with_widget(widget)?.with_pool(cfg.graphics.threads, cfg.graphics.tile);

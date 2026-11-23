@@ -70,6 +70,8 @@ pub struct VncServer {
     addr: SocketAddr,
     workers: Vec<std::thread::JoinHandle<()>>,
     sessions: Arc<Mutex<Vec<(TcpStream, std::thread::JoinHandle<()>)>>>,
+    /// The listener's entry in `ports`.
+    _port: crate::ports::PortGuard,
 }
 
 impl VncServer {
@@ -107,7 +109,13 @@ impl VncServer {
             password,
         });
         let sessions = Arc::new(Mutex::new(Vec::<(TcpStream, std::thread::JoinHandle<()>)>::new()));
-        let mut server = Self { shared: shared.clone(), addr, workers: Vec::new(), sessions: sessions.clone() };
+        let mut server = Self {
+            shared: shared.clone(),
+            addr,
+            workers: Vec::new(),
+            sessions: sessions.clone(),
+            _port: crate::ports::register("tcp", addr, "VNC"),
+        };
         {
             let s = shared.clone();
             server.workers.push(std::thread::Builder::new().name("VNC-Grab".into()).spawn(move || grab_loop(&s)).map_err(|e| e.to_string())?);

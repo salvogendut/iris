@@ -325,10 +325,17 @@ pub(crate) fn build_io(
     // The status bar's activity bits, shared with the Bridge's devices.
     let heartbeat = Arc::new(AtomicU64::new(0));
     let mut io = if cfg.machine.profile == MachineProfile::Onyx2Ip27 {
-        onyx2(cfg, nodes, timers, controller.clone(), heartbeat)?
+        onyx2(cfg, nodes, timers, controller.clone(), heartbeat.clone())?
     } else {
-        origin2000(cfg, nodes, timers, controller.clone(), heartbeat)?
+        origin2000(cfg, nodes, timers, controller.clone(), heartbeat.clone())?
     };
+    // A machine with no graphics has no bar, but the monitor's `speed` and
+    // `ticks` read the same status.
+    if io.status.is_none() {
+        let status = crate::status::MachineStatus::without_ticks(heartbeat);
+        status.set_scsi_wide(true);
+        io.status = Some(status);
+    }
     attach_controller(&mut io, controller, events, timers);
     Ok(io)
 }
@@ -381,7 +388,7 @@ fn onyx2(
     let bridge = build_baseio(cfg, upstream(), &[(BASEIO_G_RECORD, BASEIO_G_SERIAL), (MIO_RECORD, MIO_SERIAL)])?;
     xbow.serve_bridge(BASEIO_WIDGET, &bridge);
 
-    let status = crate::disp::StatusSource::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
+    let status = crate::status::MachineStatus::without_ticks(heartbeat.clone());
     let pipe = match cfg.graphics_board().kona() {
         Some((product, rm_count)) => {
             let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: upstream() });
@@ -425,9 +432,10 @@ fn onyx2(
     let pci_bridge = bridge.clone();
     let mut io = pci_devices(timers, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, heartbeat)?;
     attach_mediaio(timers, cfg, &pci_bridge, &mut io);
+    status.set_scsi_wide(true);
+    io.status = Some(status);
     if let Some(p) = pipe {
         io.display = Some(p.display());
-        io.status = Some(status);
         io.devices.push(p.clone());
         io.monitor.push(p.clone());
         let reset = std::mem::replace(&mut io.reset, Box::new(|| {}));

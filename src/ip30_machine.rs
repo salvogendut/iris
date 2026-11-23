@@ -401,6 +401,7 @@ impl OctaneMachine {
                 let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
                 board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
                 let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
+                card.fc.set_heartbeat(heartbeat.clone());
                 card.attach(board.bus(), slot);
                 eprintln!(
                     "iris: Fibre Channel in the {} on XIO slot {}, slot {slot}, {} loop disk(s)",
@@ -460,7 +461,8 @@ impl OctaneMachine {
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
-        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
+        status.set_scsi_wide(true);
         let gfx = board
             .map(|b| ImpactXio::with_raster(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
             .transpose()?;
@@ -583,8 +585,12 @@ impl OctaneMachine {
         }
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
+        // Each processor's clock is its CP0 Compare (HEART's counter is
+        // IRIX's time base, not its tick): publish the rate it programs.
+        cpu.publish_tick_rate(status.cpu(0).tick_rate());
         for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
-            status.add_cpu_stats(c.cycles_ptr(), tick.clone());
+            let n = status.add_cpu_stats(c.cycles_ptr(), tick.clone());
+            c.publish_tick_rate(status.cpu(n).tick_rate());
         }
         if let Some(g) = &gfx {
             // Host GL frames composite straight into the IMPACT framebuffer.
@@ -636,6 +642,7 @@ impl OctaneMachine {
 
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
+        monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());
         // `pci`: the Bridge's bus, as the O2's MACE shows its own.
@@ -1519,9 +1526,8 @@ impl Workstation for OctaneMachine {
     fn scratch_path(&self) -> Option<&std::path::Path> {
         self.scratch_path.as_deref()
     }
-    /// Disc changes on the internal bus.
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
-        Some(self.scsi[0].clone() as Arc<dyn crate::workstation::DiscChanger>)
+        Some(Arc::new(crate::workstation::DiscChangers(self.scsi.iter().map(|c| c.clone() as _).collect())))
     }
     fn pending_chd_sync_count(&self) -> usize {
         self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()

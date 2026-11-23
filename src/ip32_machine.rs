@@ -308,13 +308,16 @@ impl O2Machine {
         // its interface buffer.
         bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
         let running = Arc::new(AtomicBool::new(false));
-        let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
+        let status = crate::status::MachineStatus::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
+        status.set_scsi_wide(true);
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
+        // The O2's clock is CP0 Compare: publish the rate it programs.
+        cpu.publish_tick_rate(status.cpu(0).tick_rate());
         let paused = Arc::new(AtomicBool::new(false));
         // GBE's timing interrupts come at their lines from the timer thread.
         status.refresh().set_timers(timer_manager.clone());
-        let display = Arc::new(O2Display::new(bus.clone(), status, paused.clone()));
+        let display = Arc::new(O2Display::new(bus.clone(), status.clone(), paused.clone()));
         let head: Arc<dyn crate::display::Head> = display.clone();
         display.head.attach(Arc::downgrade(&head));
         if let Some(port) = o2.control_port {
@@ -322,7 +325,11 @@ impl O2Machine {
                 Ok(l) => {
                     eprintln!("iris: O2 control on 127.0.0.1:{port} (the monitor's `o2` commands; `help o2` there lists them)");
                     let bus = bus.clone();
-                    std::thread::Builder::new().name("O2-Control".into()).spawn(move || control_server(l, bus)).unwrap();
+                    let reg = crate::ports::register("tcp", format!("127.0.0.1:{port}"), "O2 control");
+                    std::thread::Builder::new().name("O2-Control".into()).spawn(move || {
+                        let _port = reg;
+                        control_server(l, bus)
+                    }).unwrap();
                 }
                 Err(e) => eprintln!("iris: O2 control port {port}: {e}"),
             }
@@ -331,6 +338,7 @@ impl O2Machine {
         // commands (registers, breakpoints, memory) and the O2's devices'.
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
+        monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(bus.clone());
         // `phys`: the physical bus's decode table, memory and traces.
@@ -910,10 +918,9 @@ impl Workstation for O2Machine {
     fn ci_rollback(&mut self) -> Result<(), String> { O2Machine::ci_rollback(self) }
 
     fn scratch_path(&self) -> Option<&std::path::Path> { self.scratch_path.as_deref() }
-    /// Disc changes on the internal bus (controller 0), as the Indigo2 offers
-    /// its first controller.
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
-        self.bus.scsi.lock().unwrap().first().map(|c| c.clone() as Arc<dyn crate::workstation::DiscChanger>)
+        let ctls = self.bus.scsi.lock().unwrap().iter().map(|c| c.clone() as _).collect();
+        Some(Arc::new(crate::workstation::DiscChangers(ctls)))
     }
     /// The same `/CDROM` remount the Indy types: controller 0 is `dks0` to
     /// IRIX on the O2 as well.
@@ -974,7 +981,7 @@ pub struct O2Display {
     /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
-    status: Arc<crate::disp::StatusSource>,
+    status: Arc<crate::status::MachineStatus>,
     /// Where the beam meets each of GBE's four timing interrupts, in lines
     /// after the start of vertical blanking, as of the last retrace.
     irq_lines: Mutex<[Option<u32>; 4]>,
@@ -995,7 +1002,7 @@ struct Scan {
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, paused: Arc<AtomicBool>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::status::MachineStatus>, paused: Arc<AtomicBool>) -> Self {
         Self {
             irq_lines: Mutex::new([None; 4]),
             paused,
