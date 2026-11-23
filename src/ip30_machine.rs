@@ -24,7 +24,7 @@ use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, RawFlash, PIN_WIRING};
-use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
+use crate::dev::heart::{Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::ds1685::Ds1685;
 use crate::dev::ioc3::{self, ByteBus, Ioc3};
@@ -328,7 +328,7 @@ impl OctaneMachine {
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
-        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, host_clock()));
+        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().reader()));
         // HEART's MicroLAN holds the processor module's record.
         let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
         heart.set_microlan(identity.processor.bus());
@@ -910,6 +910,7 @@ impl OctaneMachine {
     pub fn stop(&mut self) {
         self.stop_cpus();
         self.stop_devices();
+        self.timer_manager.clock().stop();
         // The guest clock points into this machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
@@ -970,6 +971,7 @@ impl OctaneMachine {
     /// Without the last the PROM's first graphics readback after a reset
     /// waits forever on a pipeline nothing drains.
     pub fn restart_peripherals(&mut self) {
+        self.timer_manager.clock().start();
         for d in self.devices() {
             d.start();
         }
@@ -1089,6 +1091,7 @@ impl OctaneMachine {
             .value("bridge", self.bridge.save_state())
             .value("xbow", self.xbow.save_state())
             .value("heart", self.heart.save_state())
+            .u64("clock_ns", self.timer_manager.clock().now())
             .build()
     }
 
@@ -1098,6 +1101,10 @@ impl OctaneMachine {
     /// is placed from its loaded descriptors.
     fn load_board(&self, v: &toml::Value) -> Result<(), String> {
         let load = |key: &str, dev: &dyn Saveable| dev.load_state(field(v, key)?).map_err(|e| format!("{key}: {e}"));
+        // The machine is stopped, so the clock holds at the saved reading while the devices re-arm.
+        if crate::snapshot::get_field(v, "clock_ns").is_some() {
+            self.timer_manager.clock().restore(crate::snapshot::field_u64(v, "clock_ns")?);
+        }
         load("ioc3", &*self.ioc3)?;
         load("eth", &*self.eth)?;
         load("scsi0", &*self.scsi[0])?;
@@ -2203,6 +2210,7 @@ mod snapshot_tests {
             a.apply_snapshot(saved).unwrap();
             assert_eq!(digest(&a), at_save);
             assert_eq!(a.cpus[0].save_state(), cpu_at_save);
+            assert_eq!(a.timer_manager.clock().now(), crate::snapshot::field_u64(&board, "clock_ns").unwrap());
             // Two clocks run in host time while the machine is stopped: the
             // PHY's negotiation countdown, whose time left can only have
             // shrunk since the load, and the RTC, which keeps the host's time
