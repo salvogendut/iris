@@ -47,6 +47,11 @@ pub const REX3_BASE: u32 = 0x1F0F0000; // Physical base address of registers
 pub const GFIFO_DEPTH: usize = 65536;
 /// Real hardware GFIFO depth (32 entries). STATUS reports level=1 below this threshold.
 pub const GFIFO_HW_DEPTH: usize = 32;
+/// How long the processor thread lingers on an empty GFIFO for a run of
+/// entries to collect before it goes idle (`register_processor`).
+const GFIFO_LINGER: std::time::Duration = std::time::Duration::from_micros(20);
+const GFIFO_LINGER_ENTRIES: usize = 256;
+const GFIFO_LINGER_SPINS: u32 = 512;
 /// Special GFIFO command to trigger a GO without a register write.
 pub const GFIFO_PURE_GO: u32 = 0xFFFF_0800;
 /// GFIFO_PURE_GO with the GO bit stripped — the reg_offset seen by process_register.
@@ -1420,6 +1425,10 @@ pub struct Rex3 {
     fatal_sender: Mutex<Option<std::sync::mpsc::Sender<crate::traits::MachineFatal>>>,
     #[cfg(feature = "wgpu")]
     resident_fatal_notified: AtomicBool,
+    /// Whether the resident raster has a fault: `ResidentRaster` keeps it,
+    /// and `resident_ready` reads it on every GO without the raster's lock.
+    #[cfg(feature = "wgpu")]
+    resident_faulted: Arc<AtomicBool>,
     #[cfg(feature = "wgpu")]
     resident_frame: frame::ResidentFrameControl,
     #[cfg(feature = "wgpu")]
@@ -1641,6 +1650,8 @@ impl Rex3 {
             #[cfg(feature = "wgpu")]
             resident_fatal_notified: AtomicBool::new(false),
             #[cfg(feature = "wgpu")]
+            resident_faulted: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "wgpu")]
             resident_frame: frame::ResidentFrameControl::default(),
             #[cfg(feature = "wgpu")]
             resident_display_mode: Mutex::new(None),
@@ -1843,8 +1854,9 @@ impl Rex3 {
             return Err("REX3 live resident scanout is not implemented".into());
         }
         self.processor_unparker.take();
-        *self.raster.get_mut() =
-            RasterMode::Resident(crate::dev::ng1::wgpu::resident::ResidentRaster::new(backend));
+        let mut raster = crate::dev::ng1::wgpu::resident::ResidentRaster::new(backend);
+        raster.share_fault_flag(Arc::clone(&self.resident_faulted));
+        *self.raster.get_mut() = RasterMode::Resident(raster);
         self.resident_frame.activate();
         Ok(())
     }
@@ -1894,7 +1906,9 @@ impl Rex3 {
             backend.enable_profiling()?;
         }
         self.processor_unparker.take();
-        *self.raster.get_mut() = RasterMode::Resident(ResidentRaster::new(backend));
+        let mut raster = ResidentRaster::new(backend);
+        raster.share_fault_flag(Arc::clone(&self.resident_faulted));
+        *self.raster.get_mut() = RasterMode::Resident(raster);
         self.resident_frame.activate();
         Ok(())
     }
@@ -1946,10 +1960,8 @@ impl Rex3 {
 
     #[cfg(feature = "wgpu")]
     fn resident_ready(&self) -> bool {
-        if let RasterMode::Resident(raster) = &*self.raster.lock() {
-            return raster.fault().is_none();
-        }
-        true
+        // Not the raster's lock: this runs on every GO.
+        !(self.resident_frame.is_active() && self.resident_faulted.load(Ordering::Acquire))
     }
 
     #[cfg(feature = "wgpu")]
@@ -3451,9 +3463,15 @@ impl Rex3 {
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
+        // Entries since the batch's age was last checked here.
+        #[cfg(feature = "wgpu")]
+        let mut since_age_check = 0u32;
+        // Whether the ring was found empty and the thread has lingered once.
+        let mut lingered = false;
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
+                lingered = false;
 
                 #[cfg(feature = "wgpu")]
                 if addr == GFIFO_RESIDENT_FRAME {
@@ -3508,12 +3526,48 @@ impl Rex3 {
                     self.gfifo.flush_head();
                     break; 
                 } // GFIFO_EXIT
+                // The batch's age is checked as each GO starts
+                // (`ResidentGpu::enqueue_at`), when the GFIFO empties, before
+                // the thread parks, and every 256 entries here, so a stream
+                // of register writes without GOs cannot hold a batch back.
+                // Not after every GO: that cost a clock read and a raster
+                // lock each.
                 #[cfg(feature = "wgpu")]
-                self.flush_resident_if_due();
+                {
+                    since_age_check += 1;
+                    if since_age_check >= 256 {
+                        since_age_check = 0;
+                        self.flush_resident_if_due();
+                    }
+                }
+            } else if !lingered {
+                // Linger before going idle. A consumer that keeps pace with
+                // the producer reads the tail and each slot just after the
+                // producer writes them, so every push pays a cache-line
+                // transfer to this core. On a multi-die host that cost more
+                // than the entry itself: a faster raster made the producer
+                // (the guest CPU) slower. Let a run of entries collect,
+                // polling the tail only every few hundred nanoseconds, for at
+                // most a few microseconds.
+                lingered = true;
+                let start = std::time::Instant::now();
+                while self.gfifo.pending_at(0) < GFIFO_LINGER_ENTRIES
+                    && start.elapsed() < GFIFO_LINGER
+                {
+                    for _ in 0..GFIFO_LINGER_SPINS {
+                        std::hint::spin_loop();
+                    }
+                }
             } else {
                 if is_busy {
+                    // The guest pauses between primitives all the time; a
+                    // submission each time cost the processor thread a fifth
+                    // of its time in small batches. The batch goes when it is
+                    // 4 ms old, checked here and each time the thread is about
+                    // to park; every reader (frame cut, host read, wait for
+                    // idle) submits first.
                     #[cfg(feature = "wgpu")]
-                    let _ = self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::Idle);
+                    self.flush_resident_if_due();
                     #[cfg(feature = "rex-gpu")]
                     self.flush_gpu_replay(FlushReason::Idle);
                     self.gfxbusy.store(false, Ordering::Release);
@@ -3529,8 +3583,13 @@ impl Rex3 {
                 // CPU at ~100%. Tests leak their Rex3 and its processor thread,
                 // so spinning ones also starve a CI runner.
                 if backoff.is_completed() {
+                    // A batch still young waits through the park below (at
+                    // most 2 ms) and goes on a later pass, once it is due.
                     #[cfg(feature = "wgpu")]
-                    self.poll_resident_device_health();
+                    {
+                        self.flush_resident_if_due();
+                        self.poll_resident_device_health();
+                    }
                     // Set parked BEFORE the final emptiness re-check so a racing
                     // gfifo_push either (a) is seen by the peek below, or (b) sees
                     // parked=true and unparks us — the unpark token makes

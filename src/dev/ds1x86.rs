@@ -108,16 +108,7 @@ impl Ds1x86 {
 
     /// Run the clock `offset` seconds from host time.
     fn start_clock(&self, data: &mut RtcData, offset: i64) {
-        let (host, second) = battery_clock::host_second();
-        // The clock lines up with the host's second; under `ci_clock`, with no host second to
-        // align to, it starts now.
-        #[cfg(not(feature = "ci_clock"))]
-        let at = self.clock.now().saturating_sub(second.elapsed().as_nanos() as u64);
-        #[cfg(feature = "ci_clock")]
-        let at = {
-            let _ = second;
-            self.clock.now()
-        };
+        let (host, at) = battery_clock::host_second(&self.clock);
         data.base_centiseconds = (host + offset).max(0) as u64 * 100;
         data.converted_centiseconds = None;
         data.time_base = at;

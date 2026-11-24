@@ -328,7 +328,7 @@ impl OctaneMachine {
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
-        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().reader()));
+        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().clone()));
         // HEART's MicroLAN holds the processor module's record.
         let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
         heart.set_microlan(identity.processor.bus());
@@ -413,7 +413,7 @@ impl OctaneMachine {
         disks.extend(cfg.fibre_channel.iter().flat_map(crate::dev::isp2200::card::disk_refs));
         // The DS1685 on IOC3's byte bus: the guest switching the machine off
         // through it, and its NVRAM in a file.
-        let rtc = Ds1685::new(Some(event_tx.clone()));
+        let rtc = Ds1685::new(Some(event_tx.clone()), timer_manager.clock().clone());
         rtc.set_rtc_offset(&cfg.rtc_offset);
         if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
             eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);

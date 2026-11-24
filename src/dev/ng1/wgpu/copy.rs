@@ -1,9 +1,10 @@
-use crate::dev::ng1::rex3::Rex3Context;
+use crate::dev::ng1::rex3::{Rex3Context, OCTANT_XDEC, OCTANT_YDEC};
 use crate::dev::ng1::rex3_flat_fill::FillPlane;
 
 use super::fill_walk::{
     prepare_fill_walk, FillCompletion, FillOperation, FillWalkKind,
 };
+use super::command::CopyMode;
 use super::shade::ShadeDda;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,9 +85,7 @@ pub(super) fn prepare_copy_fill(
     });
     let final_shade = if context.drawmode0.shade() {
         let mut shade = ShadeDda::from_context(context);
-        for _ in 0..walk.visits {
-            shade.advance();
-        }
+        shade.advance_by(walk.visits);
         Some(shade)
     } else {
         None
@@ -96,4 +95,55 @@ pub(super) fn prepare_copy_fill(
         completion,
         final_shade,
     })
+}
+
+/// How `fill` can run on the GPU. The hardware walks the copy one pixel at a
+/// time, reading the walker's pixel and writing it XYMOVE away, so a later
+/// read can see an earlier write. Run in parallel, every read must see the
+/// planes as they were before the copy, which is what the walk does when
+/// no destination it writes is a source it reads later:
+///
+/// - the written box and the box moved back by XYMOVE do not overlap: read
+///   the source in place;
+/// - they overlap, but the pixel each walker position reads is overwritten
+///   only by a position walked after it (the walk runs against the move,
+///   as X does when it scrolls): read the source from a snapshot;
+/// - otherwise (the walk smears pixels along the move), one lane walks it.
+pub(super) fn copy_mode(context: &Rex3Context, fill: &CopyFill) -> CopyMode {
+    let dx = (context.xymove >> 16) as i16 as i32;
+    let dy = context.xymove as i16 as i32;
+    let (w, h) = (fill.max_x - fill.min_x + 1, fill.max_y - fill.min_y + 1);
+    if dx.abs() >= w || dy.abs() >= h || (dx == 0 && dy == 0) {
+        // No pixel written is read by another position (a zero move reads
+        // and writes each pixel at the same position).
+        return CopyMode::Parallel;
+    }
+    let block = fill.kind == CopyKind::Block;
+    let octant = context.bresoctinc1.octant();
+    let x_step = if block && octant & OCTANT_XDEC != 0 { -1 } else { 1 };
+    let y_step = if block && octant & OCTANT_YDEC != 0 { -1 } else { 1 };
+    // The position whose write lands on walker W is W - move: it must come
+    // after W in the walk (rows in y_step order, then x_step within one).
+    let safe = if dy != 0 { dy * y_step < 0 } else { dx * x_step < 0 };
+    if safe { CopyMode::Snapshot } else { CopyMode::Serial }
+}
+
+/// The plane box (x0, y0, x1, y1, inclusive) a parallel copy fill reads:
+/// its destination box moved back by XYMOVE (physical rows run the other
+/// way under YFLIP), clamped to the plane of `stride` x `height` words.
+/// None when it reads nothing inside the plane.
+pub(super) fn copy_source_box(
+    context: &Rex3Context,
+    fill: &CopyFill,
+    stride: i32,
+    height: i32,
+) -> Option<(u32, u32, u32, u32)> {
+    let dx = (context.xymove >> 16) as i16 as i32;
+    let dy = context.xymove as i16 as i32;
+    let dy = if context.drawmode1.yflip() { -dy } else { dy };
+    let x0 = (fill.min_x - dx).max(0);
+    let x1 = (fill.max_x - dx).min(stride - 1);
+    let y0 = (fill.min_y - dy).max(0);
+    let y1 = (fill.max_y - dy).min(height - 1);
+    (x0 <= x1 && y0 <= y1).then(|| (x0 as u32, y0 as u32, x1 as u32, y1 as u32))
 }

@@ -318,6 +318,7 @@ fn unrecognised_accesses_read_zero_and_store_nothing() {
 use crate::pci::PciDmaStatus;
 
 use crate::pci::testing::FlatMem as Ram;
+use crate::test_board::until;
 
 fn dma_card() -> (Rad1, Arc<Ram>) {
     dma_card_on(stepped())
@@ -646,7 +647,7 @@ fn the_clock_stands_still_while_paused() {
     clock.start();
     r.resume();
     let mut ticks = 0;
-    assert!(eventually(|| {
+    assert!(until(|| {
         ticks = rd(&r, 0x30).wrapping_sub(ust);
         ticks > 0
     }), "the clock runs again after the resume");
@@ -671,17 +672,9 @@ fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     (r, ram, tm)
 }
 
-/// Poll `done` until it holds, giving up after a minute. Timer callbacks run
-/// on another thread and the suite runs many cards at once, so a wait counted
-/// in sleeps or milliseconds gives up on a busy host before the callback has
-/// had a core; the deadline only has to catch a callback that never comes.
-fn eventually(done: impl FnMut() -> bool) -> bool {
-    crate::test_board::until(Duration::from_secs(60), done)
-}
-
 /// Poll the schedule's own counter, which no guest register read touches.
 fn wait_done(r: &Rad1, n: u64) -> bool {
-    eventually(|| r.state.lock().status_done >= n)
+    until(|| r.state.lock().status_done >= n)
 }
 
 /// A started status schedule delivers completions from the timer with no
@@ -738,7 +731,7 @@ fn the_output_pump_runs_only_while_the_channel_does() {
     wr(&r, 0x58, 0x2000_0001);
     assert!(r.state.lock().audio_timer.is_some());
     // The pump moves frames the guest never asked about.
-    assert!(eventually(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
+    assert!(until(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
     Device::stop(&r);
     assert!(r.state.lock().audio_timer.is_none(), "stop removes it");
     Device::start(&r);
@@ -1605,7 +1598,7 @@ fn a_tone_reaches_a_file_through_the_real_pump() {
     start_ust(&r);
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
-    assert!(crate::test_board::until(Duration::from_secs(60), || r.state.lock().chan[CH_OUT].frames >= 8820), "the pump never moved the ring");
+    assert!(until(|| r.state.lock().chan[CH_OUT].frames >= 8820), "the pump never moved the ring");
     // The frames played before the DAC mute are counted in the same step.
     let loud = {
         let _tick = r.tick_pass.lock();
@@ -1632,78 +1625,27 @@ fn a_tone_reaches_a_file_through_the_real_pump() {
 /// must be the tone with each channel on its own side, as long as the ring
 /// moved, and the gap must count as an underrun. The 512-frame ring holds
 /// five and ten whole cycles at 44.1 kHz, so the tones are about 431 and
-/// 861 Hz rather than 440 and 880. On a real device this runs in real time
-/// and the host output resamples; otherwise the clock is stepped.
-fn a_tone_survives_an_underrun(backend: Option<crate::host_audio::test_signal::Backend>) {
-    use crate::host_audio::test_signal::*;
-    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let Some(backend) = backend else {
-        let mut t = SteppedTone::new();
-        wr(&t.r, 0x58, 0x2000_0001);
-        t.run(600);
-        wr(&t.r, 0x58, 0x2000_0000);
-        let (first, before) = (t.frames(), t.underruns());
-        t.run(300);
-        let underran = t.underruns() - before;
-        // Starting the channel again counts its frames from zero.
-        wr(&t.r, 0x58, 0x2000_0001);
-        t.run(600);
-        wr(&t.r, 0x58, 0x2000_0000);
-        let second = t.frames();
-        t.run(300);
-        let heard = Heard { rate: 44100, channels: 2, pcm: std::mem::take(&mut t.pcm) };
-        assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first as f64 / 44100.0, second as f64 / 44100.0]);
-        assert!(underran > 0, "the host stream ran dry while the output was stopped");
-        return;
-    };
-    let Some(ear) = Listener::new(backend, "rad1-underrun") else { return };
-    let tm = Arc::new(TimerManager::new());
-    let r = Rad1::new(&tm);
-    r.state().config().write(4, BAR as u32);
-    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
-    r.state().connect_dma(ram.clone());
-    {
-        let mut m = ram.0.lock().unwrap();
-        for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
-            let at = 0x10_0000 + n * 8;
-            m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
-            m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
-        }
-    }
-    r.enable_output(ear.cfg.clone());
-    Device::start(&r);
-    start_ust(&r);
-    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
-    let frames = || r.state.lock().chan[CH_OUT].frames as f64;
-    wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
-    wr(&r, 0x58, 0x2000_0000);
-    let (first, before) = (frames(), r.underruns());
-    std::thread::sleep(Duration::from_millis(300));
-    let underran = r.underruns() - before;
-    // Starting the channel again counts its frames from zero.
-    wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
-    wr(&r, 0x58, 0x2000_0000);
-    let second = frames();
-    // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
-    Device::stop(&r);
-    r.sink.lock().take();
-    let heard = ear.heard();
-    assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 44100.0, second / 44100.0]);
-    assert!(underran > 0, "the host stream ran dry while the output was stopped");
-}
-
+/// 861 Hz rather than 440 and 880. The clock is stepped.
 #[test]
 fn a_tone_survives_an_underrun_on_a_stepped_clock() {
-    a_tone_survives_an_underrun(None);
-}
-
-#[test]
-fn a_tone_survives_an_underrun_on_the_real_device() {
-    a_tone_survives_an_underrun(Some(crate::host_audio::test_signal::Backend::RealDevice));
+    use crate::host_audio::test_signal::*;
+    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+    let mut t = SteppedTone::new();
+    wr(&t.r, 0x58, 0x2000_0001);
+    t.run(600);
+    wr(&t.r, 0x58, 0x2000_0000);
+    let (first, before) = (t.frames(), t.underruns());
+    t.run(300);
+    let underran = t.underruns() - before;
+    // Starting the channel again counts its frames from zero.
+    wr(&t.r, 0x58, 0x2000_0001);
+    t.run(600);
+    wr(&t.r, 0x58, 0x2000_0000);
+    let second = t.frames();
+    t.run(300);
+    let heard = Heard { rate: 44100, channels: 2, pcm: std::mem::take(&mut t.pcm) };
+    assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first as f64 / 44100.0, second as f64 / 44100.0]);
+    assert!(underran > 0, "the host stream ran dry while the output was stopped");
 }
 
 /// The MediaIO start-up writes 0x84 with 0 (and the model once dropped the

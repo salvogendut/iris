@@ -47,6 +47,19 @@ hashes are given where a change is easiest to understand by reading the commit.
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
 
+### Newport on the GPU raster
+
+- Scrolling and other large screen-to-screen copies no longer stall the
+  display for a tenth of a second or more each (seconds in full-screen
+  demos) with `raster = "wgpu"` on Indy and Indigo2. Drawing-heavy demos
+  also wait far less for the board.
+- The GPU raster handles about half again as many primitives a second on
+  GL demos (Ideas in Motion, powerflip, solidview).
+- Gouraud-shaded drawing on the GPU raster no longer costs the emulator time
+  per pixel: powerflip on an Indy draws nearly twice as fast.
+- A resolution change with the wgpu renderer no longer stops the window
+  presenting ("Failed to wait for GPU to come idle").
+
 ### Newport colour-index shading
 
 - With the REX3 JIT (always on in iris-gui), smooth-shaded colour-index
@@ -59,6 +72,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Under jitv2, software interrupts are taken as soon as they are enabled, not
   at the next hardware interrupt, on every machine. On the Tezro, quake's
   timedemo no longer freezes for up to a second at a time.
+
+### Origin 200, Origin 2000 and Onyx2
+
+- `[machine] cpus = 2` fills both processor slots of each node board, so the
+  Origin 200 runs two processors and a two-board Origin 2000 or Onyx2 four.
+  IRIX 6.5.30 boots with all of them online on each; 6.5.22 also on the
+  Origin 2000.
 
 ### jitv2 flushes
 

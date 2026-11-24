@@ -524,6 +524,59 @@ impl<R: Pod, S: Pod> Recording<R, S> {
     }
 }
 
+/// Slots compared with the slot before them, a 32-bit word at a time (the
+/// first 64 words): how much of each slot is new.
+#[derive(Clone, Debug)]
+pub struct SlotChanges {
+    pub slots: u64,
+    /// Slots equal to the one before.
+    pub identical: u64,
+    /// Words that differ from the slot before, summed over slots.
+    pub words: u64,
+    /// Per word index, the slots in which that word changed.
+    pub per_word: [u64; 64],
+    last: [u32; 64],
+    last_len: usize,
+}
+
+impl Default for SlotChanges {
+    fn default() -> Self {
+        Self { slots: 0, identical: 0, words: 0, per_word: [0; 64], last: [0; 64], last_len: 0 }
+    }
+}
+
+impl SlotChanges {
+    fn note(&mut self, bytes: &[u8]) {
+        // One pass building a mask of the words that changed (it
+        // vectorises), then the counters for those words only: this runs
+        // for every primitive.
+        let mut words = [0u32; 64];
+        let n = (bytes.len() / 4).min(64);
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_ne_bytes(chunk.try_into().expect("four bytes"));
+        }
+        let mut mask = 0u64;
+        for i in 0..64 {
+            mask |= u64::from(words[i] != self.last[i]) << i;
+        }
+        if self.last_len != n {
+            mask |= if n == 64 { !0 } else { (1u64 << n) - 1 };
+        }
+        mask &= if n == 64 { !0 } else { (1u64 << n) - 1 };
+        self.last = words;
+        self.last_len = n;
+        self.slots += 1;
+        if mask == 0 {
+            self.identical += 1;
+        }
+        self.words += u64::from(mask.count_ones());
+        while mask != 0 {
+            self.per_word[mask.trailing_zeros() as usize] += 1;
+            mask &= mask - 1;
+        }
+    }
+}
+
 /// The recorder and its GPU buffers. `R` is the board's setup record, `S`
 /// its state slot; both are plain `repr(C)` data laid out as the board's
 /// WGSL declares them.
@@ -547,6 +600,10 @@ pub struct Batch<R: Pod, S: Pod> {
     pub flushes: u64,
     /// Primitives drawn so far.
     pub prims_total: u64,
+    /// How each slot differs from the one before it (`prim_with_slot`),
+    /// counted only with `track_slot_changes`: it costs every primitive.
+    pub slot_changes: SlotChanges,
+    pub track_slot_changes: bool,
     /// GPU times, with WGPU_BATCH_TIMING.
     pub timing: Option<Timing>,
     wait_stats: BatchWaitStats,
@@ -626,6 +683,8 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             last_set: 0,
             flushes: 0,
             prims_total: 0,
+            slot_changes: SlotChanges::default(),
+            track_slot_changes: false,
             timing: if environment_timing { Timing::new(gpu) } else { None },
             wait_stats: BatchWaitStats::default(),
             #[cfg(test)]
@@ -712,6 +771,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
                 k
             }
             SetChoice::Wait(k) => {
+                crate::pf_scope!(crate::perfetto::events::WGPU_SET_WAIT);
                 let start = Instant::now();
                 self.wait_stats.waits = self.wait_stats.waits.checked_add(1)
                     .ok_or("wgpu bounded set wait counter overflow")?;
@@ -833,7 +893,11 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         y1: i32,
         record: impl FnOnce(u32) -> R,
     ) -> Result<Option<(u32, u32)>, Full> {
-        self.recording.prim_with_slot(slot, self.grid.tile_box(x0, y0, x1, y1), record)
+        let result = self.recording.prim_with_slot(slot, self.grid.tile_box(x0, y0, x1, y1), record);
+        if self.track_slot_changes && matches!(result, Ok(Some(_))) {
+            self.slot_changes.note(bytemuck::bytes_of(&slot));
+        }
+        result
     }
 
     /// Upload and draw what was recorded, with `groups` bound from group 2

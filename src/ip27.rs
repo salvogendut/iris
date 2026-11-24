@@ -28,7 +28,7 @@
 //! [`NodeSpec`] per node plus a `build_io` function handing back a [`BoardIo`]; the profile picks
 //! both ([`crate::ip29_machine`] for the Origin 200, [`crate::ip27_machine`] for the desksides).
 //!
-//! - Every node holds one processor; each node's memory is mapped by the Hubs' remap.
+//! - A node holds one or two processors, slices A and B; each node's memory is mapped by the Hubs' remap.
 //! - The Hub's per-slice enable and NMI stores only log; their effect on a processor is not established.
 //! - The node flash and uncached Hub-special views carry no JIT page generation (`gen_ptr`), so a
 //!   jitv2 build compiles no code from them and the PROM runs on the interpreter's path.
@@ -43,7 +43,7 @@ use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
 use crate::dev::bridge::Bridge;
 use crate::dev::elsc::ModuleOutput;
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::hub::{Hub, HubConfig};
 use crate::sn::{BoardIo, Machine, NodeBoard, UncachedBus, UncachedSpace, RESET_WINDOW};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
@@ -58,6 +58,7 @@ use crate::devlog::LogModule;
 use crate::gdb_stub::CpuDebug;
 use crate::hptimer::TimerManager;
 use crate::cpu::smp::World;
+use crate::ip35::presence::Cpu;
 use crate::window_map::SparseWindowMap;
 pub use crate::dev::hub::{bank_mappings, BANKS, BANK_STRIDE, SLOT_STRIDE};
 use crate::traits::*;
@@ -206,7 +207,7 @@ pub fn machine(
         .bytes;
     let specs = node_specs(cfg)?;
     let timers = Arc::new(TimerManager::new());
-    let clock = timers.clock().reader();
+    let clock = timers.clock().clone();
     let mut nodes = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
         let node = NodeBoard::<Hub, NodeFlash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, i, &prom, &timers)?;
@@ -239,6 +240,13 @@ pub fn machine(
             node.chip.pi.set_cpu_interrupts(slice, cpu.interrupts_ptr());
             cpu.register_locks();
             cpus.push(cpu);
+        }
+        if let [a, b] = &cpus[..] {
+            let hold = |c: &Arc<dyn CpuDevice>| {
+                let cycles = c.cycles_ptr();
+                Cpu { slot: c.park_slot(), cycles: Box::new(move || cycles.retired()) }
+            };
+            node.chip.pi.set_pair([hold(a), hold(b)]);
         }
         node.chip.set_event_sender(tx.clone());
         node.chip.register_locks();
@@ -296,7 +304,7 @@ fn build_cpu(
         let exec = crate::cpu::build::build_cpu::<C>(bus, cached, memory, module, timers, count_hz, node.first_cpu + slice, smp);
         Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
     });
-    physical.connect_cpu(&*cpu, false)?;
+    physical.connect_cpu(&*cpu, true)?;
     Ok(cpu)
 }
 

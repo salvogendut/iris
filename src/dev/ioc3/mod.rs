@@ -532,7 +532,7 @@ struct Shared {
     timers: [Timer; KINDS],
     /// Between `start` and `stop`.
     running: AtomicBool,
-    /// Held by a timer callback while it runs, so `stop` can wait one out.
+    /// Held by a timer callback, a receive thread and `reset` while each runs, so a reset falls between passes.
     gate: Mutex<()>,
     /// Orders the passes that read the deadlines and set the timers.
     order: Mutex<()>,
@@ -991,7 +991,7 @@ impl Ioc3 {
         assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus has {:?}", board.name, cells.byte_bus);
         let core = Arc::new(Core::new());
         let sio = (cells.serial || cells.parallel)
-            .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
+            .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel, tm.clock())));
         let serial = if cells.serial {
             Serial::pair(core.clone(), sio.clone().expect("a serial port has a Super I/O"), tm.clock().clone()).map(Some)
         } else {
@@ -1193,7 +1193,6 @@ impl Device for Ioc3 {
             return;
         }
         self.sh.timers.iter().for_each(Timer::stop);
-        drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {
             t.thread().unpark();

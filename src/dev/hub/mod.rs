@@ -17,7 +17,7 @@
 //!   unmaps the window. The network port reads disabled at the peer.
 //! - Failing, rather than timing out, an access to a node number no reachable
 //!   Hub holds is an approximation.
-//! - A processor rendezvous hold is not modelled.
+//! - A slice held at the PROM's pair liveness poll is an approximation: see `pi`.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -173,7 +173,13 @@ impl Regs {
         match off {
             ..pi::END => return self.pi.write_sized(off, value, size),
             md::START..md::END => self.md.write(off, value),
-            io::START..io::END => return self.io.write(off, value),
+            io::START..io::END => {
+                let effect = self.io.write(off, value);
+                if off == regs::IIO_SCRATCH_REG0::OFFSET {
+                    self.pi.flag_word_stored();
+                }
+                return effect;
+            }
             _ => return self.ni.write(off, value),
         }
         Effect::None
@@ -225,7 +231,7 @@ impl Hub {
             let node = Node::new(weak.clone(), memory, runs, boot, false);
             let regs = Arc::new(Regs {
                 pi: Pi::new(tm, cfg.cpus, cfg.first_cpu),
-                md: Md::new(tm.clock().reader(), cfg.slot, cfg.banks_mb),
+                md: Md::new(tm.clock().clone(), cfg.slot, cfg.banks_mb),
                 io: Io::new(cfg.widget_revision, cfg.manufacturer),
                 ni: Arc::new(Ni::new(cfg.ni_revision)),
                 i2c: OnceLock::new(),

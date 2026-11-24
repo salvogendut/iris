@@ -85,9 +85,55 @@ pub(crate) struct PreparedFlatFill {
     advance: ContextAdvance,
     final_lsrcount: Option<u32>,
     #[cfg(feature = "wgpu")]
-    shade_payload: Option<Vec<u32>>,
+    shade_payload: Option<ShadePayload>,
     #[cfg(feature = "wgpu")]
     final_shade: Option<ShadeDda>,
+}
+
+/// A fill's shade checkpoints (four words every 32 pixels). Nearly every
+/// span the guest draws fits inline; only a longer one allocates. One was
+/// allocated per shaded GO before, a few percent of the raster thread.
+#[cfg(feature = "wgpu")]
+#[derive(Debug)]
+pub(crate) enum ShadePayload {
+    Inline { len: usize, words: [u32; SHADE_INLINE_WORDS] },
+    Heap(Vec<u32>),
+}
+
+#[cfg(feature = "wgpu")]
+const SHADE_INLINE_WORDS: usize = 32;
+
+#[cfg(feature = "wgpu")]
+impl ShadePayload {
+    fn with_capacity(words: usize) -> Self {
+        if words <= SHADE_INLINE_WORDS {
+            Self::Inline { len: 0, words: [0; SHADE_INLINE_WORDS] }
+        } else {
+            Self::Heap(Vec::with_capacity(words))
+        }
+    }
+
+    fn push4(&mut self, checkpoint: [u32; 4]) {
+        match self {
+            Self::Inline { len, words } if *len + 4 <= SHADE_INLINE_WORDS => {
+                words[*len..*len + 4].copy_from_slice(&checkpoint);
+                *len += 4;
+            }
+            Self::Inline { len, words } => {
+                let mut heap = words[..*len].to_vec();
+                heap.extend_from_slice(&checkpoint);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(heap) => heap.extend_from_slice(&checkpoint),
+        }
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { len, words } => &words[..*len],
+            Self::Heap(heap) => heap,
+        }
+    }
 }
 
 impl PreparedFlatFill {
@@ -95,9 +141,16 @@ impl PreparedFlatFill {
         self.fill
     }
 
+    /// The GO shades: the DDA advances, and the GPU shades each pixel from
+    /// checkpoints (`shade_payload`) or, without them, in closed form.
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn shaded(&self) -> bool {
+        self.final_shade.is_some()
+    }
+
     #[cfg(feature = "wgpu")]
     pub(crate) fn shade_payload(&self) -> Option<&[u32]> {
-        self.shade_payload.as_deref()
+        self.shade_payload.as_ref().map(ShadePayload::as_slice)
     }
 
     /// Complete an accepted GO, including a supported no-op.
@@ -194,27 +247,34 @@ pub(crate) fn prepare_resident_flat_fill(
     } else {
         None
     };
+    // Clipping, masks and patterns do not touch the DDA: it steps once for
+    // every pixel the walk visits.
     let (shade_payload, final_shade) = if mode.shade() != 0 {
         let mut shade = ShadeDda::from_context(context);
-        let payload_words = walk
-            .visits
-            .checked_add(31)
-            .and_then(|pixels| pixels.checked_div(32))
-            .and_then(|checkpoints| checkpoints.checked_mul(4))
-            .ok_or("shade payload length")?;
-        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
-            return Err("shade payload length");
-        }
-        let mut payload = fill.map(|_| Vec::with_capacity(payload_words as usize));
-        for index in 0..walk.visits {
-            if index & 31 == 0 {
-                if let Some(payload) = payload.as_mut() {
-                    payload.extend_from_slice(&shade.components());
-                }
+        if fill.is_none() || shade.is_linear() {
+            // The GPU shades each pixel from the slot's start values.
+            shade.advance_by(walk.visits);
+            (None, Some(shade))
+        } else {
+            // No closed form: the GPU steps from a checkpoint every 32 pixels.
+            let payload_words = walk
+                .visits
+                .checked_add(31)
+                .and_then(|pixels| pixels.checked_div(32))
+                .and_then(|checkpoints| checkpoints.checked_mul(4))
+                .ok_or("shade payload length")?;
+            if payload_words > RESIDENT_PAYLOAD_WORDS {
+                return Err("shade payload length");
             }
-            shade.advance();
+            let mut payload = ShadePayload::with_capacity(payload_words as usize);
+            for index in 0..walk.visits {
+                if index & 31 == 0 {
+                    payload.push4(shade.components());
+                }
+                shade.advance();
+            }
+            (Some(payload), Some(shade))
         }
-        (payload, Some(shade))
     } else {
         (None, None)
     };
@@ -453,11 +513,11 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
             return Err("shade payload length");
         }
-        let mut payload = fill.map(|_| Vec::with_capacity(payload_words as usize));
+        let mut payload = fill.map(|_| ShadePayload::with_capacity(payload_words as usize));
         for index in 0..pattern_advances {
             if index & 31 == 0 {
                 if let Some(payload) = payload.as_mut() {
-                    payload.extend_from_slice(&shade.components());
+                    payload.push4(shade.components());
                 }
             }
             shade.advance();
