@@ -935,7 +935,8 @@ fn gl_clear_and_flat_triangle() {
     let g = &live_gr2(Gr2Variant::Xz);
     glprim_triangle(g, false);
     let px = |x: i32, y: i32| g.vram()[((660 + y) as usize) * FB_W + (64 + x) as usize] & 0xff_ffff;
-    let pink = 0xff | (0x80 << 8) | (0xbf << 16);
+    // 0.75 is 192: the GE takes min(255, floor(v * 256)) (real Indy XZ).
+    let pink = 0xff | (0x80 << 8) | (0xc0 << 16);
     assert_eq!(px(0, 0), pink, "clear fills the window");
     assert_eq!(px(399, 299), pink);
     assert_eq!(g.vram()[659 * FB_W + 64] & 0xff_ffff, 0, "below the window untouched");
@@ -1087,7 +1088,7 @@ fn gl_rgb12_double_buffer() {
     cmd(g, 0x104, fl(1.0));
     for v in [0.5f32, 0.75, 1.0] { data(g, fl(v)); }
     g.wait_idle();
-    let pink12 = 0xf | (0x8 << 4) | (0xb << 8);
+    let pink12 = 0xf | (0x8 << 4) | (0xc << 8); // 0.75 -> 192 -> 0xc
     assert_eq!(gl_px(g, 10, 10), pink12 << 12, "clear goes to buffer 1 only");
     cmd(g, 0x1e7, 1); // swap: state 1, back = buffer 0
     gl_ccw_triangle_ub(g);
@@ -1566,7 +1567,8 @@ fn gl_stencil_mask_quad() {
     cmd(g, 0x00f, 0);
     for _ in 0..6 { data(g, 0); }
     g.wait_idle();
-    let pink = 0xff | (0x80 << 8) | (0xbf << 16);
+    // 0.75 is 192: the GE takes min(255, floor(v * 256)) (real Indy XZ).
+    let pink = 0xff | (0x80 << 8) | (0xc0 << 16);
     assert_eq!(gl_px(g, 200, 120), 0xff << 16, "inside the stencilled triangle: blue");
     assert_eq!(gl_px(g, 20, 20), pink, "outside: stencil 0, quad rejected");
     assert_eq!(gl_px(g, 380, 280), pink);
@@ -1847,9 +1849,11 @@ fn iris_glyph16_at_cmov() {
     gl_setup_window(g);
     let fl = |v: f32| v.to_bits();
     for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
-    cmd(g, 0x6913, 0x0000_00ff);
+    cmd(g, 0x6913, 0x00ff_0000);
     for x in [40.0f32, 50.0, 0.0] { cmd(g, 0x866, fl(x)); }
-    cmd(g, 0x6913, 0x00ff_0000); // after cmov: glyphs keep the cmov colour
+    // After cmov: charstr draws in the colour current when it runs, not the
+    // one at the cmov (SOFTIMAGE sets its button label colour here).
+    cmd(g, 0x6913, 0x0000_00ff);
     // 3 rows (odd: padding first): top 0x8000, middle 0x4000, bottom 0xc000.
     let glyph = [0x0002_0003, 0x0000_0000, 0x0005_0000, 0xffff_0000, 0x8000_dead, 0xc000_4000, 0, 0, 0, 0, 0, 0, 0];
     for _ in 0..2 {
@@ -2126,9 +2130,10 @@ fn gl_polygon_clipped_by_several_planes() {
     assert_eq!(gl_px(g, 200, 250), 0, "sky");
 }
 
-/// A smooth-shaded quad is one primitive: colours interpolate along the
-/// edges and across each row (Gouraud). Flat shading uses the provoking
-/// vertex: the first one for polygons.
+/// A smooth-shaded quad is drawn as a fan of two triangles from its first
+/// vertex, as a real Indy XZ shows it: the centre lies on the v0-v2
+/// diagonal and takes the average of those two corners. Flat shading uses
+/// the provoking vertex: the first one for polygons.
 #[test]
 fn gl_quad_gouraud_and_flat_provoking() {
     let g = &live_gr2(Gr2Variant::Xz);
@@ -2148,10 +2153,11 @@ fn gl_quad_gouraud_and_flat_provoking() {
     g.wait_idle();
     let px = gl_px(g, 200, 150);
     let (r, gg, b) = (px & 0xff, (px >> 8) & 0xff, px >> 16);
-    // Centre = average of the four corners: (0.5, 0.5, 0.5).
-    for c in [r, gg, b] {
+    // Centre = average of v0 (red) and v2 (blue): (0.5, 0, 0.5).
+    for c in [r, b] {
         assert!((120..=136).contains(&c), "centre {px:#08x}");
     }
+    assert!(gg <= 4, "centre {px:#08x}: green comes from v1 and v3 only");
     assert!(gl_px(g, 101, 100) & 0xff >= 250, "near the red corner");
 
     cmd(g, 0x013, 0); // flat: polygon provoking vertex = first

@@ -111,14 +111,14 @@ struct Record {
     barcode: &'static str,
     part: &'static str,
     revision: &'static str,
-    name: &'static str,
+    name: std::borrow::Cow<'static, str>,
     serial: u64,
 }
 
 impl Record {
     fn part(&self) -> w1::Ds2505 {
         board_record_part(
-            &BoardRecord { barcode: self.barcode, part: self.part, revision: self.revision, name: self.name },
+            &BoardRecord { barcode: self.barcode, part: self.part, revision: self.revision, name: &self.name },
             self.serial,
         )
     }
@@ -144,73 +144,77 @@ struct Identity {
 }
 
 impl Identity {
-    /// The Octane. A PM10 has one processor and a PM20 two, and the PROM's
-    /// diagnostics hold the record to the processors HEART reports.
-    fn octane(cpus: u8) -> Identity {
+    /// The processor module for the configured processor and processor
+    /// count, whichever chassis it sits in. A PM10 carries one processor and a
+    /// PM20 two; the PROM's power-on test holds the name's prefix to the
+    /// processors HEART reports. The R10000 module is the original Octane's
+    /// (PM10/PM20). Later modules carry their clock in the name, from two
+    /// reference Octane2s: a single 360 MHz R12000 is PM10360MHZ,
+    /// 030-1590-002 rev B; two 600 MHz R14000s are PM20600MHZ, 030-1778-001
+    /// rev C. Other counts and clocks keep their family's part number
+    /// (approximation: no inventory of them is at hand).
+    fn processor_module(part: &Part, cpus: u8) -> Record {
+        let count = if cpus > 1 { "PM20" } else { "PM10" };
+        let (part_no, revision, name) = match part.family {
+            parts::Family::R10000 => ("030-0888-004", "B", std::borrow::Cow::Borrowed(count)),
+            parts::Family::R14000 => ("030-1778-001", "C", format!("{count}{}MHZ", part.mhz).into()),
+            _ => ("030-1590-002", "B", format!("{count}{}MHZ", part.mhz).into()),
+        };
+        Record { barcode: "EMUU00", part: part_no, revision, name, serial: 0x5145_4d55_5500 }
+    }
+
+    /// The Octane's chassis records, from its inventory, around `processor`.
+    fn octane(processor: Record) -> Identity {
         Identity {
-            processor: Record {
-                barcode: "EMUU00",
-                part: "030-0888-004",
-                revision: "B",
-                name: if cpus > 1 { "PM20" } else { "PM10" },
-                serial: 0x5145_4d55_5500,
-            },
+            processor,
             system_board: Record {
                 barcode: "EMUN00",
                 part: "030-0887-003",
                 revision: "F",
-                name: "IP30",
+                name: "IP30".into(),
                 serial: 0x5145_4d55_4e00,
             },
             front_plane: Record {
                 barcode: "EMUF00",
                 part: "030-0891-003",
                 revision: "A",
-                name: "FP1",
+                name: "FP1".into(),
                 serial: 0x5145_4d55_4600,
             },
             power_supply: Record {
                 barcode: "EMUS00",
                 part: "060-0028-003",
                 revision: "A",
-                name: "PWR.SPPLY.SR",
+                name: "PWR.SPPLY.SR".into(),
                 serial: 0x5145_4d55_5300,
             },
         }
     }
 
-    /// The Octane2, from one reference unit's inventory. The processor
-    /// module is that unit's single-processor 360 MHz one, for any processor
-    /// count: no inventory of a dual-processor Octane2 is at hand
-    /// (approximation).
-    fn octane2() -> Identity {
+    /// The Octane2's chassis records, from one reference unit's inventory,
+    /// around `processor`.
+    fn octane2(processor: Record) -> Identity {
         Identity {
-            processor: Record {
-                barcode: "EMUU00",
-                part: "030-1590-002",
-                revision: "B",
-                name: "PM10360MHZ",
-                serial: 0x5145_4d55_5500,
-            },
+            processor,
             system_board: Record {
                 barcode: "EMUN00",
                 part: "030-1467-001",
                 revision: "B",
-                name: "IP30",
+                name: "IP30".into(),
                 serial: 0x5145_4d55_4e00,
             },
             front_plane: Record {
                 barcode: "EMUF00",
                 part: "030-0891-003",
                 revision: "H",
-                name: "FP1",
+                name: "FP1".into(),
                 serial: 0x5145_4d55_4600,
             },
             power_supply: Record {
                 barcode: "EMUS00",
                 part: "060-0035-002",
                 revision: "A",
-                name: "PWR.SPPLY.ER",
+                name: "PWR.SPPLY.ER".into(),
                 serial: 0x5145_4d55_5300,
             },
         }
@@ -272,7 +276,8 @@ pub struct OctaneMachine {
     frames: Option<Arc<std::sync::atomic::AtomicU64>>,
     scratch_path: Option<std::path::PathBuf>,
     nvram_path: String,
-    event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
+    events: crate::traits::MachineEvents,
+    event_rx: Option<crate::traits::MachineEventQueue>,
     controller_slot: Option<MachineSlot>,
     lifecycle: crate::machine_state::GuestState,
     /// The disks as a snapshot records them, to refuse one taken on others.
@@ -322,15 +327,19 @@ impl OctaneMachine {
         let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12)
             || part.family == parts::Family::R14000;
         let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
-        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
+        let (event_tx, event_rx) = crate::traits::MachineEvents::channel(4);
+        let events = event_tx.clone();
         let timer_manager = Arc::new(TimerManager::new());
 
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().clone()));
-        // HEART's MicroLAN holds the processor module's record.
-        let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
+        // HEART's MicroLAN holds the processor module's record. The module
+        // follows the processor settings alone; the chassis records follow
+        // the product.
+        let processor = Identity::processor_module(part, cpu_count);
+        let identity = if octane2 { Identity::octane2(processor) } else { Identity::octane(processor) };
         heart.set_microlan(identity.processor.bus());
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
@@ -500,6 +509,7 @@ impl OctaneMachine {
         // its far end. Weak, so none of these keeps the bus or the Bridge.
         // The window moves under no running CPU but the one that wrote.
         let world = Arc::new(World::new());
+        events.set_cpus(world.clone());
         let weak = Arc::downgrade(&phys);
         let remap_world = world.clone();
         heart.on_memcfg(Box::new(move |m| {
@@ -738,6 +748,7 @@ impl OctaneMachine {
             frames,
             scratch_path,
             nvram_path: cfg.nvram.clone(),
+            events,
             event_rx: Some(event_rx),
             controller_slot: None,
             lifecycle: crate::machine_state::GuestState::Idle,
@@ -929,6 +940,7 @@ impl OctaneMachine {
 
     /// Every device as at power-on, with the machine stopped.
     fn power_on_all(&self) {
+        self.events.powered_on();
         for c in &self.cpus {
             Resettable::power_on(&**c);
         }
@@ -1683,30 +1695,37 @@ mod tests {
     /// supply; HEART's and the Bridge's hold one record each.
     #[test]
     fn each_product_carries_its_own_identity_records() {
-        let o = Identity::octane(1);
-        let o2 = Identity::octane2();
+        let o = Identity::octane(Identity::processor_module(&parts::R10000_195, 1));
+        let o2 = Identity::octane2(Identity::processor_module(&parts::R12000_360, 1));
         let key = |i: &Identity| {
-            [&i.processor, &i.system_board, &i.front_plane, &i.power_supply].map(|r| (r.part, r.revision, r.name))
+            [&i.processor, &i.system_board, &i.front_plane, &i.power_supply].map(|r| (r.part, r.revision, r.name.to_string()))
         };
         assert_eq!(
             key(&o),
             [
-                ("030-0888-004", "B", "PM10"),
-                ("030-0887-003", "F", "IP30"),
-                ("030-0891-003", "A", "FP1"),
-                ("060-0028-003", "A", "PWR.SPPLY.SR"),
+                ("030-0888-004", "B", "PM10".into()),
+                ("030-0887-003", "F", "IP30".into()),
+                ("030-0891-003", "A", "FP1".into()),
+                ("060-0028-003", "A", "PWR.SPPLY.SR".into()),
             ]
         );
         assert_eq!(
             key(&o2),
             [
-                ("030-1590-002", "B", "PM10360MHZ"),
-                ("030-1467-001", "B", "IP30"),
-                ("030-0891-003", "H", "FP1"),
-                ("060-0035-002", "A", "PWR.SPPLY.ER"),
+                ("030-1590-002", "B", "PM10360MHZ".into()),
+                ("030-1467-001", "B", "IP30".into()),
+                ("030-0891-003", "H", "FP1".into()),
+                ("060-0035-002", "A", "PWR.SPPLY.ER".into()),
             ]
         );
-        assert_eq!(Identity::octane(2).processor.name, "PM20", "a dual-processor Octane's module");
+        // The module follows the processor settings, never the graphics board.
+        let module = |p: &Part, n: u8| Identity::processor_module(p, n).name.to_string();
+        assert_eq!(module(&parts::R10000_195, 2), "PM20", "two R10000s");
+        assert_eq!(module(&parts::R12000_360, 2), "PM20360MHZ", "two 360 MHz R12000s");
+        assert_eq!(module(&parts::R14000_600, 1), "PM10600MHZ", "one 600 MHz R14000");
+        // octopus, a real dual 600 MHz R14000 Octane2.
+        let r14k = Identity::processor_module(&parts::R14000_600, 2);
+        assert_eq!((r14k.part, r14k.revision, &*r14k.name), ("030-1778-001", "C", "PM20600MHZ"));
         let families = |bus: &w1::Bus| {
             let mut f: Vec<u8> = bus.roms().iter().map(|rom| rom[0]).collect();
             f.sort();
@@ -2162,6 +2181,29 @@ mod snapshot_tests {
     #[test]
     fn a_fibre_channel_card_is_attached_in_a_cage_slot() {
         fibre_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2));
+    }
+
+    /// HEART's software reset asked for before a restore belongs to the
+    /// machine the restore replaced: the event thread must not act on it.
+    #[test]
+    fn a_restore_drops_a_reset_the_guest_asked_for_before_it() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("restore-reset");
+            let prom = empty_prom(&dir);
+            let mut m = machine(&prom, &dir);
+            m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
+            let queue = m.event_rx.take().unwrap();
+            queue.listen();
+            assert!(m.heart.piu_write(0, 8, 0));
+            assert!(m.heart.piu_write(0, 8, 1 << 22));
+            let (sent, event) = queue.recv().unwrap();
+            assert!(matches!(event, MachineEvent::HardReset) && queue.is_current(sent));
+            assert_ne!(m.cpus[0].park_slot().holds() & crate::cpu::smp::HOLD_RESET, 0, "the CPU stops at the request");
+            m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert!(!queue.is_current(sent), "the restore replaced the machine that asked");
+            assert_eq!(m.cpus[0].park_slot().holds() & crate::cpu::smp::HOLD_RESET, 0, "and lets the CPU go");
+            m.stop();
+        }).unwrap().join().unwrap();
     }
 
     /// An empty PROM in place of the stock one, so these run anywhere.

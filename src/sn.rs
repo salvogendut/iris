@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use crate::net::NatControl;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use crate::traits::MachineEventQueue;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -772,7 +772,8 @@ pub struct Machine<C: Device + Resettable + 'static, F: Device + Resettable + 's
     ci: bool,
     nvram: String,
     nat: Option<Nat>,
-    events: Option<Receiver<MachineEvent>>,
+    pub(crate) events: Option<MachineEventQueue>,
+    resets: crate::traits::MachineEvents,
     slot: Option<MachineSlot>,
     lifecycle: GuestState,
 }
@@ -789,7 +790,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
         io: BoardIo,
         memory: Vec<Arc<dyn Device>>,
         timers: Arc<TimerManager>,
-        events: Receiver<MachineEvent>,
+        (resets, events): (crate::traits::MachineEvents, MachineEventQueue),
         release: fn(&C),
     ) -> Result<Self, String> {
         let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
@@ -845,6 +846,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
             nvram: cfg.nvram.clone(),
             nat,
             events: Some(events),
+            resets,
             slot: None,
             lifecycle: GuestState::Idle,
         })
@@ -905,6 +907,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
     }
     fn reset(&mut self) {
         self.stop();
+        self.resets.powered_on();
         for c in self.cpus() {
             c.power_on();
         }

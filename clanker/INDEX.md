@@ -107,6 +107,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [read-status-in-registers.md](jitv2/read-status-in-registers.md) | rule | JIT memory hooks return status in registers, never memory |
 | [retry-bail-in-delay-slot-must-arm-the-branch.md](jitv2/retry-bail-in-delay-slot-must-arm-the-branch.md) | rule | A retry bail out of an inlined delay slot must arm the branch |
 | [smc-writes-to-executing-page.md](jitv2/smc-writes-to-executing-page.md) | design | Self-modifying writes onto the page being executed (`jitv2_smc_check`) |
+| [hot-lane-under-a-full-queue.md](jitv2/hot-lane-under-a-full-queue.md) | rule | The hot lane must work while the compile FIFO is full: keep the count across a dropped push, a short lane, a refused promotion re-arms its page |
 | [sync-compile-gates-on-hot.md](jitv2/sync-compile-gates-on-hot.md) | rule | Sync compile gates a page with code on the pool's hot count, and never sets `page_scheduled` |
 | [unsupported-instructions.md](jitv2/unsupported-instructions.md) | design | JIT v2 instruction coverage and interpreter boundaries |
 | [what-actually-blocks-gpr-forwarding.md](jitv2/what-actually-blocks-gpr-forwarding.md) | measure | What actually blocks GPR store-to-load forwarding (and what doesn't) |
@@ -146,6 +147,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [o2-wide-pci-must-not-alias-ram.md](devices/o2-wide-pci-must-not-alias-ram.md) | rule | O2 N64 PCI register accesses corrupted exception vectors; preserve MACE wide windows before RAM folding |
 | [mc-decodes-32-physical-bits.md](devices/mc-decodes-32-physical-bits.md) | rule | Indy/Indigo2 decode 32 physical bits; O2 wide PCI is an exception; IRIX PTE software bits reach PA[35:32]; fold with `MipsExecutor::phys_mask`, never decode them |
 | [extended-ram-memcfg.md](devices/extended-ram-memcfg.md) | rule | Extended RAM — MEMCFG synthesis for himem banks |
+| [ip28-sysclk-divisor-is-four.md](devices/ip28-sysclk-divisor-is-four.md) | rule | IP28 Config.EC is 7 (SysClk = CPU/4) and the MC counts at that clock; EC 0 made the PROM's CTRLD 0x2F9B and IRIX warned of an old PROM every boot; healthy `mc regs` CTRLD history |
 | [hpc3-arming-wakes-the-dma-peripheral.md](devices/hpc3-arming-wakes-the-dma-peripheral.md) | rule | HPC3 arming wakes the DMA peripheral; device threads do not poll for it |
 | [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | history | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
@@ -285,6 +287,8 @@ GR2 (XZ/Extreme): HQ2 HLE, GL state, FIN handshakes, the RE3 span JIT. Hardware 
 |---|---|---|
 | [DESIGN.md](gr2/DESIGN.md) | design | GR2 design |
 | [video-timing-from-vc1-tables.md](gr2/video-timing-from-vc1-tables.md) | rule | GR2 refresh rate: the VC1 frame and line-state table formats (units of five clocks), two known clocks; PROM-checked only. Also the O2's totals and dot clock |
+| [real-xz-comparison.md](gr2/real-xz-comparison.md) | open | Real Indy XZ vs emulated, same suites: fixed colour floor(v*256), quad fan, 4 GE; open EXP2 fog, local spot, X XYBitmap / 4-bit TrueColor / overlay XReadDisplay; glx-window-life kills Xsgi (piglit X restart hook); running on a real machine |
+| [vdma-timeout-and-tracing.md](gr2/vdma-timeout-and-tracing.md) | rule | IRIX's VDMA wait is 500 000 DELAY(1) polls (a few hundred ms host); full GR2 tracing slows GEDMA DMA past it (VDMA TIMEOUT, board reset, kernel fault); measure untraced with `mc vdma on`; GIO32 path translates per page |
 | [bringup.md](gr2/bringup.md) | howto | GR2 bring-up: emulator-side gotchas |
 | [cx-save-must-wait-for-hq.md](gr2/cx-save-must-wait-for-hq.md) | rule | Context save: GEDMA reads must wait for the queued 0x1E1 |
 | [8-bit-blits-cost-the-sync-not-the-path.md](gr2/8-bit-blits-cost-the-sync-not-the-path.md) | measure | XZ 8-bit frames: XShm and glDrawPixels are the same GEDMA; per-frame sync is the cost; never use glPixelZoom |

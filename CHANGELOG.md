@@ -47,6 +47,38 @@ hashes are given where a change is easiest to understand by reading the commit.
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
 
+### IMPACT texturing
+
+- Two textured GL programs no longer overwrite each other's textures on
+  IMPACT (seen on Indigo2): buttonfly's buttons stay intact while a demo
+  it launched runs (issue 844).
+- Sphere-mapped models that never set a texture coordinate (powerflip's
+  Flowers models) now show their texture instead of drawing white.
+
+### Indigo2
+
+- IRIX on the R10000 Indigo2 no longer warns "Old IP28 prom installed --
+  memory refresh was incorrectly configured" at every boot, and the PROM's
+  `system` command shows a SysAD divisor of 4 instead of "?".
+- Indigo2s now have an EISA bus with every slot empty: `hinv` lists
+  "EISA bus: adapter 0". Indigo2s no longer show a VINO (an Indy-only chip).
+- `mc regs` lists the last 16 values written to CTRLD.
+
+### GR2 (XZ and Extreme)
+
+- IRIS GL text drawn with a colour set after `cmov` now shows: SOFTIMAGE
+  2.66's dialog buttons and viewport titles were blank (issue 844).
+- Pixel DMA to XZ and Extreme boards runs about five times faster (an
+  image upload of 130 KB now takes about 5 ms). Slow uploads could outlast
+  IRIX's DMA timeout, and the kernel then reset the board or panicked (seen
+  with SOFTIMAGE while tracing).
+- An Indy's XZ now has 4 geometry engines, as on hardware: OpenGL reports
+  it as GR3-Elan, as a real Indy does. Indigo2 gains `board = "elan"` (4
+  engines) next to `xz` (2).
+- GL clears and flat colours on XZ now match a real Indy XZ exactly (they
+  were often one step off), and smooth-shaded quads, quad strips and
+  polygons shade along the same diagonal as the hardware.
+
 ### Newport on the GPU raster
 
 - Scrolling and other large screen-to-screen copies no longer stall the
@@ -66,6 +98,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   drawing no longer turns into black and white stripes on Indy and Indigo2
   Newport. SideFX PRISMS's "smooth" and "facet" views now draw correctly
   (issue #798).
+
+### jitv2 compile order
+
+- Under jitv2, code that turns hot while the compile workers are behind is
+  compiled first. On a one-CPU Octane a program started just after login ran
+  interpreted for 4 to 12 seconds; it now compiles within half a second.
 
 ### jitv2 interrupts
 
@@ -141,6 +179,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 - virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
   the SuperIO interrupt pin: Linux's serial console no longer dies when
   virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
+- A dual-processor Octane with V10 or V12 graphics passes the PROM's power-on
+  test: the processor module record now follows `cpu` and `cpus`, not the
+  graphics board (`PM20360MHZ` for two 360 MHz R12000s).
 ### PCI-to-PCI bridges
 
 - The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes

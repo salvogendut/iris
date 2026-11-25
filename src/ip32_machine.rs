@@ -127,8 +127,8 @@ pub struct O2Machine {
     /// Guest frames the network backend has processed.
     frames: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// The guest switching the machine off, for the machine-events thread.
-    events: std::sync::mpsc::SyncSender<MachineEvent>,
-    event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
+    events: crate::traits::MachineEvents,
+    event_rx: Option<crate::traits::MachineEventQueue>,
     /// Set once that thread runs; until then the service loop exits the
     /// process itself on a power-off, as it always has.
     controller_up: Arc<AtomicBool>,
@@ -359,7 +359,7 @@ impl O2Machine {
         }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
 
-        let (events, event_rx) = std::sync::mpsc::sync_channel(4);
+        let (events, event_rx) = crate::traits::MachineEvents::channel(4);
         // A snapshot's disks by slot (controller * 16 + id) and size.
         let disks: Vec<crate::snapshot::DiskRef> = attached.tables.iter()
             .filter(|t| !t.is_cdrom)
@@ -497,7 +497,7 @@ impl O2Machine {
         cpu: Arc<dyn CpuDevice>,
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
-        (events, controller_up): (std::sync::mpsc::SyncSender<MachineEvent>, Arc<AtomicBool>),
+        (events, controller_up): (crate::traits::MachineEvents, Arc<AtomicBool>),
     ) {
         let dev = cpu.clone().as_device();
         // The PROM's environment lives in its flash: save it once the guest
@@ -1030,10 +1030,11 @@ impl O2Display {
 
 impl crate::display::Head for O2Display {
     /// GBE scans RAM the CPU and the rendering engine write with no mark
-    /// the display could test, so every frame is looked at: the scan-out
-    /// finds what changed (`compose` answers `Unchanged` when nothing did).
+    /// the display could test, so every frame is looked at while someone
+    /// watches: the scan-out finds what changed (`compose` answers
+    /// `Unchanged` when nothing did). Headless, nothing would see it.
     fn changed(&self) -> bool {
-        true
+        self.head.watched()
     }
 
     /// The frame rate is the guest's: GBE's frame size at its dot clock.

@@ -8,7 +8,7 @@ use std::thread;
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig, ScsiDeviceConfig};
 use crate::machine_state::GuestState;
-use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent, MachineFatal};
+use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEventQueue, MachineEvents, MachineFatal};
 use crate::locks::LockMonitor;
 use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::physical::Physical;
@@ -26,6 +26,9 @@ pub const CPUS: &[&Part] = &[&parts::R4400_150, &parts::R5000_180_EARLY];
 
 /// The IP28's.
 pub const IP28_CPUS: &[&Part] = &[&parts::R10000_195_EARLY];
+/// The IP28's SysClk divisor as R10000 Config.EC encodes it, and its value.
+const IP28_SYSCLK_EC: u32 = 7;
+const IP28_SYSCLK_DIV: u64 = 4;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
@@ -120,8 +123,8 @@ pub struct Machine {
     /// TCP port the monitor serves on 127.0.0.1 (`cfg.monitor_port`).
     monitor_port: u16,
     /// Sender for async machine events (HardReset, PowerOff) from devices.
-    pub event_tx: mpsc::SyncSender<MachineEvent>,
-    event_rx: Option<mpsc::Receiver<MachineEvent>>,
+    pub event_tx: MachineEvents,
+    event_rx: Option<MachineEventQueue>,
     /// Reliable, unbounded terminal-device-fault path.
     fatal_rx: Option<mpsc::Receiver<MachineFatal>>,
     /// First terminal device failure. A failed machine cannot restart.
@@ -456,14 +459,20 @@ impl Machine {
         // IP28: IRIX takes the CPU speed from the PROM's `cpufreq` (194, i.e.
         // a 195 MHz R10000) instead of measuring it, and times with it: UST
         // assumes Count at half that, and the RPSS cycle counter the MC clock
-        // at the CPU clock (Config.EC is 0, a 1:1 system-clock ratio) over the
+        // at the CPU clock over the Config.EC system-clock divisor and the
         // divider it programs. The generic 33 MHz Count and 50 MHz MC made
         // UST run at a third of real time (Quake in slow motion) and the
         // cycle counter at a quarter.
+        //
+        // The board runs SysAD, and so the MC, at a quarter of the CPU clock
+        // (EC 7, 195 / 4 = 48.75 MHz). The PROM and IRIX also size the MC
+        // refresh preload (CTRLD) from EC; with EC 0, which the PROM's
+        // `system` command prints as "?", it came out four times too long and
+        // IRIX warned of an old PROM on every boot.
         let count_hz = cfg.clock.count_hz(cfg_cpu_model);
         if cfg.machine.profile.ip28() {
             // The R10000's Count ticks at half the pipeline clock.
-            mc.set_clock_hz(2 * count_hz);
+            mc.set_clock_hz(2 * count_hz / IP28_SYSCLK_DIV);
         }
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
@@ -707,9 +716,17 @@ impl Machine {
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
-            crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
+            crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Elan | crate::config::GraphicsBoard::Extreme => {
+                use crate::config::GraphicsBoard;
                 use crate::dev::gr2::{Gr2, Gr2Variant};
-                let variant = if cfg.graphics_board() == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
+                // The Indy's XZ has 4 GE7s (libGLcore calls it GR3-Elan);
+                // the Indigo2 sold XZ with 2 and Elan with 4.
+                let variant = match cfg.graphics_board() {
+                    GraphicsBoard::Extreme => Gr2Variant::Extreme,
+                    GraphicsBoard::Elan => Gr2Variant::Elan,
+                    _ if guinness => Gr2Variant::Elan,
+                    _ => Gr2Variant::Xz,
+                };
                 let g = Gr2::new(variant, status.clone());
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
@@ -843,6 +860,7 @@ impl Machine {
             virtio,
             virtio_9p,
             vino,
+            eisa: (!guinness).then(|| Arc::new(crate::dev::eisa::Eisa::new())),
             mc: mc.clone(),
             hpc3: hpc3.clone(),
             prom: prom_port,
@@ -918,6 +936,7 @@ impl Machine {
         //    family monomorphises its own CPU (`crate::cpu::build`) — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
+        let cfg_ip28 = cfg.machine.profile.ip28();
         macro_rules! build_cpu { ($cache:ty) => {{
         let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone()).with_prid(cfg_cpu_model.prid())
             .with_sgiemu_optimizations(cfg.perf.sgiemu_optimizations);
@@ -925,6 +944,11 @@ impl Machine {
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
         executor.phys_mask = u32::MAX as u64;
+        if cfg_ip28 {
+            // R10000 Config.EC (bits 12:9), the SysClk divisor the mode
+            // word latches at reset: 7 is divide by 4.
+            executor.core.cp0_config |= IP28_SYSCLK_EC << 9;
+        }
 
         // Load default symbol maps if they exist
         {
@@ -1089,9 +1113,10 @@ impl Machine {
             unsafe { (*monitor_ptr).register_device(Arc::new(LockMonitor)); }
         }
 
-        let (event_tx, event_rx) = mpsc::sync_channel::<MachineEvent>(4);
+        let (event_tx, event_rx) = MachineEvents::channel(4);
 
         // Give MC and IOC async event senders so they can request hard-reset / power-off.
+        event_tx.set_cpus(world.clone());
         mc.set_event_sender(event_tx.clone());
         ioc.set_event_sender(event_tx.clone());
 
@@ -1896,6 +1921,7 @@ impl Machine {
     /// stayed unresponsive after every `jitcheck` for no reason).
     pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
         self.stop();
+        self.event_tx.powered_on();
         #[cfg(feature = "wgpu")]
         self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
         #[cfg(feature = "wgpu")]
@@ -1968,6 +1994,7 @@ impl Machine {
     /// Helper to power-on reset all devices.
     /// Must be called with threads stopped.
     fn power_on_devices(&mut self) {
+        self.event_tx.powered_on();
         self.cpu.power_on();
         self.board.phys.reset_memory();
         self.mc.power_on();
@@ -2768,6 +2795,31 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// A reset, or a restore of a live checkpoint, replaces the machine that
+    /// asked for the hard resets still queued: the event thread drops them.
+    #[test]
+    fn a_reset_or_restore_makes_a_queued_reset_stale() {
+        let nv = TempPath::dir("indy-stale-events");
+        let mut machine = build_machine(&nv);
+        let queue = machine.event_rx.take().unwrap();
+        queue.listen();
+        let send = |m: &Machine| {
+            m.event_tx.try_send(crate::traits::MachineEvent::HardReset).unwrap();
+            queue.recv().unwrap().0
+        };
+        let sent = send(&machine);
+        assert!(queue.is_current(sent));
+        assert_eq!(machine.cpu.park_slot().holds(), crate::cpu::smp::HOLD_RESET, "the CPU stops at the request");
+        machine.reset();
+        assert!(!queue.is_current(sent), "a reset");
+        assert_eq!(machine.cpu.park_slot().holds(), 0, "and lets the CPU go");
+        let sent = send(&machine);
+        let live = machine.capture_live_checkpoint();
+        machine.restore_live_checkpoint(&live).unwrap();
+        assert!(!queue.is_current(sent), "a restore");
+        machine.stop();
     }
 
     /// The Indy's console log adds to an existing file, and starts it over
