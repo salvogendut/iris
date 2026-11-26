@@ -232,6 +232,10 @@ pub const HPC3_PDMA_CHAN_SCSI1: u32 = 9;
 pub const HPC3_PDMA_CHAN_ENET_RX: u32 = 10;
 pub const HPC3_PDMA_CHAN_ENET_TX: u32 = 11;
 
+// Channel 0 configuration used for packed stereo playback by haltwo(4)
+// and Linux snd-hal2. The SGI PROM instead programs word-strided audio.
+const HAL2_PACKED_PLAYBACK_CFG: u32 = 0x0820_8844;
+
 // PBUS DMA Config
 pub const PBUS_DMACFG_DS16: u32      = 1 << 18; // Bit 18: ds_16 — 16-bit device
 pub const PBUS_DMACFG_EVEN_HIGH: u32 = 1 << 19; // Bit 19: even_high — even bytes on high bus (15:8)
@@ -621,7 +625,16 @@ fn start_transaction(&mut self) {
         if !self.is_active() { return None; }
         self.dev_reads += 1;
 
-        // PBUS DMA (channels 0-7) reads 32-bit words; 16-bit samples occupy
+        if self.id == 0 && self.dmacfg == HAL2_PACKED_PLAYBACK_CFG {
+            let addr = self.cbp;
+            let word = self.sys_mem.as_ref()?.read16(addr as u64);
+            if !word.is_ok() { return None; }
+            self.handle_dump(addr, &word.data.to_be_bytes(), true);
+            let sample = if self.endian { word.data.swap_bytes() } else { word.data };
+            return Some((u32::from(sample), self.advance(2, false)));
+        }
+
+        // Other PBUS DMA (channels 0-7) reads 32-bit words; 16-bit samples occupy
         // bits 23:8, while 8-bit transfers use bits 31:24.
         if self.id < 8 {
             let addr = self.cbp;
@@ -2567,6 +2580,42 @@ mod tests {
     /// Bus address of a register in PBUS DMA channel 1 (Codec A).
     fn ch1(off: u32) -> u64 {
         (HPC3_BASE + PBUS_DMA_STRIDE + off) as u64
+    }
+
+    #[test]
+    fn hal2_packed_playback_drains_both_samples_of_a_descriptor() {
+        struct PackedMemory;
+        impl BusDevice for PackedMemory {
+            fn read32(&self, addr: u64) -> BusRead32 {
+                match addr {
+                    0x1000 => BusRead32::ok(0x2000),
+                    0x1004 => BusRead32::ok(0x8000_0004),
+                    0x1008 => BusRead32::ok(0),
+                    _ => BusRead32::err(),
+                }
+            }
+            fn read16(&self, addr: u64) -> BusRead16 {
+                match addr {
+                    0x2000 => BusRead16::ok(0x8123),
+                    0x2002 => BusRead16::ok(0x4567),
+                    _ => BusRead16::err(),
+                }
+            }
+        }
+        let hpc = hpc3_for_test();
+        hpc.pdma_channels[0].lock().sys_mem = Some(Arc::new(PackedMemory));
+        let base = HPC3_BASE as u64;
+        hpc.write32(base + PBUS_CFGDMA_BASE as u64, HAL2_PACKED_PLAYBACK_CFG);
+        hpc.write32(base + PBUS_DMA_DP as u64, 0x1000);
+        hpc.write32(base + PBUS_DMA_CTRL as u64, PDMA_CTRL_CH_ACT | PDMA_CTRL_CH_ACT_LD);
+        let mut ch = hpc.pdma_channels[0].lock();
+        for expected in [0x8123, 0x4567] {
+            let (sample, status) = ch.dma_read().expect("packed HAL2 sample");
+            assert_eq!(sample, expected);
+            assert!(!status.refused());
+        }
+        assert_eq!(ch.cbp, 0x2004);
+        assert!(!ch.is_active());
     }
 
     #[test]

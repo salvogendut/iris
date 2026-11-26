@@ -201,7 +201,7 @@ Value | Mode   | Channels consumed per sample period | Notes
 
 ## Audio Sample Format
 
-HAL2 DMA transfers 32-bit words.  The audio data is **24-bit signed PCM, left-justified**:
+The SGI PROM uses one 32-bit DMA word per sample.  The audio data is **24-bit signed PCM, left-justified**:
 
 ```
  31          8 7        0
@@ -209,6 +209,8 @@ HAL2 DMA transfers 32-bit words.  The audio data is **24-bit signed PCM, left-ju
 ```
 
 In the diagnostics this is constructed as `sintab_value << 8`.
+NetBSD and Linux program PBUS DMA channel 0 with `0x08208844` and send packed big-endian signed stereo samples. Each transfer in this configuration consumes two bytes.
+
 The HPC3 PDMA layer on the Indy delivers **16-bit values** to the HAL2 (it strips the
 low 8 padding bits in 16-bit PBUS mode), so the emulator's `DmaClient::read()`
 returns `(word >> 8) as u16`, ready for use as `i16`. In 8-bit PBUS mode it
