@@ -1342,6 +1342,9 @@ impl Hpc3 {
         // The interrupt status, and its lines: each SCSI PDMA channel's
         // completion, each WD33C93A, the SEEQ. Enet channels 10/11 have no
         // DMA completion line: the SEEQ drives the interrupt.
+        // HAL2's playback descriptor interrupts are acknowledged by reading
+        // channel zero's control register on IOC Local 1, bit 4.
+        pdma_channels[0].lock().irq = Some(ioc.irq_line(IocInterrupt::HpcDma));
         let irqs = Arc::new(Hpc3Interrupts {
             state: state.clone(),
             scsi: [ioc.irq_line(IocInterrupt::Scsi0), ioc.irq_line(IocInterrupt::Scsi1)],
@@ -2589,7 +2592,7 @@ mod tests {
             fn read32(&self, addr: u64) -> BusRead32 {
                 match addr {
                     0x1000 => BusRead32::ok(0x2000),
-                    0x1004 => BusRead32::ok(0x8000_0004),
+                    0x1004 => BusRead32::ok(PDMA_DESC_EOX | PDMA_DESC_XIE | 4),
                     0x1008 => BusRead32::ok(0),
                     _ => BusRead32::err(),
                 }
@@ -2616,6 +2619,13 @@ mod tests {
         }
         assert_eq!(ch.cbp, 0x2004);
         assert!(!ch.is_active());
+        drop(ch);
+        let l1 = u64::from(crate::dev::ioc::IOC_BASE + crate::dev::ioc::IOC_INT3_L1_STAT);
+        let irq = crate::dev::ioc::l1_regs::HPC_DMA;
+        assert_ne!(hpc.ioc.read8(l1).data & irq, 0);
+        assert_ne!(hpc.read32(base + PBUS_DMA_CTRL as u64).data & PDMA_CTRL_INT, 0);
+        assert_eq!(hpc.ioc.read8(l1).data & irq, 0);
+        assert_eq!(hpc.read32(base + PBUS_DMA_CTRL as u64).data & PDMA_CTRL_INT, 0);
     }
 
     #[test]

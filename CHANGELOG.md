@@ -15,8 +15,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Xiri and frontend integration
 
-- Indy HAL2 plays the full stereo PCM signal from NetBSD desktop applications.
-
+- Indy HAL2 plays signed stereo PCM from NetBSD desktop applications and interrupts the guest when it is time to refill the playback buffer.
 - NetBSD on R5000 retains its fixed cache-line configuration; 32-bit user
   addresses no longer match unrelated 64-bit kernel TLB entries.
 - N64 NetBSD on O2 reaches a native single-user shell with both SCSI controllers.
