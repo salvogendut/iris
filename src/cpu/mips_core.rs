@@ -1996,8 +1996,8 @@ impl MipsCore {
             );
             self.timer_id = Some(tm.add_one_shot(
                 std::time::Duration::from_nanos(ns),
-                (irq, fasttick, wrap, ticket, seq_ref, cpu),
-                |(irq, fasttick, wrap, ticket, seq_ref, cpu)| {
+                move || {
+                    let irq = &irq; // capture the Send wrapper, not its raw pointer field
                     // SAFETY: points into the MipsCore owned by the executor's
                     // top-level Arc<Mutex<..>>, which outlives the armed timer
                     // (Drop for MipsCore removes it). Same contract as
@@ -2007,11 +2007,11 @@ impl MipsCore {
                     // Compare write since this one-shot was scheduled has
                     // already issued a new ticket, so this claim fails and the
                     // interrupt the guest just acked is not re-asserted.
-                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick, *cpu);
+                    let won = claim_ip7(&seq_ref, ticket, irq_ref, &fasttick, cpu);
                     if !won {
                         return crate::hptimer::TimerReturn::Delete;
                     }
-                    crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
+                    crate::hptimer::TimerReturn::RescheduleOneShot(wrap)
                 },
             ));
         }
@@ -2131,7 +2131,7 @@ impl MipsCore {
         // Materialize past count_now's cycles memo (cycles may not have
         // moved since the last read, but real time has under the wall-clock
         // build; rewinding the memo is harmless under ci_clock), and deliver
-        // a Compare this advance steps over: the one-shot is disabled below
+        // a Compare this advance steps over: the one-shot is removed below
         // and the restart arms the next match from the latched Count, so a
         // deadline the timer thread had not fired yet would otherwise wait
         // a whole Count wrap.
@@ -2139,8 +2139,8 @@ impl MipsCore {
         self.materialize_count(true);
         self.count_read_cycle = self.hot.cycles;
         self.count_paused = true;
-        if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id) {
-            tm.disable(id);
+        if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
+            tm.remove(id);
         }
     }
 
@@ -2522,12 +2522,6 @@ impl MipsCore {
         }
     }
 
-    /// Check if CPU is in kernel mode
-    #[inline]
-    pub fn is_kernel_mode(&self) -> bool {
-        matches!(self.get_privilege_mode(), PrivilegeMode::Kernel)
-    }
-
     /// Check if interrupts are enabled
     pub fn interrupts_enabled(&self) -> bool {
         // IE bit must be set, and not in exception mode (EXL=0, ERL=0)
@@ -2541,12 +2535,14 @@ impl MipsCore {
 
     /// Read FPR as single-precision float
     #[inline]
+    #[cfg(test)]
     pub fn read_fpr_s(&self, reg: u32) -> f32 {
         f32::from_bits(self.fpr[reg as usize] as u32)
     }
 
     /// Write FPR as single-precision float (lower 32 bits)
     #[inline]
+    #[cfg(test)]
     pub fn write_fpr_s(&mut self, reg: u32, value: f32) {
         // Keep upper 32 bits unchanged
         self.fpr[reg as usize] = (self.fpr[reg as usize] & 0xFFFFFFFF_00000000) | (value.to_bits() as u64);
@@ -2879,11 +2875,6 @@ pub enum PrivilegeMode {
 pub const PRIV_KERNEL: u8     = PrivilegeMode::Kernel     as u8;
 pub const PRIV_SUPERVISOR: u8 = PrivilegeMode::Supervisor as u8;
 pub const PRIV_USER: u8       = PrivilegeMode::User       as u8;
-
-impl PrivilegeMode {
-    #[inline]
-    pub const fn as_u8(self) -> u8 { self as u8 }
-}
 
 impl Default for MipsCore {
     fn default() -> Self {

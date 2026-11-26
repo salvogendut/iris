@@ -15,7 +15,7 @@ fn test_precision_one_shot_and_recurring() {
     let recurring_count = Arc::new(AtomicUsize::new(0));
 
     let fired_clone = one_shot_fired.clone();
-    manager.add_one_shot(Duration::from_millis(50), (), move |_| {
+    manager.add_one_shot(Duration::from_millis(50), move || {
         let diff = start.elapsed().as_secs_f64() - 0.050;
         assert!(
             diff.abs() < 0.015,
@@ -30,8 +30,7 @@ fn test_precision_one_shot_and_recurring() {
     manager.add_recurring(
         start + Duration::from_millis(20),
         Duration::from_millis(20),
-        (),
-        move |_| {
+        move || {
             let c = r_count.fetch_add(1, Ordering::SeqCst) + 1;
             let expected = 0.020 * (c as f64);
             let diff = start.elapsed().as_secs_f64() - expected;
@@ -59,7 +58,7 @@ fn test_multiple_overlapping_timers() {
     // Schedule 50 timers to fire at exactly 50ms from now
     for _ in 0..50 {
         let fc = fired_count.clone();
-        manager.add_one_shot(Duration::from_millis(50), (), move |_| {
+        manager.add_one_shot(Duration::from_millis(50), move || {
             let diff = start.elapsed().as_secs_f64() - 0.050;
             // Allow a bit more variance due to loop execution time and lock contention
             assert!(
@@ -86,7 +85,7 @@ fn test_extended_callback_recovery() {
 
     // A timer that runs ONCE and blocks for 50ms, starving others.
     let ltd = long_timer_done.clone();
-    manager.add_one_shot(Duration::from_millis(30), (), move |_| {
+    manager.add_one_shot(Duration::from_millis(30), move || {
         thread::sleep(Duration::from_millis(50));
         ltd.store(true, Ordering::SeqCst);
         TimerReturn::Continue
@@ -97,8 +96,7 @@ fn test_extended_callback_recovery() {
     manager.add_recurring(
         start + Duration::from_millis(10),
         Duration::from_millis(10),
-        (),
-        move |_| {
+        move || {
             str.fetch_add(1, Ordering::SeqCst);
             TimerReturn::Continue
         },
@@ -129,7 +127,7 @@ fn test_rescheduling_timers() {
     // 1. One-shot extending to another one-shot
     let st1 = states.clone();
     let mut step = 0;
-    manager.add_one_shot(Duration::from_millis(20), (), move |_| {
+    manager.add_one_shot(Duration::from_millis(20), move || {
         step += 1;
         let elapsed = start.elapsed().as_millis();
         st1.lock()
@@ -143,42 +141,17 @@ fn test_rescheduling_timers() {
         }
     });
 
-    // 2. One-shot upgrading to recurring
-    let st2 = states.clone();
-    let mut r_step = 0;
-    manager.add_one_shot(Duration::from_millis(40), (), move |_| {
-        r_step += 1;
-        let elapsed = start.elapsed().as_millis();
-        st2.lock()
-            .unwrap()
-            .push(format!("upgraded_{} at ~{}", r_step, elapsed));
-        if r_step == 1 {
-            // Upgrade to 20ms recurring
-            TimerReturn::RescheduleRecurring(Duration::from_millis(20))
-        } else if r_step == 3 {
-            TimerReturn::Delete
-        } else {
-            TimerReturn::Continue
-        }
-    });
-
     thread::sleep(Duration::from_millis(150));
 
     let hist = states.lock().unwrap().clone();
     // Expected rough timings:
     // oneshot_1 at ~20,
-    // oneshot_2 at ~50,
-    // upgraded_1 at ~40,
-    // upgraded_2 at ~60,
-    // upgraded_3 at ~80
+    // oneshot_2 at ~50
 
-    assert_eq!(hist.len(), 5, "Expected 5 total timer executions");
+    assert_eq!(hist.len(), 2, "Expected 2 total timer executions");
 
     assert!(hist.iter().any(|s| s.starts_with("oneshot_1")));
     assert!(hist.iter().any(|s| s.starts_with("oneshot_2")));
-    assert!(hist.iter().any(|s| s.starts_with("upgraded_1")));
-    assert!(hist.iter().any(|s| s.starts_with("upgraded_2")));
-    assert!(hist.iter().any(|s| s.starts_with("upgraded_3")));
 }
 
 #[test]
@@ -199,25 +172,25 @@ fn test_add_remove_multiple_order() {
     let fired_t4 = Arc::new(AtomicBool::new(false));
 
     let f1 = fired_t1.clone();
-    let id1 = manager.add_one_shot(Duration::from_millis(100), (), move |_| {
+    let id1 = manager.add_one_shot(Duration::from_millis(100), move || {
         f1.store(true, Ordering::SeqCst);
         TimerReturn::Continue
     });
 
     let f2 = fired_t2.clone();
-    let _id2 = manager.add_one_shot(Duration::from_millis(20), (), move |_| {
+    let _id2 = manager.add_one_shot(Duration::from_millis(20), move || {
         f2.store(true, Ordering::SeqCst);
         TimerReturn::Continue
     });
 
     let f3 = fired_t3.clone();
-    let id3 = manager.add_one_shot(Duration::from_millis(60), (), move |_| {
+    let id3 = manager.add_one_shot(Duration::from_millis(60), move || {
         f3.store(true, Ordering::SeqCst);
         TimerReturn::Continue
     });
 
     let f4 = fired_t4.clone();
-    let _id4 = manager.add_one_shot(Duration::from_millis(40), (), move |_| {
+    let _id4 = manager.add_one_shot(Duration::from_millis(40), move || {
         f4.store(true, Ordering::SeqCst);
         TimerReturn::Continue
     });
@@ -249,10 +222,11 @@ fn recurring_timer_at_1khz_keeps_its_rate() {
     let start = Instant::now();
     let period = Duration::from_millis(1);
     let (f, l) = (fired.clone(), late_ns.clone());
-    manager.add_recurring(start + period, period, 0u32, move |n| {
-        *n += 1;
+    let mut n = 0u32;
+    manager.add_recurring(start + period, period, move || {
+        n += 1;
         f.fetch_add(1, Ordering::SeqCst);
-        let due = start + period * *n;
+        let due = start + period * n;
         l.fetch_add(Instant::now().saturating_duration_since(due).as_nanos() as usize, Ordering::SeqCst);
         TimerReturn::Continue
     });

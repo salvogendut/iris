@@ -1711,17 +1711,6 @@ impl PhysicalCodePage {
         self.fr1.load(Ordering::Relaxed)
     }
 
-    /// Return every offset to eligible-for-compile, discarding the sticky
-    /// denylist. For the FR-mode-flip case on the flush-survivor path: the
-    /// denylist records decisions made while compiling for the OLD mode, so
-    /// once the page is re-pinned those verdicts no longer describe the code
-    /// that will actually be generated. `publish` has its own equivalent for
-    /// the real-invalidation case (new bytes deserve a fresh chance, §13.6).
-    #[inline]
-    pub fn reset_denied(&self) {
-        for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
-    }
-
     /// Record that an in-function FR-guard bail observed live FR = `fr1` and
     /// that this page's pin should be corrected to it at the next compile.
     /// Called from `jit_kill_entry` (mips_exec.rs), which already holds both
@@ -3068,6 +3057,7 @@ impl Jitv2 {
 
     /// Keep an uncached page of a frame apart from its cached page, in space 0.
     /// Before any page is claimed.
+    #[cfg(test)]
     pub fn split_uncached_code(&mut self) {
         let frames = self.spaces[0].frames;
         self.set_space(0, frames, true);
@@ -6482,7 +6472,6 @@ mod tests {
         }
         fn start(&self) {}
         fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
-        fn get_clock(&self) -> u64 { 0 }
     }
 
     /// A worker retires an arena and asks the CPU to pass a batch boundary;
@@ -6618,7 +6607,6 @@ mod tests {
         fn stop(&self) {}
         fn start(&self) {}
         fn is_running(&self) -> bool { true }
-        fn get_clock(&self) -> u64 { 0 }
     }
 
     /// Every word decodes as `ADDIU r1, r0, 1` — a real, compilable

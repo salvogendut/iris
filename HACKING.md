@@ -239,7 +239,7 @@ pub trait BusDevice: Send + Sync {
 
 pub trait Device: Send + Sync {
     fn start(&self); fn stop(&self); fn is_running(&self) -> bool;
-    fn step(&self, cycles: u64); fn get_clock(&self) -> u64;
+    fn step(&self, cycles: u64);
     fn signal(&self, signal: Signal) {}
     fn register_commands(&self) -> Vec<(String, String)> { vec![] } // monitor commands
     fn execute_command(&self, cmd: &str, args: &[&str], w: Box<dyn Write + Send>) -> Result<(), String> { .. }
@@ -274,6 +274,10 @@ pub trait Resettable { fn power_on(&self); }
   `OLDEST_SCHEMA` names the floor.
 - **Resettable** is power-on state.
 
+`src/dev/mace_uart.rs` is the small live device to copy: register decode as a
+`BusDevice`, the lifecycle as a `Device`, and a deadline on the machine clock
+through `hptimer::Timer`, started and stopped with the device.
+
 A device that answers every width the same way writes one inherent
 `access(&self, a, size, value) -> BusRead64` and expands the eight sized
 methods with `access_widths!()` (`src/dev/widths.rs`); `widths::access` splits
@@ -290,8 +294,7 @@ Devices connect to each other through device-specific `connect()` /
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
 channel; `wait_active` lets a device thread block until the guest arms the
 channel, which HPC3 signals from the arming register write instead of being
-polled), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
-(below), `GfxDisplay` (a graphics board's screen, for the window and
+polled), `InterruptController`/`IrqLine` (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 
 Serial lines have two halves. A UART model owns the registers: the Indy's

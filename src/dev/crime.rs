@@ -103,7 +103,7 @@ pub struct Crime {
     int: Mutex<IntState>,
     /// The guest's last accesses to the interrupt registers (status, mask,
     /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
-    /// control port's `crimelog` (chasing interrupt storms).
+    /// `o2 crimelog` (chasing interrupt storms).
     /// Off until the monitor's `crime irqlog on`, and not kept in a
     /// `lightning` build: IRIX reads INTSTAT and writes INTMASK on every
     /// interrupt and every spl change.
@@ -381,7 +381,6 @@ impl Device for Crime {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [on|off|n] | crime touched | crime trace <file> [re,cpu,gbe,crime,irq|all] | crime trace off|flush".to_string())]

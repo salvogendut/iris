@@ -230,7 +230,7 @@ pub struct Gbe {
     pub hot: Mutex<BTreeMap<u32, u64>>,
     /// Time in microseconds (MACE UST).
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// The control port's `pixel X Y`: the point to describe on the next
+    /// The monitor's `o2 pixel X Y`: the point to describe on the next
     /// frame, and what the scan-out found there.
     pub probe: Mutex<(Option<(usize, usize)>, String)>,
     /// The four vertical-timing interrupts, into CRIME's latched inputs
@@ -3582,7 +3582,6 @@ impl crate::traits::Device for Gbe {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("gbe".to_string(), "GBE display engine: gbe status | gbe trace <file> [re,cpu,gbe,crime,irq|all] | gbe trace off|flush".to_string())]
@@ -3624,7 +3623,6 @@ impl crate::traits::Device for CrimeRe {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("re".to_string(), "CRIME rendering engine: re status | re notes | re dither [on|off] | re trace <file> [re,cpu,gbe,crime,irq|all] | re trace off|flush | re rec <file>|off".to_string())]
@@ -3833,7 +3831,7 @@ mod tests {
     }
 
     /// Replay a recorded register trace (IRIS_IP32_RE_TRACE, saved with the
-    /// control port's `retrace`) into a fresh RE and save what TLB A shows
+    /// `o2 retrace`) into a fresh RE and save what TLB A shows
     /// at 32 bpp as a PNG: RE_REPLAY=trace RE_REPLAY_PNG=out.png. CPU writes
     /// to the frame buffer are not in the trace, so only drawing shows.
     #[test]

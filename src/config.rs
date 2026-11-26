@@ -1608,9 +1608,6 @@ pub struct MachineSection {
     /// O2: a PS/2 mouse on the second port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
-    /// O2: the scripting control port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_port: Option<u16>,
     /// O2 test aid: lend a kernel the FPU inside the PROM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arcs_fpu: Option<bool>,
@@ -1647,10 +1644,6 @@ pub struct O2Section {
     /// A PS/2 mouse on the second port (with the graphics console).
     #[serde(default = "o2_on")]
     pub mouse: bool,
-    /// A TCP port on 127.0.0.1 for driving the machine from a script: screen
-    /// shots, keys, the mouse (see `src/ip32_machine.rs`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_port: Option<u16>,
     /// Test aid, not hardware behaviour: lend a kernel the FPU while it is
     /// inside the PROM (NetBSD prints through the PROM's graphics console
     /// with CU1 clear, and the PROM scrolls with FPU loads).
@@ -1696,7 +1689,6 @@ impl O2Section {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
         self.mouse
-            && self.control_port.is_none()
             && !self.arcs_fpu
             && self.prom.is_none()
             && self.flash.is_none()
@@ -1813,7 +1805,6 @@ impl Default for O2Section {
     fn default() -> Self {
         Self {
             mouse: true,
-            control_port: None,
             arcs_fpu: false,
             prom: None,
             flash: None,
@@ -3008,14 +2999,6 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
-/// The first four banks of a full `banks` array, for legacy four-bank callers.
-/// This discards banks 4 through 7; profile-aware front ends use the full array.
-pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
-    let mut four = [0u32; 4];
-    four.copy_from_slice(&banks[..4]);
-    four
-}
-
 /// `banks` as TOML: any length from 1 to [`MAX_BANKS`] is read and padded
 /// with zeros; it is written with at least four entries and no trailing
 /// zeros beyond them, so a four-bank machine's config looks as it always has.
@@ -3545,10 +3528,6 @@ impl MachineConfig {
             if !o2 { return Err(not_here("mouse")); }
             self.o2.mouse = mouse;
         }
-        if let Some(port) = self.machine.control_port.take() {
-            if !o2 { return Err(not_here("control_port")); }
-            self.o2.control_port = Some(port);
-        }
         if let Some(on) = self.machine.arcs_fpu.take() {
             if !o2 { return Err(not_here("arcs_fpu")); }
             self.o2.arcs_fpu = on;
@@ -3569,7 +3548,6 @@ impl MachineConfig {
             P::O2Ip32 => {
                 let o2 = std::mem::take(&mut out.o2);
                 m.mouse = (!o2.mouse).then_some(false);
-                m.control_port = o2.control_port;
                 m.arcs_fpu = o2.arcs_fpu.then_some(true);
             }
             P::OctaneIp30 => m.flash = std::mem::take(&mut out.octane).flash,
@@ -4438,12 +4416,6 @@ impl MachineConfig {
             rx_hold:      self.network.rx_hold.unwrap_or(true),
             stream:       self.network.stream.clone(),
         }
-    }
-
-    /// Return the active disc path for a CD-ROM device (first of `discs` list,
-    /// falling back to `path`).
-    pub fn active_disc(dev: &ScsiDeviceConfig) -> &str {
-        dev.discs.first().map(|s| s.as_str()).unwrap_or(&dev.path)
     }
 }
 
@@ -5783,9 +5755,10 @@ mod export_tests {
         assert_eq!((onyx2.node_boards(), onyx2.onyx2.io_prom.as_deref()), (2, Some("io6prom.img")));
         let fuel = load("[machine]\nprofile = \"fuel_ip34\"\nps2_input = false\nusb_input = true\n").unwrap();
         assert!(!fuel.fuel.ps2_input && fuel.fuel.usb_input);
-        let o2 = load("[machine]\nprofile = \"o2_ip32\"\nmouse = false\ncontrol_port = 7000\n").unwrap();
-        assert_eq!((o2.o2.mouse, o2.o2.control_port), (false, Some(7000)));
-        assert!(toml::to_string_pretty(&o2.for_writing()).unwrap().contains("control_port = 7000"));
+        let o2 = load("[machine]\nprofile = \"o2_ip32\"\nmouse = false\n").unwrap();
+        assert!(!o2.o2.mouse);
+        assert!(load("[machine]\nprofile = \"o2_ip32\"\ncontrol_port = 7000\n").unwrap_err().contains("control_port"));
+        assert!(load("[o2]\ncontrol_port = 7000\n").unwrap_err().contains("control_port"));
 
         // The machine's older table still loads, and a `[machine]` key wins over it.
         let old = load("[machine]\nprofile = \"origin3200_ip35\"\n[origin3200]\nc_bricks = 2\nflash = \"old\"\n").unwrap();
@@ -6036,7 +6009,6 @@ mod export_tests {
             cpu_mhz = 195
             net = false
             mouse = false
-            control_port = 2293
             forwards = [ { proto = "tcp", host_port = 2292, guest_port = 22 } ]
         "#).expect("parse");
         cfg.fold_deprecated();
@@ -6051,7 +6023,6 @@ mod export_tests {
         assert_eq!(cfg.port_forward.len(), 1);
         assert_eq!(cfg.port_forward[0].host_port, 2292);
         assert!(!cfg.o2.mouse);
-        assert_eq!(cfg.o2.control_port, Some(2293));
         cfg.validate().expect("the folded config is a valid O2");
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         for gone in ["ram_mb =", "cpu_mhz =", "flash =", "forwards =", "graphics =", "serial_port =", "net ="] {

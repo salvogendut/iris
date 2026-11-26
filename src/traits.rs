@@ -367,11 +367,6 @@ pub trait BusDevice: Send + Sync {
     }
 }
 
-pub trait FifoDevice: Send + Sync {
-    fn read_fifo(&self) -> u8;
-    fn write_fifo(&self, val: u8, notify: bool);
-}
-
 /// Status bits returned by DMA read/write/advance operations.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct DmaStatus(pub u32);
@@ -589,7 +584,6 @@ pub trait Device: Send + Sync {
     fn stop(&self);
     fn start(&self);
     fn is_running(&self) -> bool;
-    fn get_clock(&self) -> u64;
 
     fn signal(&self, _signal: Signal) {}
 

@@ -248,12 +248,11 @@ struct CodecAState {
     // codec's own rate; prebuffering and rate conversion are its business.
     out: Option<AudioOut>,
     nonzero_seen: bool,
-    timer_id: Option<TimerId>,
 }
 
 impl CodecAState {
     fn new() -> Self {
-        Self { out: None, nonzero_seen: false, timer_id: None }
+        Self { out: None, nonzero_seen: false }
     }
     fn reset_audio(&mut self) {
         // Keep `out` — stream stays open.  Just reset codec-side state.
@@ -266,17 +265,8 @@ impl CodecAState {
     }
 }
 
-struct CodecBState {
-    timer_id: Option<TimerId>,
-}
-
-struct AesTxState {
-    timer_id: Option<TimerId>,
-}
-
 struct AesRxState {
     loopback: std::collections::VecDeque<u32>,
-    timer_id: Option<TimerId>,
 }
 
 // Keep about one second of 48 kHz stereo loopback at most. TX can run while
@@ -291,6 +281,12 @@ impl AesRxState {
         self.loopback.push_back(sample);
     }
 }
+
+/// Indexes of an engine's timer in `Hal2::timers`.
+const CODEC_A: usize = 0;
+const CODEC_B: usize = 1;
+const AES_TX: usize = 2;
+const AES_RX: usize = 3;
 
 // ─── HAL2 register state ──────────────────────────────────────────────────────
 
@@ -387,9 +383,9 @@ pub struct Hal2 {
     tm: Arc<TimerManager>,
     // Per-channel mutable state
     ca_state: Arc<Mutex<CodecAState>>,
-    cb_state: Arc<Mutex<CodecBState>>,
-    at_state: Arc<Mutex<AesTxState>>,
     ar_state: Arc<Mutex<AesRxState>>,
+    /// Each engine's pacing timer while armed.
+    timers: Mutex<[Option<TimerId>; 4]>,
     // [audio]: which host to play through, and its buffer size.
     audio: AudioConfig,
     /// What codec A moved and skipped (`audio status`); codec B is not counted.
@@ -435,9 +431,8 @@ impl Hal2 {
             running: AtomicBool::new(false),
             tm: tm.clone(),
             ca_state: Arc::new(Mutex::new(CodecAState::new())),
-            cb_state: Arc::new(Mutex::new(CodecBState { timer_id: None })),
-            at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
-            ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
+            ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new() })),
+            timers: Mutex::new([None; 4]),
             audio,
             meter: Meter::new("HAL2", &["analog out"]),
             dump: AudioDump::from_env(),
@@ -505,7 +500,7 @@ impl Hal2 {
 
     fn arm_codeca(&self) {
         let tm = &self.tm;
-        self.disarm_codeca();
+        self.disarm(CODEC_A);
 
         let (dma_ch, mode, rate, pitch_rate) = {
             let s = self.state.lock();
@@ -532,7 +527,7 @@ impl Hal2 {
         let mut pcm: Vec<i16> = Vec::new();
         let mut raw: Vec<(i16, i16)> = Vec::new();
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             let mut due = pacer.due();
             meter.skipped(0, Skip::Stale, pacer.take_skipped());
             // Keep within READ_AHEAD_MS of the position the guest last polled
@@ -591,23 +586,29 @@ impl Hal2 {
             TimerReturn::Continue
         });
 
-        self.ca_state.lock().timer_id = Some(id);
+        self.timers.lock()[CODEC_A] = Some(id);
     }
 
-    fn disarm_codeca(&self) {
-        let id = self.ca_state.lock().timer_id.take();
+    /// Stop `engine`'s timer and reset what it fed: codec A keeps its host
+    /// stream open, and the AES receive loopback is emptied.
+    fn disarm(&self, engine: usize) {
+        let id = self.timers.lock()[engine].take();
         if let Some(id) = id {
             self.tm.remove(id);
-            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 0);
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, engine);
         }
-        self.ca_state.lock().reset_audio(); // keeps `out` (stream stays open)
+        match engine {
+            CODEC_A => self.ca_state.lock().reset_audio(),
+            AES_RX => self.ar_state.lock().loopback.clear(),
+            _ => {}
+        }
     }
 
     // ── Codec B input (silence writer) timer ─────────────────────────────────
 
     fn arm_codecb(&self) {
         let tm = &self.tm;
-        self.disarm_codecb();
+        self.disarm(CODEC_B);
 
         let (dma_ch, mode, rate) = {
             let s = self.state.lock();
@@ -629,7 +630,7 @@ impl Hal2 {
         let dma_client = self.dma_clients[dma_ch].clone();
         let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
                 let _ = dma_client.write(0, false);
                 if mode == MODE_STEREO || mode == MODE_QUAD {
@@ -643,22 +644,14 @@ impl Hal2 {
             TimerReturn::Continue
         });
 
-        self.cb_state.lock().timer_id = Some(id);
-    }
-
-    fn disarm_codecb(&self) {
-        let id = self.cb_state.lock().timer_id.take();
-        if let Some(id) = id {
-            self.tm.remove(id);
-            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 1);
-        }
+        self.timers.lock()[CODEC_B] = Some(id);
     }
 
     // ── AES TX drain timer (no host output) ──────────────────────────────────
 
     fn arm_aestx(&self) {
         let tm = &self.tm;
-        self.disarm_aestx();
+        self.disarm(AES_TX);
 
         let (dma_ch, rate) = {
             let s = self.state.lock();
@@ -674,7 +667,7 @@ impl Hal2 {
         let ar_state = self.ar_state.clone();
         let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
                 if let Some((val, st)) = dma_client.read() {
                     if !st.refused() {
@@ -685,22 +678,14 @@ impl Hal2 {
             TimerReturn::Continue
         });
 
-        self.at_state.lock().timer_id = Some(id);
-    }
-
-    fn disarm_aestx(&self) {
-        let id = self.at_state.lock().timer_id.take();
-        if let Some(id) = id {
-            self.tm.remove(id);
-            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 2);
-        }
+        self.timers.lock()[AES_TX] = Some(id);
     }
 
     // ── AES RX loopback write timer ───────────────────────────────────────────
 
     fn arm_aesrx(&self) {
         let tm = &self.tm;
-        self.disarm_aesrx();
+        self.disarm(AES_RX);
 
         let (dma_ch, rate) = {
             let s = self.state.lock();
@@ -716,7 +701,7 @@ impl Hal2 {
         let ar_state = self.ar_state.clone();
         let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
                 let val = ar_state.lock().loopback.pop_front().unwrap_or(0);
                 let _ = dma_client.write(val, false);
@@ -724,16 +709,7 @@ impl Hal2 {
             TimerReturn::Continue
         });
 
-        self.ar_state.lock().timer_id = Some(id);
-    }
-
-    fn disarm_aesrx(&self) {
-        let id = self.ar_state.lock().timer_id.take();
-        if let Some(id) = id {
-            self.tm.remove(id);
-            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 3);
-        }
-        self.ar_state.lock().loopback.clear();
+        self.timers.lock()[AES_RX] = Some(id);
     }
 
     // ── React to dma_enable changes ───────────────────────────────────────────
@@ -750,7 +726,7 @@ impl Hal2 {
                 self.arm_codeca();
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A DMA disabled");
-                self.disarm_codeca();
+                self.disarm(CODEC_A);
             }
         }
 
@@ -760,7 +736,7 @@ impl Hal2 {
                 self.arm_codecb();
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec B DMA disabled");
-                self.disarm_codecb();
+                self.disarm(CODEC_B);
             }
         }
 
@@ -770,7 +746,7 @@ impl Hal2 {
                 self.arm_aestx();
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES TX DMA disabled");
-                self.disarm_aestx();
+                self.disarm(AES_TX);
             }
         }
 
@@ -780,16 +756,13 @@ impl Hal2 {
                 self.arm_aesrx();
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES RX DMA disabled");
-                self.disarm_aesrx();
+                self.disarm(AES_RX);
             }
         }
     }
 
     fn disarm_all(&self) {
-        self.disarm_codeca();
-        self.disarm_codecb();
-        self.disarm_aestx();
-        self.disarm_aesrx();
+        (CODEC_A..=AES_RX).for_each(|e| self.disarm(e));
     }
 
     // ── Register access ───────────────────────────────────────────────────────
@@ -1089,9 +1062,8 @@ impl Hal2 {
         use crate::locks::register_mutex_fn;
         register_mutex_fn("hal2::state",    self, |h| h.state.is_locked());
         register_mutex_fn("hal2::ca_state", self, |h| h.ca_state.is_locked());
-        register_mutex_fn("hal2::cb_state", self, |h| h.cb_state.is_locked());
-        register_mutex_fn("hal2::at_state", self, |h| h.at_state.is_locked());
         register_mutex_fn("hal2::ar_state", self, |h| h.ar_state.is_locked());
+        register_mutex_fn("hal2::timers",   self, |h| h.timers.is_locked());
     }
 }
 
@@ -1146,8 +1118,6 @@ impl Device for Hal2 {
         self.running.load(Ordering::Acquire)
     }
 
-    fn get_clock(&self) -> u64 { 0 }
-
     /// `audio status`: codec A is the only output counted. Its rate is the
     /// guest's while its timer runs.
     fn audio_frames(&self) -> Option<u64> {
@@ -1156,7 +1126,7 @@ impl Device for Hal2 {
 
     fn audio_report(&self) -> Option<String> {
         let ca = self.ca_state.lock();
-        let rate = ca.timer_id.is_some().then(|| {
+        let rate = self.timers.lock()[CODEC_A].is_some().then(|| {
             let s = self.state.lock();
             s.bres_rate(s.codeca_cfg().1)
         }).filter(|&r| r > 0);
@@ -1473,7 +1443,6 @@ mod loopback_tests {
     fn idle_receiver_drops_oldest_samples_instead_of_growing_forever() {
         let mut state = AesRxState {
             loopback: std::collections::VecDeque::new(),
-            timer_id: None,
         };
         for value in 0..AES_LOOPBACK_WORDS + 10 {
             state.push_loopback(value as u32);
