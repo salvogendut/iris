@@ -54,7 +54,7 @@ pub fn set_emulator_profile(profile: MachineProfile) {
     EMULATOR_PROFILE.store(profile as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn emulator_profile() -> Option<MachineProfile> {
+pub fn emulator_profile() -> Option<MachineProfile> {
     let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
     MachineProfile::EVERY.into_iter().find(|p| *p as u8 == raw)
 }
@@ -552,9 +552,8 @@ impl Machine {
         ioc.scc().set_backend_a(channel_a);
         ioc.set_heartbeat(heartbeat.clone());
         ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
-        // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
-        // target on a controller (`ScsiDeviceConfig::placement`). The disks
-        // recorded here, and the scratch volume's path for the CI socket,
+        // Attach SCSI devices from config, each at its slot in the slot
+        // list. The disks recorded here, and the scratch volume's path for the CI socket,
         // come back with it. Disk provenance for snapshot manifests is
         // captured while the MachineConfig `cfg` is still in scope (it is
         // shadowed by the CPU config below): the slot (controller * 16 + id,
@@ -562,7 +561,8 @@ impl Machine {
         // size.
         // The buses are filled before the controllers exist and handed to them.
         let scsi_buses = Hpc3::new_scsi_buses(guinness);
-        let attached = match crate::scsi::attach_from_config(&cfg, None, &|c| Hpc3::route_scsi(&scsi_buses, c)) {
+        let resolved = crate::topology::DevicePlacement::new(&cfg)?;
+        let attached = match crate::scsi::attach_from_config(&cfg, None, &resolved, &scsi_buses.iter().collect::<Vec<_>>()) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("iris: fatal: {e}");
@@ -1446,13 +1446,14 @@ impl Machine {
         self.hpc3.ioc().scc().drain_console()
     }
 
-    /// csh one-liner to (re)mount `/CDROM` for SCSI unit `id` (EFS s7, else iso9660 vol).
-    pub fn irix_cdrom_remount_command(scsi_id: u8) -> String {
+    /// csh one-liner to (re)mount `/CDROM` for drive `16 * controller + id`
+    /// (EFS s7, else iso9660 vol).
+    pub fn irix_cdrom_remount_command(drive: u8) -> String {
+        let (c, id) = (drive / 16, drive % 16);
         format!(
             "umount /CDROM >& /dev/null; \
-             mount -t efs -o ro /dev/dsk/dks0d{id}s7 /CDROM || \
-             mount -t iso9660 /dev/rdsk/dks0d{id}vol /CDROM\n",
-            id = scsi_id
+             mount -t efs -o ro /dev/dsk/dks{c}d{id}s7 /CDROM || \
+             mount -t iso9660 /dev/rdsk/dks{c}d{id}vol /CDROM\n"
         )
     }
 
@@ -2934,7 +2935,7 @@ mod controller_lifetime_tests {
             .spawn(move || {
                 let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
                 nvram_in(&mut cfg, &nv_dir);
-                cfg.scsi.insert(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
+                cfg.set_disk(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
                 Box::new(Machine::new(cfg))
             })
             .unwrap()
@@ -3057,7 +3058,7 @@ mod production_newport_wgpu_tests {
     fn production_config(nv_dir: &std::path::Path) -> MachineConfig {
         let mut cfg = MachineConfig::default();
         nvram_in(&mut cfg, nv_dir);
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg.no_audio = true;
         cfg.ci = true;
         cfg.monitor_port = Some(0);
@@ -3153,8 +3154,7 @@ mod stop_order_tests {
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
     }
 
-    /// A CD-ROM on the Indigo2's second controller is `[scsi.20]`; disc
-    /// changes must reach it by that key.
+    /// A CD-ROM on the Indigo2's second controller takes disc changes by its slot.
     #[test]
     fn second_controller_cdrom_takes_disc_changes() {
         use crate::config::{MachineProfile, ScsiDeviceConfig};
@@ -3165,16 +3165,25 @@ mod stop_order_tests {
             let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
             crate::test_temp::nvram_in(&mut cfg, &nv);
             cfg.machine.profile = MachineProfile::Indigo2Ip22;
-            cfg.scsi.insert(20, ScsiDeviceConfig { cdrom: true, controller: 1, ..Default::default() });
+            cfg.set_disk(20, ScsiDeviceConfig { cdrom: true, ..Default::default() });
             Box::new(Machine::new(cfg))
         });
         let changer = Workstation::disc_changer(&*machine).expect("a disc changer");
-        assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [20]);
+        let id = crate::topology::drive_id(MachineProfile::Indigo2Ip22, "hpc3/c1/t4").unwrap();
+        assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [id]);
         let iso = dir.join("a.iso");
         std::fs::write(&iso, vec![0u8; 2048]).unwrap();
         let path = iso.to_string_lossy().into_owned();
-        assert_eq!(changer.load_disc(20, path.clone()), Ok(path));
+        assert_eq!(changer.load_disc(id, path.clone()), Ok(path));
         assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no id 4");
+    }
+
+    /// The second controller is `dks1` to IRIX, so its drive's remount names it.
+    #[test]
+    fn remount_names_the_drives_controller() {
+        let cmd = |drive| Machine::irix_cdrom_remount_command(drive);
+        assert!(cmd(4).contains("dks0d4s7") && cmd(4).contains("dks0d4vol"));
+        assert!(cmd(20).contains("dks1d4s7") && cmd(20).contains("dks1d4vol"));
     }
 }
 
@@ -3334,7 +3343,7 @@ mod virtio_tests {
             .spawn(move || {
                 let mut cfg = MachineConfig::default();
                 crate::test_temp::nvram_in(&mut cfg, &nv_dir);
-                cfg.scsi.clear();
+                cfg.devices.clear();
                 cfg.headless = true;
                 cfg.machine.profile = profile;
                 if profile == MachineProfile::Indigo2Ip28 {
@@ -3370,7 +3379,7 @@ mod virtio_tests {
             .spawn(move || {
                 let mut cfg = MachineConfig::default();
                 crate::test_temp::nvram_in(&mut cfg, &nv_dir);
-                cfg.scsi.clear();
+                cfg.devices.clear();
                 cfg.machine.profile = MachineProfile::IndyIp24;
                 cfg.graphics.heads = 2;
                 cfg.ultra64.enabled = true;
@@ -3428,7 +3437,7 @@ mod virtio_tests {
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
                 let mut cfg = MachineConfig::default();
-                cfg.scsi.clear();
+                cfg.devices.clear();
                 cfg.headless = true;
                 cfg.machine.profile = MachineProfile::Indigo2Ip28;
                 cfg.machine.cpu = Some("r10000".into());

@@ -44,6 +44,7 @@ use crate::ip30::{
     WIDGET_XBOW,
 };
 use crate::pci::{BoardIrq, DevFn};
+use crate::topology::MachineSlotKind;
 use crate::snapshot::{
     field, ChunksManifest, Manifest, MgrasChunk, OdysseyChunk, Snapshot, StateTable, SCHEMA_VERSION,
 };
@@ -56,6 +57,27 @@ use crate::xtalk::{HostPort, Upstream};
 pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
 /// The processors an Octane shipped with, the default first.
 pub const CPUS: &[&Part] = &[&parts::R10000_195, &parts::R12000_360, &parts::R14000_600];
+
+/// The two ISP1040s on the onboard Bridge, internal bus then external.
+const SCSI_DEVICES: [u8; 2] = [0, 1];
+
+fn scsi_at() -> [String; 2] {
+    SCSI_DEVICES.map(|d| format!("xio{}/pci0/{d}", crate::ip30::WIDGET_BRIDGE))
+}
+
+/// The system board's Bridge bus: two ISP1040s, the IOC3, the RAD1 and spare slots 5 to 7 for virtio (7 first, on INTB).
+/// Device 4 is none: its INTA is the IOC3's SuperIO pin.
+pub(crate) const SYSTEM_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
+        (SCSI_DEVICES[0], MachineSlotKind::ScsiBus { part: "isp1040", ids: 15 }, None),
+        (SCSI_DEVICES[1], MachineSlotKind::ScsiBus { part: "isp1040", ids: 15 }, None),
+        (2, MachineSlotKind::Fixed("ioc3"), None),
+        (3, MachineSlotKind::Fixed("rad1"), None),
+    ];
+
+/// The Octane's slots.
+pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
+    crate::topology::pci_bus_slots(s, &format!("xio{}/pci0", crate::ip30::WIDGET_BRIDGE), "Octane system board", SYSTEM_SLOTS);
+}
 
 /// The Crossbow on the Octane reports revision code 4.
 const XBOW_REVISION: u32 = 4;
@@ -379,7 +401,7 @@ impl OctaneMachine {
         // The status bar's activity bits, shared with the graphics board.
         let heartbeat = Arc::new(AtomicU64::new(0));
         let mac = cfg.network().mac;
-        // The buses are filled from `[scsi.N]` before the controllers exist.
+        // The buses are filled before the controllers exist.
         let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
         let (scratch_path, mut disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
         let scsi = [Arc::new(Isp1040::new_at(0, bus_a, &timer_manager)), Arc::new(Isp1040::new_at(1, bus_b, &timer_manager))];
@@ -388,8 +410,8 @@ impl OctaneMachine {
         }
         let pci = bridge.bus();
         let slot = |device| DevFn { device, function: 0 };
-        pci.attach(slot(0), scsi[0].clone());
-        pci.attach(slot(1), scsi[1].clone());
+        pci.attach(slot(SCSI_DEVICES[0]), scsi[0].clone());
+        pci.attach(slot(SCSI_DEVICES[1]), scsi[1].clone());
         let nvme = (!cfg.nvme.path.is_empty())
             .then(|| -> Result<_, String> {
                 // `validate` found the board; the slot may still be taken.
@@ -767,15 +789,12 @@ impl OctaneMachine {
         }
     }
 
-    /// The `[scsi.N]` devices: `controller` 0 is the internal bus, 1 the
-    /// external one. Returns the `scratch = true` volume, if any, and the
-    /// disks as a snapshot records them.
+    /// The SCSI devices: scsi0 is the internal bus, scsi1 the external one.
+    /// Returns the `scratch = true` volume, if any, and the disks as a
+    /// snapshot records them.
     fn attach_scsi(cfg: &MachineConfig, buses: [&crate::scsi::ScsiBus; 2]) -> Result<(Option<std::path::PathBuf>, Vec<crate::snapshot::DiskRef>), String> {
-        let attached = crate::scsi::attach_from_config(cfg, Some("ip30"), &|c| {
-            buses.get(c as usize)
-                .copied()
-                .ok_or_else(|| format!("controller {c} (an Octane has controllers 0 and 1)"))
-        })?;
+        let resolved = crate::topology::DevicePlacement::new(cfg)?;
+        let attached = crate::scsi::attach_from_config(cfg, Some("ip30"), &resolved, &buses)?;
         if let Some(d) = attached.daynaports.first() {
             return Err(format!("{}: kind = \"daynaport\" is not available on the Octane", crate::config::scsi_label(d.controller, d.id)));
         }
@@ -1911,8 +1930,8 @@ mod snapshot_tests {
         if !disk.exists() {
             std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
         }
-        cfg.scsi.clear();
-        cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
+        cfg.devices.clear();
+        cfg.set_disk(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
         edit(&mut cfg);
         OctaneMachine::new(&cfg).expect("an Octane")
     }
@@ -2417,6 +2436,28 @@ mod snapshot_tests {
             assert_ne!(m.status().state, GuestState::Running);
             m.start_guest().unwrap();
             assert!(m.cpu_is_running());
+            m.stop();
+        }).unwrap().join().unwrap();
+    }
+
+    /// A CD-ROM on the second ISP1040 takes disc changes by its slot.
+    #[test]
+    fn second_controller_cdrom_takes_disc_changes() {
+        use crate::config::{MachineProfile, ScsiDeviceConfig};
+        use crate::workstation::Workstation;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("octane-disc");
+            let prom = empty_prom(&dir);
+            let mut m = machine_with(&prom, &dir, |cfg| cfg.set_disk(20, ScsiDeviceConfig { cdrom: true, ..Default::default() }));
+            let iso = dir.join("a.iso");
+            std::fs::write(&iso, vec![0u8; 2048]).unwrap();
+            let path = iso.to_string_lossy().into_owned();
+            let changer = m.disc_changer().expect("a disc changer");
+            let id = crate::topology::drive_id(MachineProfile::OctaneIp30, "scsi1/t4").unwrap();
+            assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [id]);
+            assert_eq!(changer.load_disc(id, path.clone()), Ok(path));
+            assert_eq!(changer.eject_to_empty(id), Ok(()));
+            assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no drive at 4");
             m.stop();
         }).unwrap().join().unwrap();
     }
