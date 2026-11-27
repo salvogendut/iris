@@ -40,8 +40,8 @@ use crate::dev::xbow::Xbow;
 use crate::dev::xio_pci::XioPciBoard;
 use crate::hptimer::TimerManager;
 use crate::ip30::{
-    widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
-    WIDGET_XBOW,
+    widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, SWITCHED_WIDGETS, WIDGET_BRIDGE,
+    WIDGET_HEART, WIDGET_SMALL_SIZE, WIDGET_XBOW,
 };
 use crate::pci::{BoardIrq, DevFn, PCI_INTA, PCI_INTB};
 use crate::topology::MachineSlotKind;
@@ -161,6 +161,12 @@ impl Record {
     }
 }
 
+/// Synthetic one-wire ROM serials, one per board kind.
+const PROCESSOR_SERIAL: u64 = 0x5145_4d55_5500;
+const SYSTEM_BOARD_SERIAL: u64 = 0x5145_4d55_4e00;
+const FRONT_PLANE_SERIAL: u64 = 0x5145_4d55_4600;
+const POWER_SUPPLY_SERIAL: u64 = 0x5145_4d55_5300;
+
 /// The four identity records a product carries: the processor module on
 /// HEART's one-wire master, the system board on the onboard Bridge's, and
 /// the front plane and power supply on the IOC3's beside its
@@ -191,7 +197,7 @@ impl Identity {
             parts::Family::R14000 => ("030-1778-001", "C", format!("{count}{}MHZ", part.mhz).into()),
             _ => ("030-1590-002", "B", format!("{count}{}MHZ", part.mhz).into()),
         };
-        Record { barcode: "EMUU00", part: part_no, revision, name, serial: 0x5145_4d55_5500 }
+        Record { barcode: "EMUU00", part: part_no, revision, name, serial: PROCESSOR_SERIAL }
     }
 
     /// The Octane's chassis records, from its inventory, around `processor`.
@@ -203,21 +209,21 @@ impl Identity {
                 part: "030-0887-003",
                 revision: "F",
                 name: "IP30".into(),
-                serial: 0x5145_4d55_4e00,
+                serial: SYSTEM_BOARD_SERIAL,
             },
             front_plane: Record {
                 barcode: "EMUF00",
                 part: "030-0891-003",
                 revision: "A",
                 name: "FP1".into(),
-                serial: 0x5145_4d55_4600,
+                serial: FRONT_PLANE_SERIAL,
             },
             power_supply: Record {
                 barcode: "EMUS00",
                 part: "060-0028-003",
                 revision: "A",
                 name: "PWR.SPPLY.SR".into(),
-                serial: 0x5145_4d55_5300,
+                serial: POWER_SUPPLY_SERIAL,
             },
         }
     }
@@ -232,21 +238,21 @@ impl Identity {
                 part: "030-1467-001",
                 revision: "B",
                 name: "IP30".into(),
-                serial: 0x5145_4d55_4e00,
+                serial: SYSTEM_BOARD_SERIAL,
             },
             front_plane: Record {
                 barcode: "EMUF00",
                 part: "030-0891-003",
                 revision: "H",
                 name: "FP1".into(),
-                serial: 0x5145_4d55_4600,
+                serial: FRONT_PLANE_SERIAL,
             },
             power_supply: Record {
                 barcode: "EMUS00",
                 part: "060-0035-002",
                 revision: "A",
                 name: "PWR.SPPLY.ER".into(),
-                serial: 0x5145_4d55_5300,
+                serial: POWER_SUPPLY_SERIAL,
             },
         }
     }
@@ -741,7 +747,7 @@ impl OctaneMachine {
     /// Point every switched port's windows at its widget or at the bus
     /// error, as the Crossbow's links stand.
     fn sync_links(phys: &Ip30Bus, xbow: &Xbow) {
-        for w in 9..16 {
+        for w in SWITCHED_WIDGETS {
             phys.set_widget_link(w, xbow.carries(w));
         }
     }
@@ -2046,7 +2052,7 @@ mod snapshot_tests {
         nvme_in_a_slot(crate::dev::xio_pci::Kind::Shoehorn, None, false);
     }
 
-    /// Two NVMe cards and an audio card in one Octane: a snapshot keeps
+    /// Two NVMe cards, a virtio-serial and an audio card in one Octane: a snapshot keeps
     /// each where it was placed, with its disk, and takes them all back.
     #[test]
     fn several_cards_round_trip_a_machine_snapshot() {
@@ -2064,9 +2070,10 @@ mod snapshot_tests {
                 cfg.no_audio = true;
                 cfg.devices.push(crate::devices::ConfiguredDevice { name: Some("cage".into()), ..xio_board(crate::dev::xio_pci::Kind::Cage, None) });
                 cfg.devices.extend([nvme(1), nvme(2), crate::devices::ConfiguredDevice::new("cage/pci0/3", crate::devices::DeviceModel::Ice1724)]);
+                cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"virtio_serial\"").unwrap()).unwrap());
             });
             let at = |s: &str| s.parse::<crate::slot_path::MachineSlotPath>().unwrap();
-            let want = [("nvme", "xio13/pci0/1"), ("nvme", "xio13/pci0/2"), ("ice1724", "xio13/pci0/3")];
+            let want = [("nvme", "xio13/pci0/1"), ("nvme", "xio13/pci0/2"), ("virtio_serial", "xio15/pci0/7"), ("ice1724", "xio13/pci0/3")];
             assert_eq!(m.cards.manifest(), want.map(|(t, a)| (t.to_string(), at(a))));
             let cards: Vec<_> = m.cards.nvme.iter().map(|c| c.nvme.clone()).collect();
             let io = |n: usize, cdb: Vec<u8>, data: Option<Vec<u8>>| {

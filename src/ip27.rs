@@ -51,6 +51,7 @@ use crate::dev::isp1040::Isp1040;
 use crate::dev::node_flash::{self, FlashValues, NodeFlash};
 use crate::dev::prom_image;
 use crate::dev::serial_host::CiSerialBackend;
+use crate::dev::battery_clock::YearBase;
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
@@ -87,21 +88,29 @@ pub fn memory_map(banks_mb: [u32; BANKS]) -> crate::memory_map::MemoryMap {
 pub fn hub_special(memory: Arc<dyn BusDevice>, flash: &Arc<NodeFlash>, ecc: Arc<dyn BusDevice>, directory: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
     const WINDOW: u64 = 256 << 20;
     const BACK_DOOR: u64 = 1 << 30;
+    // Window bases: memory and boot flash at two each, then the ECC and directory back doors.
+    const MEMORY_BASES: [u64; 2] = [0, 0x2000_0000];
+    const FLASH_BASES: [u64; 2] = [0x1000_0000, 0x3000_0000];
+    const ECC_BASE: u64 = 0x8000_0000;
+    const DIRECTORY_BASE: u64 = 0xc000_0000;
     let mut map = SparseWindowMap::default();
-    for base in [0, 0x2000_0000] {
+    for base in MEMORY_BASES {
         map.map(base, WINDOW, memory.clone());
     }
-    for base in [0x1000_0000, 0x3000_0000] {
+    for base in FLASH_BASES {
         map.map(base, WINDOW, flash.window());
     }
-    map.map(0x8000_0000, BACK_DOOR, ecc);
-    map.map(0xc000_0000, BACK_DOOR, directory);
+    map.map(ECC_BASE, BACK_DOOR, ecc);
+    map.map(DIRECTORY_BASE, BACK_DOOR, directory);
     Arc::new(map)
 }
 
 /// The PROM image tried when `prom` is left at the shared default, for all
 /// three IP27 products.
 pub const IP27_PROM_FILE: &str = "ip27prom.img";
+
+/// A node board record's synthetic ROM serial, before the node index is ORed in.
+const NODE_SERIAL_BASE: u64 = 0x5145_4d55_4e00;
 
 /// The facts about a product the machine reads.
 pub struct NodeSpec {
@@ -170,7 +179,7 @@ impl NodeBoard<Hub, NodeFlash> {
         // identity: the other node's PROM reads it as the remote NIC.
         let mut onewire = w1::Bus::new();
         let barcode = format!("EMUN{index:02}");
-        let serial = 0x5145_4d55_4e00 | index as u64;
+        let serial = NODE_SERIAL_BASE | index as u64;
         match &spec.node_record {
             Some(r) => onewire.add(Box::new(board_record_part(&BoardRecord { barcode: &barcode, ..*r }, serial))),
             None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
@@ -392,8 +401,8 @@ pub(crate) fn pci_devices(
     let slot = |device| crate::pci::DevFn { device, function: 0 };
     pci.attach(slot(SCSI_DEVICES[0]), scsi[0].clone());
     pci.attach(slot(SCSI_DEVICES[1]), scsi[1].clone());
-    // The Fuel's M48T35 Timekeeper is the same part.
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
+    // The Fuel's M48T35 Timekeeper is the same part; IRIX on the IP27 adds 1970 to its year cell.
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1970), timers.clock().clone())?);
     let ioc3 = Arc::new(Ioc3::new(timers, ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 has Ethernet").clone();
