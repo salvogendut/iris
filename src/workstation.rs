@@ -60,6 +60,7 @@ pub fn build_headless(mut cfg: MachineConfig) -> Result<Box<dyn Workstation>, St
 /// Construction can put more than a megabyte on the stack, so call this from
 /// a thread with a large one, as `main.rs` and iris-gui do.
 pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+    let cfg = cfg.resolved()?;
     cfg.validate_newport_raster_gate()?;
     crate::machine::set_emulator_profile(cfg.machine.profile);
     if let Some(line) = host_id_line(&cfg) {
