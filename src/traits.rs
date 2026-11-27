@@ -401,6 +401,11 @@ pub trait DmaClient: Send + Sync {
     fn read(&self) -> Option<(u32, DmaStatus)>;
     /// Write a value to the DMA channel. Returns the channel's status.
     fn write(&self, val: u32, eop: bool) -> DmaStatus;
+    /// Receive one signed HAL2 converter sample. Some HPC3 configurations
+    /// store it as a signed 24-bit word, while others pack two samples.
+    fn write_audio_sample(&self, sample: u16) -> DmaStatus {
+        self.write(u32::from(sample), false)
+    }
     /// How far the device may read ahead of the guest: `Some(n)` when the
     /// guest is polling this channel's position and the device has read `n`
     /// words beyond the position the guest last saw (see HAL2's codec A).

@@ -641,13 +641,13 @@ impl Hal2 {
             if let Some(source) = &mut input { source.begin_tick(); }
             for _ in 0..pacer.due() {
                 let [left, right] = input.as_mut().map_or([0; 2], |source| source.frame());
-                if dma_client.write(u32::from(left), false).refused() { break; }
+                if dma_client.write_audio_sample(left).refused() { break; }
                 if mode == MODE_STEREO || mode == MODE_QUAD {
-                    let _ = dma_client.write(u32::from(right), false);
+                    let _ = dma_client.write_audio_sample(right);
                 }
                 if mode == MODE_QUAD {
-                    let _ = dma_client.write(0, false);
-                    let _ = dma_client.write(0, false);
+                    let _ = dma_client.write_audio_sample(0);
+                    let _ = dma_client.write_audio_sample(0);
                 }
             }
             TimerReturn::Continue

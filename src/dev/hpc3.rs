@@ -691,7 +691,7 @@ fn start_transaction(&mut self) {
         }
     }
 
-    fn dma_write(&mut self, val: u32, eop: bool) -> DmaStatus {
+    fn dma_write(&mut self, val: u32, eop: bool, audio_sample: bool) -> DmaStatus {
         self.dev_writes += 1;
         if !self.is_active() {
             dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — channel not active (CBP={:08x} BC={:08x})", self.id, self.cbp, self.bc);
@@ -720,7 +720,13 @@ fn start_transaction(&mut self) {
             let mem_val = if self.width_16 {
                 let v = val as u16;
                 let v = if self.endian { v.swap_bytes() } else { v };
-                (v as u32) << 16
+                if audio_sample {
+                    // IRIX consumes signed 24-bit PCM, with the converter's
+                    // 16 significant bits at 23:8 (also used for playback).
+                    ((v as i16 as i32) << 8) as u32
+                } else {
+                    (v as u32) << 16
+                }
             } else {
                 let v = val as u8;
                 (v as u32) << 24
@@ -907,7 +913,10 @@ impl DmaClient for PdmaClientImpl {
         }
     }
     fn write(&self, val: u32, eop: bool) -> DmaStatus {
-        self.channel.lock().dma_write(val, eop)
+        self.channel.lock().dma_write(val, eop, false)
+    }
+    fn write_audio_sample(&self, sample: u16) -> DmaStatus {
+        self.channel.lock().dma_write(u32::from(sample), false, true)
     }
     fn wait_active(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -2857,11 +2866,18 @@ mod enet_rx_chain_tests {
                         PDMA_CTRL_CH_ACT | PDMA_CTRL_CH_ACT_LD);
         }
         let mut capture = hpc.pdma_channels[1].lock();
-        assert!(capture.dma_write(0x8123, false).is_ok());
-        assert!(capture.dma_write(0x4567, false).eox());
-        assert!(capture.dma_write(0xffff, false).refused());
+        assert!(capture.dma_write(0x8123, false, true).is_ok());
+        assert!(capture.dma_write(0x4567, false, true).eox());
+        assert!(capture.dma_write(0xffff, false, true).refused());
         drop(capture);
         assert_eq!(ram.read32(0x1000).data, 0x81234567);
+        // The SGI driver selects a full DMA word per signed 24-bit sample.
+        hpc.write32(reg(PBUS_CFGDMA_BASE + PBUS_CFGDMA_STRIDE), PBUS_DMACFG_DS16);
+        hpc.write32(reg(PBUS_DMA_DP + PBUS_DMA_STRIDE), 0x100);
+        hpc.write32(reg(PBUS_DMA_CTRL + PBUS_DMA_STRIDE), PDMA_CTRL_CH_ACT | PDMA_CTRL_CH_ACT_LD);
+        assert!(hpc.pdma_channels[1].lock().dma_write(0x8123, false, true).eox());
+        assert_eq!(ram.read32(0x1000).data, 0xff812300);
+
         // The test memory implements read32, so drain playback in word mode.
         hpc.write32(reg(PBUS_CFGDMA_BASE), PBUS_DMACFG_DS16);
         assert!(hpc.pdma_channels[0].lock().dma_read().unwrap().1.eox());

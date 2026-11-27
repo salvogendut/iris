@@ -212,6 +212,11 @@ In the diagnostics this is constructed as `sintab_value << 8`.
 NetBSD and Linux program PBUS DMA channel 0 with `0x08208844` and send packed big-endian signed stereo samples. Each transfer in this configuration consumes two bytes.
 Channel zero signals descriptor completion on IOC Local 1 bit 4 when XIE is set. Reading its PBUS control register acknowledges the interrupt and lets the guest refill a cyclic playback buffer.
 
+On analog capture with a word per sample, SGI IRIX reads signed 24-bit PCM
+with the converter value in bits 23:8. NetBSD’s packed HAL2 transfers use
+both bytes of the converter value directly. A 440 Hz sine at amplitude
+12,000 recorded by SGI Sound Editor recovers that amplitude in the saved AIFF.
+
 For the word-strided layout the HPC3 PDMA layer delivers **16-bit values** to the HAL2 (it strips the
 low 8 padding bits in 16-bit PBUS mode), so the emulator's `DmaClient::read()`
 returns `(word >> 8) as u16`, ready for use as `i16`. In 8-bit PBUS mode it
