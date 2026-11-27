@@ -322,14 +322,19 @@ avoid advancing into descriptors the guest has not prepared.
   device. `[audio] host` picks the host audio system.
 - Mono is duplicated to L/R. Stereo consumes interleaved pairs. Single-stream
   quad consumes all four samples but discards the rear pair.
-- Codec B is an input DMA silence writer, not a second host output stream.
+- Codec B reads interleaved signed 16-bit little-endian samples from
+  `[audio] input_file` at the guest ADC clock rate. A regular file starts
+  from the beginning when the codec is armed. On Unix a FIFO can supply
+  live audio. A missing frame produces silence. Mono takes the left channel,
+  stereo takes both and quad fills the two additional channels with zeros.
+  With no input configured, all channels receive silence.
 - AES TX drains DMA into an internal queue capped at 96,000 words, discarding
   the oldest on overflow when RX is idle; AES RX writes that loopback data
   (or silence) to DMA. This is not host digital audio I/O.
 
 ### Remaining fidelity and validation
 
-- Host capture and rear-channel/dual-stream quad output are not implemented.
+- Direct host microphone selection and rear-channel/dual-stream quad output are open.
 - DMA endian is stored/read back; the current sample path assumes big-endian.
 - Recovered AES master-clock locking is not modeled; `update_rates` uses the
   48 kHz/44.1 kHz masters and defaults other selectors to 48 kHz.

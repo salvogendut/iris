@@ -232,9 +232,9 @@ pub const HPC3_PDMA_CHAN_SCSI1: u32 = 9;
 pub const HPC3_PDMA_CHAN_ENET_RX: u32 = 10;
 pub const HPC3_PDMA_CHAN_ENET_TX: u32 = 11;
 
-// Channel 0 configuration used for packed stereo playback by haltwo(4)
+// Configuration used for packed stereo playback and capture by haltwo(4)
 // and Linux snd-hal2. The SGI PROM instead programs word-strided audio.
-const HAL2_PACKED_PLAYBACK_CFG: u32 = 0x0820_8844;
+const HAL2_PACKED_PCM_CFG: u32 = 0x0820_8844;
 
 // PBUS DMA Config
 pub const PBUS_DMACFG_DS16: u32      = 1 << 18; // Bit 18: ds_16 — 16-bit device
@@ -625,7 +625,7 @@ fn start_transaction(&mut self) {
         if !self.is_active() { return None; }
         self.dev_reads += 1;
 
-        if self.id == 0 && self.dmacfg == HAL2_PACKED_PLAYBACK_CFG {
+        if self.id == 0 && self.dmacfg == HAL2_PACKED_PCM_CFG {
             let addr = self.cbp;
             let word = self.sys_mem.as_ref()?.read16(addr as u64);
             if !word.is_ok() { return None; }
@@ -703,7 +703,18 @@ fn start_transaction(&mut self) {
         // chain reaches until EOX (inferred, strong: no register or sequence
         // in the specification or any driver suggests it refuses one).
 
-        // PBUS DMA (Channels 0-7) always operates on 32-bit words
+        if self.id == 1 && self.dmacfg == HAL2_PACKED_PCM_CFG {
+            let addr = self.cbp;
+            let sample = val as u16;
+            let word = if self.endian { sample.swap_bytes() } else { sample };
+            let Some(mem) = &self.sys_mem else { return DmaStatus(DmaStatus::NOT_ACTIVE) };
+            if mem.write16(u64::from(addr), word) != BUS_OK {
+                return DmaStatus(DmaStatus::OVERFLOW);
+            }
+            self.handle_dump(addr, &word.to_be_bytes(), false);
+            return self.advance(2, eop);
+        }
+        // Other PBUS configurations use one word per sample.
         if self.id < 8 {
             let addr = self.cbp;
             let mem_val = if self.width_16 {
@@ -1351,9 +1362,11 @@ impl Hpc3 {
         // The interrupt status, and its lines: each SCSI PDMA channel's
         // completion, each WD33C93A, the SEEQ. Enet channels 10/11 have no
         // DMA completion line: the SEEQ drives the interrupt.
-        // HAL2's playback descriptor interrupts are acknowledged by reading
-        // channel zero's control register on IOC Local 1, bit 4.
-        pdma_channels[0].lock().irq = Some(ioc.irq_line(IocInterrupt::HpcDma));
+        // HAL2 playback and capture share IOC Local 1 bit 4. Reading one
+        // channel's control register acknowledges only that channel.
+        let [play, record] = IrqLine::wired_or(ioc.irq_line(IocInterrupt::HpcDma));
+        pdma_channels[0].lock().irq = Some(play);
+        pdma_channels[1].lock().irq = Some(record);
         let irqs = Arc::new(Hpc3Interrupts {
             state: state.clone(),
             scsi: [ioc.irq_line(IocInterrupt::Scsi0), ioc.irq_line(IocInterrupt::Scsi1)],
@@ -2371,6 +2384,9 @@ impl Resettable for Hpc3 {
             chan.nbdp = 0x80000000;
             chan.bc = 0;
             chan.ctrl = 0;
+            if chan.id <= 1 {
+                if let Some(irq) = &chan.irq { irq.set(false); }
+            }
             chan.gio = 0;
             chan.dev = 0;
             chan.eox = false;
@@ -2482,7 +2498,11 @@ impl Saveable for Hpc3 {
         if let Some(toml::Value::Array(chans)) = get_field(v, "pdma_channels") {
             for (i, cv) in chans.iter().enumerate() {
                 if i >= self.pdma_channels.len() { break; }
-                load_pdma_channel(&mut self.pdma_channels[i].lock(), cv);
+                let mut chan = self.pdma_channels[i].lock();
+                load_pdma_channel(&mut chan, cv);
+                if i <= 1 {
+                    if let Some(irq) = &chan.irq { irq.set(chan.ctrl & PDMA_CTRL_INT != 0); }
+                }
             }
         }
         Ok(())
@@ -2617,7 +2637,7 @@ mod tests {
         let hpc = hpc3_for_test();
         hpc.pdma_channels[0].lock().sys_mem = Some(Arc::new(PackedMemory));
         let base = HPC3_BASE as u64;
-        hpc.write32(base + PBUS_CFGDMA_BASE as u64, HAL2_PACKED_PLAYBACK_CFG);
+        hpc.write32(base + PBUS_CFGDMA_BASE as u64, HAL2_PACKED_PCM_CFG);
         hpc.write32(base + PBUS_DMA_DP as u64, 0x1000);
         hpc.write32(base + PBUS_DMA_CTRL as u64, PDMA_CTRL_CH_ACT | PDMA_CTRL_CH_ACT_LD);
         let mut ch = hpc.pdma_channels[0].lock();
@@ -2824,6 +2844,33 @@ mod enet_rx_chain_tests {
         ram.write32(0x104, PDMA_DESC_EOX | PDMA_DESC_EOP | PDMA_DESC_XIE | flags | 0x600);
         ram.write32(0x108, 0x100);
         (hpc3, ram)
+    }
+
+    #[test]
+    fn hal2_capture_packs_stereo_and_keeps_playback_irq_pending() {
+        let (hpc, ram) = one_descriptor(0);
+        ram.write32(0x104, PDMA_DESC_EOX | PDMA_DESC_XIE | 4);
+        for channel in 0..2 {
+            hpc.write32(reg(PBUS_CFGDMA_BASE + channel * PBUS_CFGDMA_STRIDE), HAL2_PACKED_PCM_CFG);
+            hpc.write32(reg(PBUS_DMA_DP + channel * PBUS_DMA_STRIDE), 0x100);
+            hpc.write32(reg(PBUS_DMA_CTRL + channel * PBUS_DMA_STRIDE),
+                        PDMA_CTRL_CH_ACT | PDMA_CTRL_CH_ACT_LD);
+        }
+        let mut capture = hpc.pdma_channels[1].lock();
+        assert!(capture.dma_write(0x8123, false).is_ok());
+        assert!(capture.dma_write(0x4567, false).eox());
+        assert!(capture.dma_write(0xffff, false).refused());
+        drop(capture);
+        assert_eq!(ram.read32(0x1000).data, 0x81234567);
+        // The test memory implements read32, so drain playback in word mode.
+        hpc.write32(reg(PBUS_CFGDMA_BASE), PBUS_DMACFG_DS16);
+        assert!(hpc.pdma_channels[0].lock().dma_read().unwrap().1.eox());
+        let l1 = u64::from(crate::dev::ioc::IOC_BASE + crate::dev::ioc::IOC_INT3_L1_STAT);
+        let irq = crate::dev::ioc::l1_regs::HPC_DMA;
+        assert_ne!(hpc.read32(reg(PBUS_DMA_CTRL + PBUS_DMA_STRIDE)).data & PDMA_CTRL_INT, 0);
+        assert_ne!(hpc.ioc.read8(l1).data & irq, 0);
+        assert_ne!(hpc.read32(reg(PBUS_DMA_CTRL)).data & PDMA_CTRL_INT, 0);
+        assert_eq!(hpc.ioc.read8(l1).data & irq, 0);
     }
 
     fn reg(off: u32) -> u64 { (HPC3_BASE + off) as u64 }

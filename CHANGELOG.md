@@ -15,6 +15,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Xiri and frontend integration
 
+- HAL2 can record from a raw stereo PCM file or Unix FIFO. The Indy delivers shared DMA interrupts for simultaneous NetBSD playback and capture.
+
 - Indy HAL2 plays signed stereo PCM from NetBSD desktop applications and interrupts the guest when it is time to refill the playback buffer.
 - NetBSD on R5000 retains its fixed cache-line configuration; 32-bit user
   addresses no longer match unrelated 64-bit kernel TLB entries.

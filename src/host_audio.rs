@@ -9,6 +9,7 @@
 //! `[audio]` section into a stream.
 
 mod external;
+pub(crate) mod pcm_input;
 pub use external::{OutputFactory, PcmStream};
 
 use std::sync::atomic::{AtomicU64, Ordering};

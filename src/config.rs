@@ -2172,6 +2172,9 @@ pub struct AudioConfig {
     /// written as the host stream would play it, in real time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
+    /// HAL2 analog input: signed 16-bit little-endian stereo at the codec rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_file: Option<std::path::PathBuf>,
 }
 
 fn default_audio_prebuf_ms() -> u64 { 20 }
@@ -2180,7 +2183,7 @@ fn is_default_audio_channels(n: &usize) -> bool { *n == 2 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { output: None, host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), latency_ms: None, channels: default_audio_channels(), file: None }
+        Self { output: None, host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), latency_ms: None, channels: default_audio_channels(), file: None, input_file: None }
     }
 }
 

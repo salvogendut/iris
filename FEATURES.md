@@ -487,6 +487,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | `audio.latency_ms` | `unset` | How much the host's device should buffer. Unset: the host system's low-latency default. |
 | `audio.channels` | `2` | Speakers the Tezro's multichannel card plays to: 2, 4 (quad), 6 (5.1) or 8 (7.1). The card folds its channels down to this many; any other value plays stereo. Other sound devices are stereo. |
 | `audio.file` | `unset` | Play into this WAV file instead of a sound card: 48 kHz 16-bit, written in real time as the host stream would play it, silence included. For headless runs and for checking what a guest played. |
+| `audio.input_file` | `unset` | Feed HAL2 analog input from raw stereo s16le PCM at the guest ADC rate. Accepts a regular file or Unix FIFO. |
 
 Embedded frontends can set the runtime-only `AudioConfig.output` factory to
 receive bounded 48 kHz stereo PCM instead of opening CPAL. This hook is not a

@@ -47,3 +47,9 @@ Rules that follow:
 
 `iris-audio/` is a path dependency with a workspace of its own (excluded
 from the root workspace); its own notes are in `iris-audio/CLAUDE.md`.
+
+**HAL2 input fixture.** `[audio] input_file` supplies the ADC from a raw
+stereo s16le file or a nonblocking FIFO at the current codec rate. An
+empty FIFO yields silence for the rest of the timer tick. This is a
+separate input from the output WAV and can run alongside it. See
+[HAL2](../../docs/dev/hal2.md).

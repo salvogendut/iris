@@ -8,7 +8,7 @@
 //! [`crate::host_audio`], scaled by the CS4216's mute and DAC attenuators
 //! and by the 8-bit MDAC volume registers HPC3 forwards
 //! ([`Hal2::set_volume_left`], [`Hal2::set_volume_right`]). Codec B records
-//! silence and the AES pair loops back; neither reaches the host.
+//! from the optional host PCM source. The AES pair loops back internally.
 //! `docs/dev/hal2.md` and `docs/dev/cs4216.md` describe the registers.
 
 use std::sync::Arc;
@@ -609,7 +609,7 @@ impl Hal2 {
         }
     }
 
-    // ── Codec B input (silence writer) timer ─────────────────────────────────
+    // ── Codec B analog input timer ─────────────────────────────────
 
     fn arm_codecb(&self) {
         self.disarm(CODEC_B);
@@ -632,11 +632,18 @@ impl Hal2 {
         crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 1 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
+        let mut input = self.audio.input_file.as_deref().and_then(|path| {
+            crate::host_audio::pcm_input::PcmInput::open(path)
+                .inspect_err(|e| eprintln!("HAL2 input {}: {e}", path.display()))
+                .ok()
+        });
         self.pace(CODEC_B, rate, move |pacer| {
+            if let Some(source) = &mut input { source.begin_tick(); }
             for _ in 0..pacer.due() {
-                let _ = dma_client.write(0, false);
+                let [left, right] = input.as_mut().map_or([0; 2], |source| source.frame());
+                if dma_client.write(u32::from(left), false).refused() { break; }
                 if mode == MODE_STEREO || mode == MODE_QUAD {
-                    let _ = dma_client.write(0, false);
+                    let _ = dma_client.write(u32::from(right), false);
                 }
                 if mode == MODE_QUAD {
                     let _ = dma_client.write(0, false);

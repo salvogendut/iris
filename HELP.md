@@ -932,6 +932,7 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 # latency_ms = 20           # what the host's device buffers; unset: its low-latency default
 # channels = 2              # speakers for the Tezro's multichannel card: 2, 4, 6 or 8
 # file = "out.wav"          # play into a WAV file instead of a sound card
+# input_file = "mic.pcm"    # HAL2 input file or Unix FIFO, raw stereo s16le at the guest ADC rate
 
 # Cards go in the same list. Left without `at`, a virtio device takes a spare slot the
 # board has for it, and a PCI card the first real slot.
