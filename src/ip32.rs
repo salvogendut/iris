@@ -505,7 +505,7 @@ impl Ip32Bus {
     pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options, timers: &Arc<crate::hptimer::TimerManager>) -> Arc<Self> {
         let ram = Arc::new(mem);
         let phys = ram.phys().clone();
-        let ust = Arc::new(MaceUst::new());
+        let ust = Arc::new(MaceUst::new(timers.clock().clone()));
         let crime = Arc::new(Crime::new(ust.clone()));
         let mut bus = Self {
             phys: phys.clone(),
@@ -696,7 +696,7 @@ impl Ip32Bus {
     pub fn save_flash(&self) {
         let Some(path) = &self.flash_file else { return };
         let p = self.flash.bytes.lock().unwrap();
-        match std::fs::write(path, &p[..]) {
+        match crate::nv_storage::save(&path.to_string_lossy(), &p[..]) {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
         }
