@@ -104,7 +104,7 @@ pub struct ScsiDeviceConfig {
     pub size_mb: Option<u32>,
 }
 
-/// The snapshot manifest's disk number for `id` on `controller`: the id
+/// The disk number the GUI and the disc changer use for `id` on `controller`: the id
 /// itself on controller 0, 16 + id on controller 1. Sixteen slots per
 /// controller, as SCSI ids go.
 pub fn scsi_slot(controller: u8, id: u8) -> u8 {
@@ -781,18 +781,6 @@ impl MachineProfile {
             Self::TezroIp53 => &[0, 512, 1024],
             Self::Origin3200Ip35 | Self::Onyx3000Ip35 => &[0, 256, 512],
             _ => &[0, 8, 16, 32, 64, 128],
-        }
-    }
-
-    /// Where the real machine takes a second graphics board, and what iris would need to build it.
-    pub fn second_graphics_hint(self) -> &'static str {
-        use MachineProfile as P;
-        match self {
-            P::IndyIp24 | P::Indigo2Ip22 | P::Indigo2Ip28 => "the dual-head board is the `newport` card in gio0",
-            P::OctaneIp30 => "a second board goes in XIO slot B or C, which needs a second graphics device on the Crossbow",
-            P::Onyx2Ip27 => "a second pipe is a second graphics module, which needs a second Raster Manager set",
-            P::Onyx3000Ip35 => "a G-brick or V-brick takes two pipes, which needs a second pipe on the brick",
-            _ => "the machine has one graphics slot",
         }
     }
 
@@ -3006,14 +2994,14 @@ impl MachineConfig {
     /// Parse a config file's text, remembering whether it listed `banks`, and
     /// folding in the spellings older versions wrote.
     fn parse_toml(text: &str) -> Result<Self, toml::de::Error> {
-        let mut cfg = toml::from_str::<Self>(text)?;
+        let mut cfg = toml::from_str::<Self>(text).map_err(|e| legacy::name_replacement(e, text))?;
         let table = toml::from_str::<toml::Table>(text)?;
         cfg.banks_set = table.contains_key("banks");
         cfg.jitv2_threads_set = table.get("jitv2").and_then(|j| j.get("threads")).is_some();
         cfg.fold_deprecated().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         // A written `devices = []` is a machine with no disks.
         let none = matches!(table.get("devices"), Some(toml::Value::Array(a)) if a.is_empty());
-        if !table.contains_key("scsi") && !none && !cfg.devices.iter().any(|d| d.device.scsi().is_some()) {
+        if !table.contains_key("scsi") && !none && cfg.devices.is_empty() {
             cfg.devices.splice(0..0, default_disks());
         }
         cfg.fold_machine_keys().map_err(<toml::de::Error as serde::de::Error>::custom)?;
@@ -3497,9 +3485,9 @@ impl MachineConfig {
         DevicePlacement::lenient(self, &self.devices).loop_disks(None)
     }
 
-    /// The NVMe card's options, if the machine has one.
-    pub fn nvme(&self) -> Option<&NvmeConfig> {
-        self.devices.iter().find_map(|d| match &d.device {
+    /// Every NVMe card's options.
+    pub fn nvmes(&self) -> impl Iterator<Item = &NvmeConfig> {
+        self.devices.iter().filter_map(|d| match &d.device {
             DeviceModel::Nvme(n) => Some(n),
             _ => None,
         })
@@ -3545,10 +3533,17 @@ impl MachineConfig {
     /// Settle where each device goes once the command line has picked the machine; `--scsiN` and `--cdromN` images replace
     /// what is at their slot.
     pub fn resolve_slots(&mut self) -> Result<(), String> {
-        legacy::gio_cards(self)?;
-        legacy::virtio_cards(self);
+        self.fold_cards()?;
         legacy::merge_shorthands(self);
         DevicePlacement::new(self).map(drop)
+    }
+
+    /// Turn the older card flags (`[ultra64]`, `graphics.heads = 2`, `test_device`, `[virtio_*]`) into `[[devices]]`
+    /// entries. A front end that reads a file itself calls this, so it sees what a run builds; a second fold adds nothing.
+    pub fn fold_cards(&mut self) -> Result<(), String> {
+        legacy::gio_cards(self)?;
+        legacy::virtio_cards(self);
+        Ok(())
     }
 
     /// The config with every slot settled, as the command line settles it: what a front end
@@ -3786,17 +3781,21 @@ impl MachineConfig {
         if emu_id != 0 && !matches!(self.machine.profile, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
+        let placement = DevicePlacement::new(self)?;
         let written = self.devices.iter().filter(|d| matches!(d.device, DeviceModel::Graphics)).count();
         if written > 1 {
-            let machine = self.machine.profile.product_name().unwrap_or(self.machine.profile.label());
-            return Err(format!("[[devices]] graphics: iris builds one graphics board on the {machine}; {}", self.machine.profile.second_graphics_hint()));
+            // Octane dual head, Onyx2 and Onyx 3000 pipes and the Indy's dual-head board are real; iris builds one board.
+            return Err(format!("[[devices]] graphics: iris builds one graphics board on the {}", placement.machine()));
         }
-        let placement = DevicePlacement::new(self)?;
         if written == 1 && board == GraphicsBoard::None {
             return Err("[[devices]] graphics: the board `[graphics] board` names is none".into());
         }
         if self.has_device("nvme") {
             self.machine.profile.refuse_nvme()?;
+            let mut images = std::collections::HashSet::new();
+            if let Some(n) = self.nvmes().filter(|n| !n.path.is_empty()).find(|n| !images.insert(n.path.as_str())) {
+                return Err(format!("[[devices]] nvme: two cards use the image {}", n.path));
+            }
         }
         if self.has_device("qla2200") && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35) {
             return Err(format!("[[devices]] qla2200: the {} cannot take a Fibre Channel adapter", placement.machine()));
@@ -4759,20 +4758,33 @@ mod export_tests {
         assert!(on.disk(1).unwrap().write_cache && on.disk(2).unwrap().write_cache, "no flag, no change");
         let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
         assert!(!off.disk(1).unwrap().write_cache && !off.disk(2).unwrap().write_cache);
-        assert!(on.nvme().unwrap().write_cache, "the NVMe default");
-        assert!(!off.nvme().unwrap().write_cache, "NVMe too");
+        assert!(on.nvmes().next().unwrap().write_cache, "the NVMe default");
+        assert!(!off.nvmes().next().unwrap().write_cache, "NVMe too");
     }
 
     #[test]
     fn nvme_write_cache_defaults_on_and_round_trips() {
         let nvme = |extra: &str| MachineConfig::from_toml_str(&format!("[[devices]]\ntype = \"nvme\"\npath = \"a.raw\"\n{extra}")).expect("parse");
-        assert!(nvme("").nvme().unwrap().write_cache, "the default");
+        assert!(nvme("").nvmes().next().unwrap().write_cache, "the default");
         assert!(NvmeConfig::default().write_cache, "the default in code");
         let off = nvme("write_cache = false\n");
-        assert!(!off.nvme().unwrap().write_cache);
+        assert!(!off.nvmes().next().unwrap().write_cache);
         let s = toml::to_string_pretty(&off).expect("serialize");
         let back = MachineConfig::from_toml_str(&s).expect("deserialize");
-        assert!(!back.nvme().unwrap().write_cache, "survives export:\n{s}");
+        assert!(!back.nvmes().next().unwrap().write_cache, "survives export:\n{s}");
+    }
+
+    /// Two NVMe cards over one image would write over each other.
+    #[test]
+    fn two_nvme_cards_cannot_share_an_image() {
+        let cards = |a: &str, b: &str| MachineConfig::from_toml_str(&format!(
+            "[machine]\nprofile = \"octane_ip30\"\n[[devices]]\ntype = \"pci_cage\"\nname = \"cage\"\nat = \"pci_module\"\n\
+             [[devices]]\ntype = \"nvme\"\nat = \"cage/pci0/1\"\npath = \"{a}\"\n\
+             [[devices]]\ntype = \"nvme\"\nat = \"cage/pci0/2\"\npath = \"{b}\"\n"
+        )).unwrap().validate();
+        cards("a.raw", "b.raw").expect("two images");
+        let e = cards("a.raw", "a.raw").unwrap_err();
+        assert!(e.contains("nvme") && e.contains("a.raw"), "{e}");
     }
 
     #[test]
@@ -5219,11 +5231,9 @@ mod export_tests {
         assert!(tezro(gfx("v12", "xio11")).unwrap_err().contains("has no slot xio11"), "11 is the second PIC");
         assert_eq!(DevicePlacement::new(&tezro(gfx("v12", "xio13")).unwrap()).unwrap().graphics().unwrap().to_string(), "xio13");
         assert_eq!(DevicePlacement::new(&tezro("[graphics]\nboard = \"v12\"\n".into()).unwrap()).unwrap().graphics().unwrap().to_string(), "xio12");
-        // One device, for a board that is fitted; the error says where the real machine takes a second.
+        // One device, for a board that is fitted.
         let two = format!("{}[[devices]]\ntype = \"graphics\"\n", gfx("v12", "xio13"));
-        assert!(tezro(two).unwrap_err().contains("one graphics slot"));
-        let octane = load("octane_ip30", "", "[[devices]]\ntype = \"graphics\"\nat = \"xio11\"\n[[devices]]\ntype = \"graphics\"\nat = \"xio9\"\n");
-        assert!(octane.unwrap_err().contains("xio9 does not take a graphics"), "the Octane has the one graphics slot xio11");
+        assert!(tezro(two).unwrap_err().contains("builds one graphics board"));
         assert!(tezro("[[devices]]\ntype = \"graphics\"\n".into()).unwrap_err().contains("is none"), "the Tezro has no board by default");
         assert!(load("o2_ip32", "", "[[devices]]\ntype = \"graphics\"\n").unwrap_err().contains("no free slot for a graphics board"));
     }

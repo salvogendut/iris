@@ -82,6 +82,32 @@ pub(super) fn virtio_cards(cfg: &mut MachineConfig) {
     }
 }
 
+/// What replaces each key that placement dropped, and the sections it was valid in (none: anywhere).
+const DROPPED: &[(&str, &[&str], &str)] = &[
+    ("xio_board", &[], "a `pci_cage` or `pci_shoehorn` [[devices]] entry at the XIO slot"),
+    ("nvme", &[], "an `nvme` [[devices]] entry"),
+    ("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/lN"),
+    ("audio_card", &[], "an `ice1724` [[devices]] entry"),
+    ("audio", &["fuel", "tezro", "origin3200", "onyx3000"], "an `ice1724` [[devices]] entry"),
+    ("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    ("widget", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    ("bridge_slot", &[], "the `at` of the virtio [[devices]] entry"),
+];
+
+/// A parse error for a dropped key, with what to write instead; any other error as it was.
+pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Error {
+    let key = e.message().strip_prefix("unknown field `").and_then(|m| m.split('`').next());
+    let section = || {
+        let before = text.get(..e.span()?.start)?;
+        let header = before.lines().rev().find_map(|l| l.trim().strip_prefix('['))?;
+        header.trim_start_matches('[').split(']').next()
+    };
+    match key.and_then(|k| DROPPED.iter().find(|d| d.0 == k && (d.1.is_empty() || section().is_some_and(|s| d.1.contains(&s))))) {
+        Some((key, _, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
+        None => e,
+    }
+}
+
 /// A bare drive id (`16 * controller + id`), the only way older versions
 /// named a drive to load or eject.
 pub(crate) fn drive_number(spec: &str) -> Option<usize> {
@@ -346,7 +372,26 @@ mod tests {
         ] {
             let e = MachineConfig::from_toml_str(text).err().map(|e| e.to_string()).unwrap_or_else(|| format!("{key} parsed"));
             assert!(e.contains("unknown field") && e.contains(key), "{key}: {e}");
+            assert!(e.contains(&format!("`{key}` is no longer read: write ")) && e.contains("[[devices]]"), "{key}: the error says what replaces it:\n{e}");
         }
+        // A key of the same name in another section is only a typo.
+        for text in ["banana = 1", "[machine]\naudio = true\n", "[tezro]\nnode = 1\n"] {
+            let e = MachineConfig::from_toml_str(text).unwrap_err().to_string();
+            assert!(e.contains("unknown field") && !e.contains("no longer read"), "{text}: {e}");
+        }
+    }
+
+    /// A front end that folds the flags when it reads a file sees the cards, and the run's own fold finds
+    /// nothing left to add.
+    #[test]
+    fn folding_the_cards_twice_changes_nothing() {
+        let mut cfg = MachineConfig::from_toml_str("[graphics]\nheads = 2\n[virtio_serial]\nenabled = true\n").unwrap();
+        cfg.fold_cards().unwrap();
+        let names = |c: &MachineConfig| c.devices.iter().map(|d| d.device.spec().name).collect::<Vec<_>>();
+        let once = names(&cfg);
+        assert!(once.contains(&"newport") && once.contains(&"virtio_serial"), "{once:?}");
+        cfg.resolve_slots().unwrap();
+        assert_eq!(names(&cfg), once);
     }
 
     /// A file with no disks gets the two defaults; one that names a disk gets
@@ -361,6 +406,19 @@ mod tests {
         assert!(MachineConfig::from_toml_str("[scsi]\n").unwrap().devices.iter().all(|d| d.device.scsi().is_none()), "an empty [scsi] is no disks");
         let text = toml::to_string(&MachineConfig { devices: vec![], ..MachineConfig::default() }).unwrap();
         assert!(MachineConfig::from_toml_str(&text).unwrap().devices.iter().all(|d| d.device.scsi().is_none()), "a machine saved with none reads back with none");
+    }
+
+    /// A file that names only cards still names its devices: the default disks do not come back, as
+    /// they would for a saved machine whose disks were all removed.
+    #[test]
+    fn a_file_with_only_cards_gets_no_default_disks() {
+        let card = "[machine]\nprofile = \"octane_ip30\"\n[[devices]]\ntype = \"nvme\"\npath = \"n.img\"\n";
+        let cfg = MachineConfig::from_toml_str(card).unwrap();
+        assert!(cfg.devices.iter().all(|d| d.device.scsi().is_none()), "no default disks beside the card");
+        let text = toml::to_string(&MachineConfig { devices: cfg.devices.clone(), ..cfg }).unwrap();
+        let back = MachineConfig::from_toml_str(&text).unwrap();
+        assert!(back.devices.iter().all(|d| d.device.scsi().is_none()), "saved and read back:\n{text}");
+        assert_eq!(back.devices.len(), 1);
     }
 
     fn slots(cfg: &MachineConfig) -> Vec<(String, &'static str)> {

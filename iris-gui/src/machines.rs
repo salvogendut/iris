@@ -64,9 +64,16 @@ pub fn config_path(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(directory(root, name)?.join(format!("{name}.toml")))
 }
 
+/// A machine's TOML, with the older card flags read as the cards they become, as a run builds them.
+pub fn parse(text: &str) -> Result<MachineConfig, String> {
+    let mut cfg = MachineConfig::from_toml_str(text).map_err(|e| e.to_string())?;
+    cfg.fold_cards()?;
+    Ok(cfg)
+}
+
 pub fn read(path: &Path) -> Result<MachineConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|e| file_error(path, e))?;
-    MachineConfig::from_toml_str(&text).map_err(|e| file_error(path, e))
+    parse(&text).map_err(|e| file_error(path, e))
 }
 
 /// The TOML a machine is saved as. Keys the config left to the machine are
@@ -224,18 +231,21 @@ pub fn save(root: &Path, name: &str, cfg: &mut MachineConfig) -> Result<(), Stri
     write(&config_path(root, name)?, &text)
 }
 
+/// The machines under `root`, those whose file does not read (name and why), and every error found.
 pub fn discover(
     root: &Path,
 ) -> (
     std::collections::BTreeMap<String, MachineConfig>,
+    std::collections::BTreeMap<String, String>,
     Vec<String>,
 ) {
     let mut machines = std::collections::BTreeMap::new();
+    let mut needs_edit = std::collections::BTreeMap::new();
     let mut errors = Vec::new();
     let entries = match std::fs::read_dir(root.join("machines")) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (machines, errors),
-        Err(e) => return (machines, vec![t!("machines-list-error", error = e.to_string())]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (machines, needs_edit, errors),
+        Err(e) => return (machines, needs_edit, vec![t!("machines-list-error", error = e.to_string())]),
     };
     for entry in entries {
         let entry = match entry {
@@ -268,10 +278,13 @@ pub fn discover(
                 }
                 Err(e) => errors.push(e),
             },
-            Err(e) => errors.push(e),
+            Err(e) => {
+                needs_edit.insert(name, e.clone());
+                errors.push(e);
+            }
         }
     }
-    (machines, errors)
+    (machines, needs_edit, errors)
 }
 
 /// Migrate battery-backed state into the machine folder, preserving existing
@@ -465,7 +478,7 @@ pub(crate) mod tests {
         let back = read(&config_path(&root.0, "tezro").unwrap()).unwrap();
         assert_eq!(back.tezro.flash.as_deref(), Some("flash.bin"));
         assert_eq!(back.origin2000.io_prom.as_deref(), Some("io6prom.img"));
-        assert_eq!(back.nvme().unwrap().path, "disk.raw");
+        assert_eq!(back.nvmes().next().unwrap().path, "disk.raw");
         assert_eq!(back.loop_disks().iter().map(|d| back.devices[d.1].device.scsi().unwrap().path.as_str()).collect::<Vec<_>>(), ["fc.raw"]);
         assert_eq!(back.virtio_serial.ports[0].socket.as_deref(), Some("port.sock"));
     }
@@ -535,6 +548,27 @@ pub(crate) mod tests {
         assert_eq!(back.jitv2.threads, 2);
     }
 
+    /// The GUI sees the older card flags as the cards they become, so its checkboxes, its second-head
+    /// panel and its slot check agree with what Start builds.
+    #[test]
+    fn older_card_flags_read_as_cards() {
+        let root = TempRoot::new("older-cards");
+        for (text, card) in [
+            ("[ultra64]\nenabled = true\n", "ultra64"),
+            ("[graphics]\nheads = 2\n", "newport"),
+            ("test_device = true\n", "test_device"),
+            ("[virtio_serial]\nenabled = true\n", "virtio_serial"),
+            ("[virtio_9p]\nenabled = true\npath = \"/share\"\n", "virtio_9p"),
+        ] {
+            let dir = directory(&root.0, "indy").unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(config_path(&root.0, "indy").unwrap(), text).unwrap();
+            let cfg = read(&config_path(&root.0, "indy").unwrap()).unwrap();
+            assert!(cfg.has_device(card), "{card}");
+            assert!(to_toml(&cfg).unwrap().contains(&format!("type = \"{card}\"")), "{card}: saved as the card");
+        }
+    }
+
     #[test]
     fn discovery_uses_only_matching_machine_tomls_and_reports_parse_errors() {
         let root = TempRoot::new("discover");
@@ -546,11 +580,13 @@ pub(crate) mod tests {
         let broken = directory(&root.0, "broken").unwrap();
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("broken.toml"), "unknown_setting = true").unwrap();
-        let (machines, errors) = discover(&root.0);
+        let (machines, needs_edit, errors) = discover(&root.0);
         assert_eq!(machines.keys().collect::<Vec<_>>(), vec!["indy"]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("broken.toml"));
         assert!(errors[0].contains("unknown_setting"));
+        assert_eq!(needs_edit.keys().collect::<Vec<_>>(), vec!["broken"]);
+        assert_eq!(needs_edit["broken"], errors[0]);
         assert_eq!(
             std::fs::read_to_string(broken.join("broken.toml")).unwrap(),
             "unknown_setting = true"
