@@ -321,7 +321,7 @@ mod tests {
             cfg.machine.cpu = Some(if profile == MachineProfile::O2Ip32 { "r5000" } else { "r10000" }.into());
             cfg.banks = banks_from4([128, 0, 0, 0]);
             cfg.prom.clear();
-            cfg.scsi.clear();
+            cfg.devices.clear();
             assert!(warnings(&cfg).is_empty());
             assert!(problems(&cfg).is_empty(), "{:?}", problems(&cfg));
             cfg.prom = d.join("missing-override").to_string_lossy().into_owned();
