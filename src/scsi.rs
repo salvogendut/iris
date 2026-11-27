@@ -75,6 +75,7 @@ pub mod scsi_cmd {
     pub const SYNCHRONIZE_CACHE_16: u8 = 0x91;
     pub const MODE_SELECT_10: u8 = 0x55;
     pub const MODE_SENSE_10: u8 = 0x5a;
+    pub const READ_CD: u8 = 0xbe;
     pub const SET_CD_SPEED: u8 = 0xbb;
     pub const WRITE_BUFFER: u8 = 0x3b;
     pub const READ_BUFFER: u8 = 0x3c;
@@ -103,6 +104,28 @@ pub struct ScsiRequest {
 pub struct ScsiResponse {
     pub status: u8,      // 0x00 = Good, 0x02 = Check Condition
     pub data: Vec<u8>,   // Response data
+}
+
+fn cd_msf(frames: u64) -> [u8; 4] {
+    [0, (frames / 4500) as u8, (frames / 75 % 60) as u8, (frames % 75) as u8]
+}
+
+/// Q subchannel of an index-01 audio sector, padded to the MMC 16-byte field.
+fn cd_audio_q(track: u8, relative: u32, absolute: u32) -> [u8; 16] {
+    fn bcd(n: u8) -> u8 { ((n / 10) << 4) | (n % 10) }
+    let mut q = [0; 16];
+    q[..3].copy_from_slice(&[1, bcd(track), 1]);
+    q[3..6].copy_from_slice(&cd_msf(u64::from(relative)).map(bcd)[1..]);
+    q[7..10].copy_from_slice(&cd_msf(u64::from(absolute) + 150).map(bcd)[1..]);
+    let mut crc: u16 = 0;
+    for &byte in &q[..10] {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+        }
+    }
+    q[10..12].copy_from_slice(&(!crc).to_be_bytes());
+    q
 }
 
 /// The allocation length of a 10-byte CDB (bytes 7-8): the most the
@@ -195,6 +218,7 @@ pub struct ScsiDevice {
     buffer: Vec<u8>,  // Internal buffer for WRITE_BUFFER/READ_BUFFER commands
     pending_sense: [u8; 18],  // Stored sense data, served on REQUEST_SENSE
     pending_attention: Option<u8>,
+    cd_position: u32,
     /// Physical sector size: always 2048 for CD-ROM (Yellow Book), 512 for HDD.
     /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
     phys_block_size: u64,
@@ -262,6 +286,7 @@ impl ScsiDevice {
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
             pending_attention: None,
+            cd_position: 0,
             phys_block_size: if is_cdrom { CDROM_SECTOR } else { 512 },
             // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
@@ -285,6 +310,7 @@ impl ScsiDevice {
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
             pending_attention: None,
+            cd_position: 0,
             phys_block_size: CDROM_SECTOR,
             logical_block_size: 2048,
             identity,
@@ -364,12 +390,18 @@ impl ScsiDevice {
         ScsiResponse { status: 0x02, data: vec![] }
     }
 
+    fn take_media_change(&mut self) -> bool {
+        let changed = self.media.take_changed();
+        if changed { self.cd_position = 0; }
+        changed
+    }
+
     fn take_attention(&mut self) -> Option<u8> {
-        self.pending_attention.take().or_else(|| self.media.take_changed().then_some(0x28))
+        self.pending_attention.take().or_else(|| self.take_media_change().then_some(0x28))
     }
 
     fn exec_test_unit_ready(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        if self.media.take_changed() {
+        if self.take_media_change() {
             // Sense key 0x06 UNIT_ATTENTION, ASC 0x28 "Not Ready to Ready Transition / Medium Changed"
             return Ok(self.check_condition(0x06, 0x28, 0x00));
         }
@@ -501,6 +533,9 @@ impl ScsiDevice {
     fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
+        if self.media.node_mut().audio_cd().is_some() {
+            return Ok(self.check_condition(0x05, 0x64, 0)); // illegal mode for this track
         }
         // Check LBA bounds before attempting I/O
         let last_lba = self.size() / self.logical_block_size;
@@ -662,7 +697,7 @@ impl ScsiDevice {
             pages.extend_from_slice(&[
                 0x2a, 0x12,             // page code, length (18 bytes follow)
                 0x00, 0x00,             // methods 1/2 not supported
-                0x71, 0x00,             // read capabilities: CD-R/RW readable, audio, composite, digital port
+                0x71, 0x03,             // CD-DA extraction with an accurate stream
                 0x00, 0x00,             // write capabilities: none
                 0x01, 0x00,             // max read speed: 706kB/s (4x)
                 0x00, 0x00,             // # of volume levels: 0
@@ -1088,68 +1123,120 @@ impl ScsiDevice {
         let format = cdb[2] & 0x0F;
         let alloc_len = alloc_len_10(cdb);
 
-        // TOC LBAs are always in physical CD sectors (2048 bytes each).
-        let total_lba = (self.size() / self.phys_block_size) as u32;
-        //eprintln!("SCSI READ TOC: format={} msf={} total_lba={} (current block_size={})",
-        //    format, msf, total_lba, self.logical_block_size);
-
+        let lead_out = (self.size() / self.phys_block_size) as u32;
+        let (control, starts): (u8, &[u32]) = match self.media.node_mut().audio_cd() {
+            Some(disc) => (0x10, &disc.starts),
+            None => (0x14, &[0]),
+        };
+        let last = starts.len() as u8;
+        let mut data = vec![0, 0, 1, if format == 1 { 1 } else { last }];
+        let mut entry = |track, lba| {
+            data.extend_from_slice(&[0, control, track, 0]);
+            if msf {
+                data.extend_from_slice(&cd_msf(u64::from(lba) + 150));
+            } else {
+                data.extend_from_slice(&u32::to_be_bytes(lba));
+            }
+        };
         match format {
             0 => {
-                // Standard TOC: track 1 (data) + lead-out (0xAA)
-                // Response header (4 bytes) + 2 track descriptors × 8 bytes = 20 bytes total
-                let mut data = Vec::with_capacity(20);
-                data.push(0x00); data.push(0x12); // TOC Data Length = 18 (follows this field)
-                data.push(0x01); // First track number
-                data.push(0x01); // Last track number
-
-                // Track 1: data track
-                data.push(0x00); // Reserved
-                data.push(0x14); // ADR=1, CTRL=4 (data, no copy)
-                data.push(0x01); // Track 1
-                data.push(0x00); // Reserved
-                if msf {
-                    data.extend_from_slice(&[0x00, 0x00, 0x02, 0x00]); // MSF 0:02:00 (2-sec pregap)
-                } else {
-                    data.extend_from_slice(&0u32.to_be_bytes()); // LBA 0
+                let first = cdb[6];
+                if first > last && first != 0xaa {
+                    return Ok(self.check_condition(0x05, 0x24, 0));
                 }
-
-                // Lead-out track
-                data.push(0x00); // Reserved
-                data.push(0x14); // ADR=1, CTRL=4
-                data.push(0xAA); // Lead-out
-                data.push(0x00); // Reserved
-                if msf {
-                    let f = (total_lba % 75) as u8;
-                    let s = ((total_lba / 75) % 60) as u8;
-                    let m = (total_lba / 75 / 60) as u8;
-                    data.push(0x00); data.push(m); data.push(s); data.push(f);
-                } else {
-                    data.extend_from_slice(&total_lba.to_be_bytes());
+                for (i, &lba) in starts.iter().enumerate() {
+                    let track = i as u8 + 1;
+                    if track >= first { entry(track, lba); }
                 }
-
-                // NetBSD asks for 12 bytes (header + track 1): the lead-out
-                // past that is not wanted, and a controller that does not
-                // drop it puts it in someone else's memory.
-                data.truncate(alloc_len);
-                Ok(ScsiResponse { status: 0x00, data })
+                entry(0xaa, lead_out);
             }
-            1 => {
-                // Session info: one complete session
-                let mut data = vec![0u8; 12];
-                data[0] = 0x00; data[1] = 0x0A; // Length = 10 (follows this field)
-                data[2] = 0x01; // First complete session
-                data[3] = 0x01; // Last complete session
-                // First track in last session
-                data[4] = 0x00;
-                data[5] = 0x14; // ADR=1, CTRL=4
-                data[6] = 0x01; // Track 1
-                data[7] = 0x00;
-                data[8..12].copy_from_slice(&0u32.to_be_bytes()); // LBA 0
-                data.truncate(alloc_len);
-                Ok(ScsiResponse { status: 0x00, data })
-            }
-            _ => Ok(self.check_condition(0x05, 0x24, 0x00)), // Invalid Field in CDB
+            1 => entry(1, starts[0]),
+            _ => return Ok(self.check_condition(0x05, 0x24, 0)),
         }
+        let len = (data.len() - 2) as u16;
+        data[..2].copy_from_slice(&len.to_be_bytes());
+        data.truncate(alloc_len);
+        Ok(ScsiResponse { status: 0, data })
+    }
+
+    fn cd_seek(&mut self, cdb: &[u8]) -> ScsiResponse {
+        if !self.has_media() { return self.check_condition(0x02, 0x3a, 0); }
+        let lba = if cdb[0] == 0x0b {
+            u32::from_be_bytes([0, cdb[1] & 0x1f, cdb[2], cdb[3]])
+        } else {
+            u32::from_be_bytes(cdb[2..6].try_into().unwrap())
+        };
+        if u64::from(lba) >= self.size() / self.phys_block_size {
+            return self.check_condition(0x05, 0x21, 0);
+        }
+        self.cd_position = lba;
+        ScsiResponse { status: 0, data: vec![] }
+    }
+
+    fn read_subchannel(&mut self, cdb: &[u8]) -> ScsiResponse {
+        if !self.has_media() { return self.check_condition(0x02, 0x3a, 0); }
+        // Digital extraction reads the disc in the host. No analogue play
+        // operation is in progress, so report the current head position.
+        let mut data = vec![0, 0x15, 0, 0];
+        if cdb[2] & 0x40 != 0 {
+            if cdb[3] != 1 { return self.check_condition(0x05, 0x24, 0); }
+            let pos = self.cd_position;
+            let (control, track, start) = match self.media.node_mut().audio_cd() {
+                Some(cd) => {
+                    let n = cd.starts.partition_point(|&start| start <= pos);
+                    (0x10, n as u8, cd.starts[n - 1])
+                }
+                None => (0x14, 1, 0),
+            };
+            data[3] = 12;
+            data.extend_from_slice(&[1, control, track, 1]);
+            for (addr, offset) in [(pos, 150), (pos - start, 0)] {
+                if cdb[1] & 2 != 0 {
+                    data.extend_from_slice(&cd_msf(u64::from(addr) + offset));
+                } else {
+                    data.extend_from_slice(&addr.to_be_bytes());
+                }
+            }
+        }
+        data.truncate(alloc_len_10(cdb));
+        ScsiResponse { status: 0, data }
+    }
+
+    fn read_cd_audio(&mut self, cdb: &[u8]) -> ScsiResponse {
+        if cdb.len() < 12 || !self.is_cdrom() {
+            return self.check_condition(0x05, 0x24, 0);
+        }
+        if !self.has_media() {
+            return self.check_condition(0x02, 0x3a, 0);
+        }
+        if !matches!(cdb[1] & 0x1c, 0 | 4) || cdb[9] != 0x10 || !matches!(cdb[10], 0 | 2) {
+            return self.check_condition(0x05, 0x24, 0);
+        }
+        let start = u32::from_be_bytes(cdb[2..6].try_into().unwrap());
+        let count = u32::from_be_bytes([0, cdb[6], cdb[7], cdb[8]]);
+        let Some(disc) = self.media.node_mut().audio_cd() else {
+            return self.check_condition(0x05, 0x64, 0);
+        };
+        if start > disc.reader.sector_count() || count > disc.reader.sector_count() - start {
+            return self.check_condition(0x05, 0x21, 0);
+        }
+        // Larger than any of the supported controllers' single DMA transfers.
+        if count > 8192 { return self.check_condition(0x05, 0x24, 0); }
+        let mut data = vec![0; count as usize * 2352];
+        if disc.reader.read_sectors(start, count, &mut data).is_err() {
+            return self.check_condition(0x03, 0x11, 0);
+        }
+        if cdb[10] == 2 {
+            let mut framed = Vec::with_capacity(count as usize * 2368);
+            for (lba, pcm) in (start..start + count).zip(data.chunks_exact(2352)) {
+                let track = disc.starts.partition_point(|&first| first <= lba);
+                framed.extend_from_slice(pcm);
+                framed.extend_from_slice(&cd_audio_q(track as u8, lba - disc.starts[track - 1], lba));
+            }
+            data = framed;
+        }
+        if count > 0 { self.cd_position = start + count - 1; }
+        ScsiResponse { status: 0, data }
     }
 
     /// SGI vendor command 0xC4 — eject / next disc.
@@ -1258,6 +1345,9 @@ impl ScsiTarget for ScsiDevice {
                 ScsiResponse { status: 0x00, data: vec![] }
             }
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
+            0x0b | 0x2b if self.is_cdrom() => self.cd_seek(&req.cdb),
+            scsi_cmd::READ_SUB_CHANNEL if self.is_cdrom() => self.read_subchannel(&req.cdb),
+            scsi_cmd::READ_CD => self.read_cd_audio(&req.cdb),
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
             scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
             scsi_cmd::SGI_HD2CDROM => self.exec_sgi_hd2cdrom(&req.cdb)?,
@@ -2110,6 +2200,44 @@ mod tests {
         let mut dev = cdrom();
         assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 8, 0]).data.len(), 8);
         assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 0, 0]).data.len(), 4, "SCSI-2: 0 means 4 bytes");
+    }
+
+    #[test]
+    fn audio_cd_toc_and_samples_follow_the_loaded_disc() {
+        use libchdman_rs::cd::{create_from_cue, CdCreateOptions};
+        let dir = TempPath::dir("audio-cd");
+        let cue = dir.join("disc.cue");
+        // Unequal lengths expose any mistaken use of CHD inter-track padding.
+        let mut samples = vec![0x31; 7 * 2352];
+        samples.extend_from_slice(&[0x34, 0x12].repeat(11 * 1176));
+        std::fs::write(dir.join("disc.bin"), samples).unwrap();
+        std::fs::write(&cue, "FILE \"disc.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:00:07\n").unwrap();
+        let chd = dir.join("disc.chd");
+        create_from_cue(&cue, &chd, CdCreateOptions::default(), &mut |_| {}, &|| false).unwrap();
+        let mut cd = ScsiDevice::new_empty_cdrom(CDROM_IDENTITY);
+        cd.changer().unwrap().load(chd.to_str().unwrap()).unwrap();
+        let _ = run(&mut cd, &[0; 6]); // media change
+        let toc = run(&mut cd, &[0x43, 0, 0, 0, 0, 0, 0, 0, 28, 0]);
+        assert_eq!(&toc.data[..4], &[0, 26, 1, 2]);
+        assert_eq!(&toc.data[12..20], &[0, 0x10, 2, 0, 0, 0, 0, 7]);
+        assert_eq!(&toc.data[20..28], &[0, 0x10, 0xaa, 0, 0, 0, 0, 18]);
+        let msf = run(&mut cd, &[0x43, 2, 0, 0, 0, 0, 0xaa, 0, 12, 0]);
+        assert_eq!(&msf.data[4..], &[0, 0x10, 0xaa, 0, 0, 0, 2, 18]);
+        let read = run(&mut cd, &[0xbe, 4, 0, 0, 0, 7, 0, 0, 1, 0x10, 0, 0]);
+        assert_eq!(read.data, [0x34, 0x12].repeat(1176));
+        let capabilities = run(&mut cd, &[0x1a, 0, 0x2a, 0, 38, 0]);
+        assert_eq!(capabilities.data[17] & 3, 3); // digital audio, accurate stream
+        let framed = run(&mut cd, &[0xbe, 4, 0, 0, 0, 7, 0, 0, 1, 0x10, 2, 0]);
+        assert_eq!(&framed.data[..2352], read.data);
+        assert_eq!(&framed.data[2352..2362], &[1, 2, 1, 0, 0, 0, 0, 0, 2, 7]);
+        assert_eq!(framed.data.len(), 2368);
+        let sub = run(&mut cd, &[0x42, 2, 0x40, 1, 0, 0, 0, 0, 16, 0]);
+        assert_eq!(&sub.data[4..], &[1, 0x10, 2, 1, 0, 0, 2, 7, 0, 0, 0, 0]);
+        assert_eq!(run(&mut cd, &[0x0b, 0, 0, 2, 0, 0]).status, 0);
+        let sub = run(&mut cd, &[0x42, 0, 0x40, 1, 0, 0, 0, 0, 16, 0]);
+        assert_eq!(&sub.data[4..], &[1, 0x10, 1, 1, 0, 0, 0, 2, 0, 0, 0, 2]);
+        assert_eq!(run(&mut cd, &[0xbe, 4, 0, 0, 0, 18, 0, 0, 1, 0x10, 0, 0]).status, 2);
+        assert_eq!(run(&mut cd, &[0x28, 0, 0, 0, 0, 7, 0, 0, 1, 0]).status, 2);
     }
 
     /// A disc swapped in through the changer is opened as the drive opens any

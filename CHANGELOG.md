@@ -15,6 +15,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Xiri and frontend integration
 
+- CD-ROM drives can read tracks from audio-only CHDs for digital playback.
+
 - HAL2 can record from a raw stereo PCM file or Unix FIFO. The Indy delivers shared DMA interrupts for simultaneous NetBSD playback and capture.
 
 - Indy HAL2 plays signed stereo PCM from NetBSD desktop applications and interrupts the guest when it is time to refill the playback buffer.

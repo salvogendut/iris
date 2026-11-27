@@ -4,15 +4,14 @@
 //!   * [`ChdHd`] — hard-disk CHD as a writable block device. Uncompressed CHDs
 //!     are written in place; compressed CHDs get an uncompressed `.diff.chd`
 //!     sidecar so the parent stays untouched (MAME's strategy).
-//!   * [`ChdCd`] — single-track MODE1 CD CHD exposed as a 2048-byte/sector
-//!     read-only stream via libchdman-rs's `CdCookedReader`.
+//!   * [`ChdCd`] — read-only cooked data or Red Book audio sectors.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use libchdman_rs::cd::CdCookedReader;
+use libchdman_rs::cd::{list_tracks, CdAudioReader, CdCookedReader, TrackType};
 use libchdman_rs::hd::HdImage;
 use libchdman_rs::metadata::tags::HARD_DISK_METADATA_TAG;
 use libchdman_rs::Chd;
@@ -744,21 +743,48 @@ pub(crate) fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
 }
 
 /// Read-only CD CHD backend.
-pub struct ChdCd {
-    reader: CdCookedReader,
-    total_bytes: u64,
+pub enum ChdCd {
+    Data(CdCookedReader),
+    Audio(AudioCd),
+}
+
+/// Index 01 locations in physical CD sectors. The PCM view is stereo
+/// signed 16-bit little-endian, 588 sample frames per sector.
+pub struct AudioCd {
+    pub starts: Vec<u32>,
+    pub reader: CdAudioReader,
 }
 
 impl ChdCd {
     pub fn open(path: &str) -> io::Result<Self> {
         let chd = Chd::open(path, false, None).map_err(map_err)?;
-        let reader = CdCookedReader::open(chd).map_err(map_err)?;
-        let total_bytes = reader.len();
-        Ok(Self { reader, total_bytes })
+        let tracks = list_tracks(&chd).map_err(map_err)?;
+        if tracks.iter().all(|t| t.track_type == TrackType::Audio) {
+            let mut starts = Vec::with_capacity(tracks.len());
+            let mut next = 0u32;
+            for track in tracks {
+                // CD layouts with explicit index-00 or postgap need a separate
+                // mapping between disc time and the reader's extracted frames.
+                if track.pregap != 0 || track.postgap != 0 {
+                    return Err(io::Error::new(io::ErrorKind::Unsupported, "audio CHD with explicit gaps"));
+                }
+                starts.push(next);
+                next = next.checked_add(track.frames).ok_or_else(|| io::Error::other("CD too long"))?;
+            }
+            let reader = CdAudioReader::open(chd).map_err(map_err)?;
+            if starts.is_empty() || starts.len() > 99 || reader.sector_count() != next {
+                return Err(io::Error::other("invalid audio CD layout"));
+            }
+            return Ok(Self::Audio(AudioCd { starts, reader }));
+        }
+        CdCookedReader::open(chd).map(Self::Data).map_err(map_err)
     }
 
     pub fn size(&self) -> u64 {
-        self.total_bytes
+        match self {
+            Self::Data(reader) => reader.len(),
+            Self::Audio(disc) => u64::from(disc.reader.sector_count()) * 2048,
+        }
     }
 
     pub fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
@@ -772,8 +798,11 @@ impl ChdCd {
     /// Read exactly `buf.len()` bytes starting at byte `offset`. The cooked
     /// reader is a plain byte stream, so no sector alignment is required.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.reader.seek(SeekFrom::Start(offset))?;
-        self.reader.read_exact(buf)
+        let Self::Data(reader) = self else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "audio track has no data sectors"));
+        };
+        reader.seek(SeekFrom::Start(offset))?;
+        reader.read_exact(buf)
     }
 }
 

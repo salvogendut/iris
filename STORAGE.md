@@ -6,6 +6,14 @@ workflows. The full configuration inventory is in [FEATURES.md](FEATURES.md);
 
 ## Disk images
 
+### Music CDs
+
+Attach an audio-only CHD to a CD-ROM drive at boot or insert it with the
+disc changer. The drive reports each track and its lead-out, and supports
+digital audio extraction with MMC READ CD. The audio reader accepts tracks
+with a single INDEX 01 and no explicit pregap or postgap. A raw ISO still
+appears as one data track.
+
 ### CD-ROM images over HTTP
 
 A CD-ROM (`path`, `discs`, `--cdrom4`, `--cdrom4-extra`, the monitor's

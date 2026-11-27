@@ -80,7 +80,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
-use crate::chd_disk::{ChdCd, ChdHd};
+use crate::chd_disk::{AudioCd, ChdCd, ChdHd};
 
 mod chd_cow;
 pub use chd_cow::open_chd_cow;
@@ -347,6 +347,9 @@ impl Background {
 /// See the module docs for the single definition of dirty, commit and rollback
 /// that every backend shares.
 pub trait BlockNode: Send {
+    /// Red Book sectors and track starts, when this node holds an audio CD.
+    fn audio_cd(&mut self) -> Option<&mut AudioCd> { None }
+
     /// Capacity in bytes.
     fn size(&self) -> u64;
 
@@ -1365,6 +1368,13 @@ impl ChdCdNode {
 }
 
 impl BlockNode for ChdCdNode {
+    fn audio_cd(&mut self) -> Option<&mut AudioCd> {
+        match &mut self.reader {
+            ChdCd::Audio(disc) => Some(disc),
+            ChdCd::Data(_) => None,
+        }
+    }
+
     fn size(&self) -> u64 {
         self.size
     }
@@ -1618,6 +1628,10 @@ impl Removable for ChangerNode {
 }
 
 impl BlockNode for ChangerNode {
+    fn audio_cd(&mut self) -> Option<&mut AudioCd> {
+        self.active.as_mut()?.audio_cd()
+    }
+
     fn size(&self) -> u64 {
         self.active.as_ref().map_or(0, |d| d.size())
     }
