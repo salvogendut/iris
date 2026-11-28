@@ -318,20 +318,52 @@ pub trait Workstation: Send {
     fn load_elf(&self, _path: &str) -> Result<String, String> {
         Err(NOT_HERE.into())
     }
-    fn save_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(NOT_HERE.into())
+    fn snapshot_root(&self) -> &std::path::Path { std::path::Path::new("saves") }
+
+    /// Saves go to the machine's configured snapshot directory. The six hooks below
+    /// are all a machine gives for snapshots; [`crate::snapshot`] does the rest.
+    fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        let root = self.snapshot_root().to_owned();
+        crate::snapshot::save_in(self, &root, name)
     }
-    fn load_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(NOT_HERE.into())
+    fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        let root = self.snapshot_root().to_owned();
+        crate::snapshot::load_in(self, &root, name)
     }
     /// The CI socket's `restore`: load a snapshot and keep what a later
     /// `rollback` needs to return to it quickly.
     fn ci_restore(&mut self, name: &str) -> Result<(), String> {
-        self.load_snapshot(name)
+        let root = self.snapshot_root().to_owned();
+        crate::snapshot::ci_restore(self, &root, name)
     }
     /// The CI socket's `rollback` to the last `ci_restore`.
     fn ci_rollback(&mut self) -> Result<(), String> {
+        let root = self.snapshot_root().to_owned();
+        crate::snapshot::ci_rollback(self, &root)
+    }
+    /// Why this machine cannot be saved or loaded now, if it cannot.
+    fn snapshot_refusal(&self) -> Option<String> {
+        Some(NOT_HERE.into())
+    }
+    /// What a snapshot of this machine is and must hold.
+    fn snapshot_layout(&self) -> crate::snapshot::Layout {
+        Default::default()
+    }
+    /// The machine's state, stopped.
+    fn capture(&self) -> Result<crate::snapshot::Image<'_>, String> {
         Err(NOT_HERE.into())
+    }
+    /// Put an image into the stopped machine, as at power-on first so nothing it does not hold is left over.
+    fn apply_image(&mut self, _image: &crate::snapshot::Image) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Run `f` on the SCSI buses that hold disks, by slot, for a snapshot's overlays.
+    fn with_disk_buses(&self, _f: &mut dyn FnMut(&[crate::snapshot::DiskBus]) -> Result<(), String>) -> Result<(), String> {
+        Ok(())
+    }
+    /// The last load, for `parent` and `rollback`.
+    fn snapshots(&mut self) -> Option<&mut crate::snapshot::Restored> {
+        None
     }
 
     /// Write the PROM's non-volatile settings to `path`, or to the configured
@@ -411,7 +443,7 @@ pub trait Workstation: Send {
 }
 
 /// The error an optional facility returns on a machine that lacks it.
-const NOT_HERE: &str = "not supported on this machine";
+pub(crate) const NOT_HERE: &str = "not supported on this machine";
 
 impl dyn Workstation + '_ {
     /// Briefly stop the machine, run `work`, then restart the peripherals, and

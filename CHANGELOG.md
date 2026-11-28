@@ -36,6 +36,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Embedded hosts receive a distinct powered-off state after disk flushing.
 - Embedded frontends reject incomplete snapshots in their own storage folder.
 
+### Snapshots
+
+- A failed snapshot load leaves the machine stopped, on every machine, and a snapshot of
+  another machine, CPU, disk or memory size is refused before anything is touched.
+
 ### Serial ports
 
 - A serial port can carry a device in place of its socket, on every machine:
