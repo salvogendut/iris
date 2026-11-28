@@ -1460,6 +1460,12 @@ impl Machine {
             return;
         }
         self.timer_manager.clock().start();
+        // VINO's DMA pump is torn down by `stop()` like every other peripheral,
+        // so it must be restarted here too — otherwise a `with_paused` window
+        // (scratch-volume I/O, iris-ci put/get) permanently kills in-flight
+        // Video-In capture and the guest's VL client blocks forever. Mirrors
+        // the gate in `Machine::start`.
+        if self.board.vino.has_source() { self.board.vino.start(); }
         self.mc.start();
         self.hpc3.start();
         // A board whose resident raster has faulted panics in `start`; a failed save restarts too.
